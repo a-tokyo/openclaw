@@ -4,10 +4,13 @@ import { createAssistantMessageEventStream } from "@mariozechner/pi-ai";
 import { describe, expect, it } from "vitest";
 import { createOpenAIThinkingLevelWrapper } from "./openai-stream-wrappers.js";
 
-function createPayloadCapture() {
+function createPayloadCapture(opts?: { initialReasoning?: unknown }) {
   const payloads: Array<Record<string, unknown>> = [];
   const baseStreamFn: StreamFn = (model, _context, options) => {
     const payload: Record<string, unknown> = { model: model.id };
+    if (opts?.initialReasoning !== undefined) {
+      payload.reasoning = structuredClone(opts.initialReasoning);
+    }
     options?.onPayload?.(payload, model);
     payloads.push(structuredClone(payload));
     return createAssistantMessageEventStream();
@@ -28,36 +31,44 @@ const openaiModel = {
 } as Model<"openai-responses">;
 
 describe("createOpenAIThinkingLevelWrapper", () => {
-  it("injects reasoning.effort medium when thinkingLevel is medium", () => {
-    const { baseStreamFn, payloads } = createPayloadCapture();
+  it("overrides effort on reasoning-capable model when thinkingLevel is medium", () => {
+    const { baseStreamFn, payloads } = createPayloadCapture({ initialReasoning: { effort: "none" } });
     const wrapped = createOpenAIThinkingLevelWrapper(baseStreamFn, "medium");
     void wrapped(codexModel, { messages: [] }, {});
 
     expect(payloads[0]?.reasoning).toEqual({ effort: "medium" });
   });
 
-  it("injects reasoning.effort high when thinkingLevel is high", () => {
-    const { baseStreamFn, payloads } = createPayloadCapture();
+  it("overrides effort on reasoning-capable model when thinkingLevel is high", () => {
+    const { baseStreamFn, payloads } = createPayloadCapture({ initialReasoning: { effort: "none" } });
     const wrapped = createOpenAIThinkingLevelWrapper(baseStreamFn, "high");
     void wrapped(openaiModel, { messages: [] }, {});
 
     expect(payloads[0]?.reasoning).toEqual({ effort: "high" });
   });
 
-  it("injects reasoning.effort none when thinkingLevel is off", () => {
-    const { baseStreamFn, payloads } = createPayloadCapture();
+  it("sets effort to none when thinkingLevel is off on reasoning-capable model", () => {
+    const { baseStreamFn, payloads } = createPayloadCapture({ initialReasoning: { effort: "medium" } });
     const wrapped = createOpenAIThinkingLevelWrapper(baseStreamFn, "off");
     void wrapped(codexModel, { messages: [] }, {});
 
     expect(payloads[0]?.reasoning).toEqual({ effort: "none" });
   });
 
-  it("maps adaptive thinkingLevel to medium effort", () => {
-    const { baseStreamFn, payloads } = createPayloadCapture();
+  it("maps adaptive thinkingLevel to medium effort on reasoning-capable model", () => {
+    const { baseStreamFn, payloads } = createPayloadCapture({ initialReasoning: { effort: "none" } });
     const wrapped = createOpenAIThinkingLevelWrapper(baseStreamFn, "adaptive");
     void wrapped(codexModel, { messages: [] }, {});
 
     expect(payloads[0]?.reasoning).toEqual({ effort: "medium" });
+  });
+
+  it("does not add reasoning for non-reasoning models without existing reasoning payload", () => {
+    const { baseStreamFn, payloads } = createPayloadCapture();
+    const wrapped = createOpenAIThinkingLevelWrapper(baseStreamFn, "medium");
+    void wrapped(openaiModel, { messages: [] }, {});
+
+    expect(payloads[0]?.reasoning).toBeUndefined();
   });
 
   it("overrides existing reasoning.effort from upstream wrappers", () => {
@@ -154,10 +165,10 @@ describe("createOpenAIThinkingLevelWrapper", () => {
     expect(payloads[0]?.reasoning).toBeUndefined();
   });
 
-  it("passes through all thinking levels correctly", () => {
+  it("passes through all thinking levels correctly on reasoning-capable models", () => {
     const levels = ["minimal", "low", "medium", "high", "xhigh"] as const;
     for (const level of levels) {
-      const { baseStreamFn, payloads } = createPayloadCapture();
+      const { baseStreamFn, payloads } = createPayloadCapture({ initialReasoning: { effort: "none" } });
       const wrapped = createOpenAIThinkingLevelWrapper(baseStreamFn, level);
       void wrapped(codexModel, { messages: [] }, {});
       expect(payloads[0]?.reasoning).toEqual({ effort: level });

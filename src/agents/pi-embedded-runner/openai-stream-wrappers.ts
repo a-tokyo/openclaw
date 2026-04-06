@@ -231,16 +231,14 @@ export function createOpenAIThinkingLevelWrapper(
       return underlying(model, context, options);
     }
     return streamWithPayloadPatch(underlying, model, context, options, (payloadObj) => {
-      const effort = mapThinkingLevelToReasoningEffort(thinkingLevel);
       const existingReasoning = payloadObj.reasoning;
       if (
         existingReasoning &&
         typeof existingReasoning === "object" &&
         !Array.isArray(existingReasoning)
       ) {
-        (existingReasoning as Record<string, unknown>).effort = effort;
-      } else {
-        payloadObj.reasoning = { effort };
+        (existingReasoning as Record<string, unknown>).effort =
+          mapThinkingLevelToReasoningEffort(thinkingLevel);
       }
     });
   };
