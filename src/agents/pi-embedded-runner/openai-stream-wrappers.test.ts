@@ -120,7 +120,7 @@ describe("createOpenAIThinkingLevelWrapper", () => {
     expect(payloads[0]?.reasoning).toEqual({ effort: "high", summary: "auto" });
   });
 
-  it("does not inject reasoning for openai-completions API", () => {
+  it("does not inject reasoning for completions API on proxy routes", () => {
     const { baseStreamFn, payloads } = createPayloadCapture();
     const wrapped = createOpenAIThinkingLevelWrapper(baseStreamFn, "medium");
     void wrapped(
@@ -128,7 +128,25 @@ describe("createOpenAIThinkingLevelWrapper", () => {
         api: "openai-completions",
         provider: "openai",
         id: "gpt-4o",
+        baseUrl: "https://proxy.example.com/v1",
       } as Model<"openai-completions">,
+      { messages: [] },
+      {},
+    );
+
+    expect(payloads[0]?.reasoning).toBeUndefined();
+  });
+
+  it("does not inject reasoning for proxy routes with custom baseUrl", () => {
+    const { baseStreamFn, payloads } = createPayloadCapture();
+    const wrapped = createOpenAIThinkingLevelWrapper(baseStreamFn, "medium");
+    void wrapped(
+      {
+        api: "openai-responses",
+        provider: "openai",
+        id: "gpt-5.2",
+        baseUrl: "https://proxy.example.com/v1",
+      } as Model<"openai-responses">,
       { messages: [] },
       {},
     );

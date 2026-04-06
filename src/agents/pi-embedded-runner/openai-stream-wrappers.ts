@@ -227,11 +227,7 @@ export function createOpenAIThinkingLevelWrapper(
     return underlying;
   }
   return (model, context, options) => {
-    if (
-      model.api !== "openai-responses" &&
-      model.api !== "openai-codex-responses" &&
-      model.api !== "azure-openai-responses"
-    ) {
+    if (!shouldApplyOpenAIReasoningCompatibility(model)) {
       return underlying(model, context, options);
     }
     return streamWithPayloadPatch(underlying, model, context, options, (payloadObj) => {
