@@ -133,6 +133,7 @@ import {
   createOpenAIResponsesContextManagementWrapper,
   createOpenAIServiceTierWrapper,
   createOpenAITextVerbosityWrapper,
+  createOpenAIThinkingLevelWrapper,
   resolveOpenAIFastMode,
   resolveOpenAIServiceTier,
   resolveOpenAITextVerbosity,
@@ -170,9 +171,12 @@ function createTestOpenAIProviderWrapper(
     config: params.context.config,
     agentDir: params.context.agentDir,
   });
-  return createOpenAIResponsesContextManagementWrapper(
-    createOpenAIReasoningCompatibilityWrapper(streamFn),
-    params.context.extraParams,
+  return createOpenAIThinkingLevelWrapper(
+    createOpenAIResponsesContextManagementWrapper(
+      createOpenAIReasoningCompatibilityWrapper(streamFn),
+      params.context.extraParams,
+    ),
+    params.context.thinkingLevel,
   );
 }
 

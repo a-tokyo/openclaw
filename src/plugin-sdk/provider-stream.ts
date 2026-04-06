@@ -16,6 +16,7 @@ import {
   createOpenAIResponsesContextManagementWrapper,
   createOpenAIServiceTierWrapper,
   createOpenAITextVerbosityWrapper,
+  createOpenAIThinkingLevelWrapper,
   resolveOpenAIFastMode,
   resolveOpenAIServiceTier,
   resolveOpenAITextVerbosity,
@@ -117,9 +118,12 @@ export function buildProviderStreamFamilyHooks(
             config: ctx.config,
             agentDir: ctx.agentDir,
           });
-          return createOpenAIResponsesContextManagementWrapper(
-            createOpenAIReasoningCompatibilityWrapper(nextStreamFn),
-            ctx.extraParams,
+          return createOpenAIThinkingLevelWrapper(
+            createOpenAIResponsesContextManagementWrapper(
+              createOpenAIReasoningCompatibilityWrapper(nextStreamFn),
+              ctx.extraParams,
+            ),
+            ctx.thinkingLevel,
           );
         },
       };

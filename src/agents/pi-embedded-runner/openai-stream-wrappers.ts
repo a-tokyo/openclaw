@@ -1,6 +1,7 @@
 import type { StreamFn } from "@mariozechner/pi-agent-core";
 import type { SimpleStreamOptions } from "@mariozechner/pi-ai";
 import { streamSimple } from "@mariozechner/pi-ai";
+import type { ThinkLevel } from "../../auto-reply/thinking.js";
 import type { OpenClawConfig } from "../../config/config.js";
 import {
   patchCodexNativeWebSearchPayload,
@@ -212,6 +213,43 @@ export function createOpenAIReasoningCompatibilityWrapper(
         payloadObj,
         resolveOpenAIResponsesPayloadPolicy(model, { storeMode: "preserve" }),
       );
+    });
+  };
+}
+
+function mapThinkingLevelToReasoningEffort(
+  thinkingLevel: ThinkLevel,
+): "none" | "minimal" | "low" | "medium" | "high" | "xhigh" {
+  if (thinkingLevel === "off") {
+    return "none";
+  }
+  if (thinkingLevel === "adaptive") {
+    return "medium";
+  }
+  return thinkingLevel;
+}
+
+export function createOpenAIThinkingLevelWrapper(
+  baseStreamFn: StreamFn | undefined,
+  thinkingLevel?: ThinkLevel,
+): StreamFn {
+  const underlying = baseStreamFn ?? streamSimple;
+  if (!thinkingLevel) {
+    return underlying;
+  }
+  return (model, context, options) => {
+    return streamWithPayloadPatch(underlying, model, context, options, (payloadObj) => {
+      const effort = mapThinkingLevelToReasoningEffort(thinkingLevel);
+      const existingReasoning = payloadObj.reasoning;
+      if (
+        existingReasoning &&
+        typeof existingReasoning === "object" &&
+        !Array.isArray(existingReasoning)
+      ) {
+        (existingReasoning as Record<string, unknown>).effort = effort;
+      } else {
+        payloadObj.reasoning = { effort };
+      }
     });
   };
 }
