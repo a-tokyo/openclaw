@@ -3,7 +3,6 @@ import type { SimpleStreamOptions } from "@mariozechner/pi-ai";
 import { streamSimple } from "@mariozechner/pi-ai";
 import type { ThinkLevel } from "../../auto-reply/thinking.js";
 import type { OpenClawConfig } from "../../config/config.js";
-import { mapThinkingLevelToReasoningEffort } from "./reasoning-effort-utils.js";
 import {
   patchCodexNativeWebSearchPayload,
   resolveCodexNativeSearchActivation,
@@ -14,6 +13,7 @@ import {
 } from "../openai-responses-payload-policy.js";
 import { resolveProviderRequestPolicyConfig } from "../provider-request-config.js";
 import { log } from "./logger.js";
+import { mapThinkingLevelToReasoningEffort } from "./reasoning-effort-utils.js";
 import { streamWithPayloadPatch } from "./stream-payload-utils.js";
 
 type OpenAIServiceTier = "auto" | "default" | "flex" | "priority";
@@ -227,6 +227,13 @@ export function createOpenAIThinkingLevelWrapper(
     return underlying;
   }
   return (model, context, options) => {
+    if (
+      model.api !== "openai-responses" &&
+      model.api !== "openai-codex-responses" &&
+      model.api !== "azure-openai-responses"
+    ) {
+      return underlying(model, context, options);
+    }
     return streamWithPayloadPatch(underlying, model, context, options, (payloadObj) => {
       const effort = mapThinkingLevelToReasoningEffort(thinkingLevel);
       const existingReasoning = payloadObj.reasoning;

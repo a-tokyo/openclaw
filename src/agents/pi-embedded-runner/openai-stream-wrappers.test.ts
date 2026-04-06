@@ -120,6 +120,22 @@ describe("createOpenAIThinkingLevelWrapper", () => {
     expect(payloads[0]?.reasoning).toEqual({ effort: "high", summary: "auto" });
   });
 
+  it("does not inject reasoning for openai-completions API", () => {
+    const { baseStreamFn, payloads } = createPayloadCapture();
+    const wrapped = createOpenAIThinkingLevelWrapper(baseStreamFn, "medium");
+    void wrapped(
+      {
+        api: "openai-completions",
+        provider: "openai",
+        id: "gpt-4o",
+      } as Model<"openai-completions">,
+      { messages: [] },
+      {},
+    );
+
+    expect(payloads[0]?.reasoning).toBeUndefined();
+  });
+
   it("passes through all thinking levels correctly", () => {
     const levels = ["minimal", "low", "medium", "high", "xhigh"] as const;
     for (const level of levels) {
