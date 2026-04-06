@@ -2,6 +2,7 @@ import type { StreamFn } from "@mariozechner/pi-agent-core";
 import { streamSimple } from "@mariozechner/pi-ai";
 import type { ThinkLevel } from "../../auto-reply/thinking.js";
 import { isProxyReasoningUnsupportedModelHint } from "../../plugin-sdk/provider-model-shared.js";
+import { mapThinkingLevelToReasoningEffort } from "./reasoning-effort-utils.js";
 import { resolveProviderRequestPolicy } from "../provider-attribution.js";
 import { resolveProviderRequestPolicyConfig } from "../provider-request-config.js";
 import { applyAnthropicEphemeralCacheControlMarkers } from "./anthropic-cache-control-payload.js";
@@ -14,18 +15,6 @@ const KILOCODE_FEATURE_ENV_VAR = "KILOCODE_FEATURE";
 function resolveKilocodeAppHeaders(): Record<string, string> {
   const feature = process.env[KILOCODE_FEATURE_ENV_VAR]?.trim() || KILOCODE_FEATURE_DEFAULT;
   return { [KILOCODE_FEATURE_HEADER]: feature };
-}
-
-function mapThinkingLevelToOpenRouterReasoningEffort(
-  thinkingLevel: ThinkLevel,
-): "none" | "minimal" | "low" | "medium" | "high" | "xhigh" {
-  if (thinkingLevel === "off") {
-    return "none";
-  }
-  if (thinkingLevel === "adaptive") {
-    return "medium";
-  }
-  return thinkingLevel;
 }
 
 function normalizeProxyReasoningPayload(payload: unknown, thinkingLevel?: ThinkLevel): void {
@@ -47,11 +36,11 @@ function normalizeProxyReasoningPayload(payload: unknown, thinkingLevel?: ThinkL
   ) {
     const reasoningObj = existingReasoning as Record<string, unknown>;
     if (!("max_tokens" in reasoningObj) && !("effort" in reasoningObj)) {
-      reasoningObj.effort = mapThinkingLevelToOpenRouterReasoningEffort(thinkingLevel);
+      reasoningObj.effort = mapThinkingLevelToReasoningEffort(thinkingLevel);
     }
   } else if (!existingReasoning) {
     payloadObj.reasoning = {
-      effort: mapThinkingLevelToOpenRouterReasoningEffort(thinkingLevel),
+      effort: mapThinkingLevelToReasoningEffort(thinkingLevel),
     };
   }
 }
