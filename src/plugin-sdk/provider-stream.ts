@@ -118,12 +118,11 @@ export function buildProviderStreamFamilyHooks(
             config: ctx.config,
             agentDir: ctx.agentDir,
           });
-          return createOpenAIThinkingLevelWrapper(
-            createOpenAIResponsesContextManagementWrapper(
-              createOpenAIReasoningCompatibilityWrapper(nextStreamFn),
-              ctx.extraParams,
+          return createOpenAIResponsesContextManagementWrapper(
+            createOpenAIReasoningCompatibilityWrapper(
+              createOpenAIThinkingLevelWrapper(nextStreamFn, ctx.thinkingLevel),
             ),
-            ctx.thinkingLevel,
+            ctx.extraParams,
           );
         },
       };

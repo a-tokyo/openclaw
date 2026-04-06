@@ -171,12 +171,11 @@ function createTestOpenAIProviderWrapper(
     config: params.context.config,
     agentDir: params.context.agentDir,
   });
-  return createOpenAIThinkingLevelWrapper(
-    createOpenAIResponsesContextManagementWrapper(
-      createOpenAIReasoningCompatibilityWrapper(streamFn),
-      params.context.extraParams,
+  return createOpenAIResponsesContextManagementWrapper(
+    createOpenAIReasoningCompatibilityWrapper(
+      createOpenAIThinkingLevelWrapper(streamFn, params.context.thinkingLevel),
     ),
-    params.context.thinkingLevel,
+    params.context.extraParams,
   );
 }
 
