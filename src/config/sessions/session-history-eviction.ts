@@ -30,6 +30,10 @@ import {
   readReferencedSessionIds,
 } from "./session-accessor.sqlite-lifecycle-state.js";
 import {
+  finalizeSessionEntryMaintenancePlansAfterWriterReleaseBestEffort,
+  planOldestCapacityEligibleSqliteLiveEntryRemoval,
+} from "./session-accessor.sqlite-maintenance.js";
+import {
   getSessionKysely,
   resolveSqliteScope,
   resolveSqliteTranscriptArchiveDirectory,
@@ -113,7 +117,21 @@ export async function inspectSqliteSessionHistoryDiskBudget(
       storePath: params.storePath,
     }),
   });
-  return { diskBudget, wouldMutate: candidates.length > 0 };
+  if (candidates.length > 0) {
+    return { diskBudget, wouldMutate: true };
+  }
+  // Live durables are only reclaimed when the configured high-water mark is a
+  // real stop condition. Tests pass highWaterBytes: 0 directly to exhaust
+  // historical generations without wiping live nodes (#119422 / #119909).
+  if (highWaterBytes <= 0 || maxDiskBytes <= 0) {
+    return { diskBudget, wouldMutate: false };
+  }
+  const livePlan = planOldestCapacityEligibleSqliteLiveEntryRemoval({
+    archiveDirectory: resolveSqliteTranscriptArchiveDirectory(resolved),
+    database,
+    storePath: params.storePath,
+  });
+  return { diskBudget, wouldMutate: livePlan.entryRemovals.length > 0 };
 }
 
 function collectProtectedHistoricalSessionIds(params: {
@@ -273,6 +291,20 @@ export function collectAdmissionProtectedSessionIds(params: {
     }
   }
   return protectedSessionIds;
+}
+
+function sqliteSessionNodeExists(database: OpenClawAgentDatabase, sessionKey: string): boolean {
+  const db = getSessionKysely(database.db);
+  return (
+    executeSqliteQuerySync(
+      database.db,
+      db
+        .selectFrom("session_nodes")
+        .select("session_key")
+        .where("session_key", "=", sessionKey)
+        .limit(1),
+    ).rows.length > 0
+  );
 }
 
 function readHistoricalSessionIds(params: {
@@ -707,6 +739,50 @@ async function enforceSessionHistoryMaintenanceSerialized(
       );
       removedFiles += repruned.removedFiles;
       usage = repruned.usage;
+    }
+  }
+
+  // Historical generations first. Idle durable live nodes are last-resort
+  // capacity victims so maxDiskBytes still bounds the store. Skip when the
+  // high-water mark is not a usable stop condition (#119422 / #119909).
+  if (highWaterBytes > 0 && maxDiskBytes > 0) {
+    while (usage.totalBytes > highWaterBytes) {
+      const livePlan = planOldestCapacityEligibleSqliteLiveEntryRemoval({
+        archiveDirectory,
+        database,
+        storePath: params.storePath,
+      });
+      const victimKey = livePlan.entryRemovals[0]?.sessionKey;
+      if (!victimKey) {
+        break;
+      }
+      const publishedArchives = await finalizeSessionEntryMaintenancePlansAfterWriterReleaseBestEffort(
+        resolved,
+        [livePlan],
+      );
+      if (sqliteSessionNodeExists(database, victimKey)) {
+        break;
+      }
+      removedEntries += 1;
+      emitArchivedTranscriptUpdates(publishedArchives);
+      try {
+        reclaimSqliteFreePages(database);
+      } catch {
+        // Best-effort reclamation only.
+      }
+      usage = await measureSessionPhysicalDiskUsage(params.storePath);
+      if (usage.totalBytes > highWaterBytes) {
+        const repruned = await runExclusiveSqliteSessionWrite(resolved, async () =>
+          pruneAllSessionTranscriptArchivesToHighWater({
+            archiveDirectory,
+            database,
+            highWaterBytes,
+            storePath: params.storePath,
+          }),
+        );
+        removedFiles += repruned.removedFiles;
+        usage = repruned.usage;
+      }
     }
   }
 

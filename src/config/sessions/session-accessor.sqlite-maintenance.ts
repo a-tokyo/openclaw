@@ -173,13 +173,9 @@ export function applySessionEntryMaintenance(
     }) ?? new Set<string>();
   const removedKeys = new Set<string>();
   const removedEntriesByKey = new Map<string, SessionEntry>();
-  const removedSessionIds = new Set<string>();
   const rememberRemovedEntry = (removed: { key: string; entry: SessionEntry }) => {
     removedKeys.add(removed.key);
     removedEntriesByKey.set(removed.key, cloneSessionEntry(removed.entry));
-    for (const sessionId of collectSessionStateIdsForEntry(removed.entry)) {
-      removedSessionIds.add(sessionId);
-    }
   };
   let remainingEntryCount = entryCount;
   let modelRunPruned = 0;
@@ -227,20 +223,47 @@ export function applySessionEntryMaintenance(
       preserveRecentMs: maintenance.preserveRecentMs,
     });
   }
-  for (const sessionId of readSessionGenerationIdsForKeys(database, removedKeys)) {
+  return {
+    ...planSqliteLiveEntryRemovals({
+      archiveDirectory: params.archiveDirectory,
+      database,
+      projectedStore: store,
+      removedEntriesByKey,
+      removedKeys,
+    }),
+    modelRunPruned,
+    pruned,
+    capped,
+  };
+}
+
+function planSqliteLiveEntryRemovals(params: {
+  archiveDirectory: string;
+  database: OpenClawAgentDatabase;
+  projectedStore: Record<string, SessionEntry>;
+  removedEntriesByKey: Map<string, SessionEntry>;
+  removedKeys: Set<string>;
+}): SessionEntryMaintenancePlan {
+  const removedSessionIds = new Set<string>();
+  for (const entry of params.removedEntriesByKey.values()) {
+    for (const sessionId of collectSessionStateIdsForEntry(entry)) {
+      removedSessionIds.add(sessionId);
+    }
+  }
+  for (const sessionId of readSessionGenerationIdsForKeys(params.database, params.removedKeys)) {
     removedSessionIds.add(sessionId);
   }
   const referencedSessionIds = collectProjectedReferencedSessionIds({
-    database,
-    excludedSessionKeys: removedKeys,
-    projectedStore: store,
+    database: params.database,
+    excludedSessionKeys: params.removedKeys,
+    projectedStore: params.projectedStore,
   });
   const deletePlans: SessionStateDeletePlan[] = [];
   for (const sessionId of removedSessionIds) {
     const plan = planSessionStateDeleteIfUnreferenced({
       archiveTranscript: true,
       archiveDirectory: params.archiveDirectory,
-      database,
+      database: params.database,
       referencedSessionIds,
       sessionId,
     });
@@ -249,15 +272,48 @@ export function applySessionEntryMaintenance(
     }
   }
   return {
-    entryRemovals: [...removedEntriesByKey].map(([sessionKey, entry]) => ({
+    entryRemovals: [...params.removedEntriesByKey].map(([sessionKey, entry]) => ({
       expectedEntry: entry,
       sessionKey,
     })),
     stateDeletePlans: deletePlans,
-    modelRunPruned,
-    pruned,
-    capped,
+    modelRunPruned: 0,
+    pruned: 0,
+    capped: 0,
   };
+}
+
+/** Plans at most one oldest capacity-eligible live session_node removal. */
+export function planOldestCapacityEligibleSqliteLiveEntryRemoval(params: {
+  archiveDirectory: string;
+  database: OpenClawAgentDatabase;
+  storePath: string;
+}): SessionEntryMaintenancePlan {
+  // simplification: rescan session_nodes per victim; index by updated_at if stores grow huge
+  const store = loadSqliteSessionMaintenanceStore(params.database);
+  const preserveKeys =
+    collectSessionMaintenancePreserveKeysForStore({
+      storePath: params.storePath,
+      store,
+    }) ?? new Set<string>();
+  const projectedStore = { ...store };
+  const removedKeys = new Set<string>();
+  const removedEntriesByKey = new Map<string, SessionEntry>();
+  capEntryCount(projectedStore, Math.max(0, Object.keys(store).length - 1), {
+    log: false,
+    onCapped: (removed) => {
+      removedKeys.add(removed.key);
+      removedEntriesByKey.set(removed.key, cloneSessionEntry(removed.entry));
+    },
+    preserveKeys,
+  });
+  return planSqliteLiveEntryRemovals({
+    archiveDirectory: params.archiveDirectory,
+    database: params.database,
+    projectedStore,
+    removedEntriesByKey,
+    removedKeys,
+  });
 }
 
 export async function finalizeSessionEntryMaintenancePlansBestEffort(
