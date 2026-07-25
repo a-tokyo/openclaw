@@ -1598,7 +1598,7 @@ describe("sqlite session normalization", () => {
       agentId: "main",
       env,
       sessionKey,
-      storePath: paths.sqlitePath,
+      storePath: paths.storePath,
     });
     const cronKey = "agent:main:cron:job-1";
     const cronEntry = {
@@ -1628,7 +1628,7 @@ describe("sqlite session normalization", () => {
       skipMaintenance: true,
     });
     const admission = await beginSessionWorkAdmission({
-      scope: paths.sqlitePath,
+      scope: paths.storePath,
       identities: [cronKey, cronEntry.sessionId],
       assertAllowed: () => {},
     });

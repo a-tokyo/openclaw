@@ -97,6 +97,7 @@ export function applySqliteSessionEntryMaintenance(
     forceMaintenance?: boolean;
     maintenanceConfig?: ResolvedSessionMaintenanceConfig;
     skipMaintenance?: boolean;
+    storePath: string;
   },
 ): SqliteSessionEntryMaintenancePlan {
   if (params.skipMaintenance) {
@@ -157,7 +158,7 @@ export function applySqliteSessionEntryMaintenance(
   };
   const preserveKeys =
     collectSessionMaintenancePreserveKeysForStore({
-      storePath: database.path,
+      storePath: params.storePath,
       store,
       baseKeys: collectSqliteSessionMaintenanceBaseKeys(store, params.activeSessionKey),
     }) ?? new Set<string>();
