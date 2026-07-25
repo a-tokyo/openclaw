@@ -394,12 +394,11 @@ function isExternalGroupOrChannelSessionKey(sessionKey: string): boolean {
   return /^[^:]+:(?:group|channel):.+$/.test(rest);
 }
 
-function isAgentPrimarySessionKey(sessionKey: string): boolean {
-  // The agent's primary interactive session (`agent:<id>:main`, e.g. the TUI/webchat
-  // conversation). Subagent/cron/hook keys carry a prefixed `rest`, so an exact `main`
-  // match uniquely identifies the operator-facing session.
-  const parsed = parseAgentSessionKey(sessionKey);
-  return normalizeLowercaseStringOrEmpty(parsed?.rest) === "main";
+function isPrimarySessionMaintenanceKey(sessionKey: string): boolean {
+  if (normalizeLowercaseStringOrEmpty(sessionKey) === "global") {
+    return true;
+  }
+  return parseAgentSessionKey(sessionKey)?.rest === "main";
 }
 
 function isProtectedSessionMaintenanceEntry(
@@ -410,11 +409,9 @@ function isProtectedSessionMaintenanceEntry(
   if (isSyntheticSessionMaintenanceKey(sessionKey)) {
     return false;
   }
-  // The agent's own primary `main` session is the operator's live interactive conversation.
-  // Evicting it out from under an in-flight run corrupts the session file the runtime still
-  // holds (surfacing as `session file changed while embedded prompt lock was released`), so it
-  // is always durable regardless of entry-cap/disk pressure from other sessions.
-  if (isAgentPrimarySessionKey(sessionKey)) {
+  // Primary sessions are operator-facing and must survive maintenance even without an active
+  // admission. Global scope uses the literal `global` key instead of `agent:<id>:main`.
+  if (isPrimarySessionMaintenanceKey(sessionKey)) {
     return true;
   }
   if (parseSessionThreadInfoFast(sessionKey).threadId) {

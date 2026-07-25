@@ -842,15 +842,13 @@ describe("enforceSessionDiskBudget", () => {
 });
 
 describe("isProtectedSessionMaintenanceEntry", () => {
-  it("always protects the agent's primary main session across agents", () => {
-    expect(isProtectedSessionMaintenanceEntry("agent:main:main", makeEntry(Date.now()))).toBe(true);
-    expect(isProtectedSessionMaintenanceEntry("agent:worker:main", makeEntry(Date.now()))).toBe(
-      true,
-    );
-    // A non-main, metadata-less session key remains disposable.
-    expect(isProtectedSessionMaintenanceEntry("agent:main:opaque", makeEntry(Date.now()))).toBe(
-      false,
-    );
+  it.each([
+    ["agent:main:main", true],
+    ["agent:worker:main", true],
+    ["global", true],
+    ["agent:main:opaque", false],
+  ])("classifies primary session key %s as protected=%s", (key, expected) => {
+    expect(isProtectedSessionMaintenanceEntry(key, makeEntry(Date.now()))).toBe(expected);
   });
 
   it("treats generated ACP bridge sessions as disposable", () => {
