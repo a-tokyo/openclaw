@@ -64,7 +64,7 @@ function collectSqliteSessionMaintenanceBaseKeys(
   return keys;
 }
 
-export function hasStaleSqliteSessionEntryCandidate(
+function hasStaleSqliteSessionEntryCandidate(
   database: OpenClawAgentDatabase,
   pruneAfterMs: number,
   preserveKeys: ReadonlySet<string> | undefined,
