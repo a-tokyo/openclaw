@@ -65,6 +65,7 @@ import {
   restoreSqliteCompactionCheckpointSession,
   upsertSqliteSessionEntry,
 } from "./session-accessor.sqlite.js";
+import { hasStaleSqliteSessionEntryCandidate } from "./session-accessor.sqlite-maintenance.js";
 import { parseSqliteSessionFileMarker } from "./sqlite-marker.js";
 import type { SessionCompactionCheckpoint, SessionEntry } from "./types.js";
 
@@ -1443,6 +1444,39 @@ describe("sqlite session normalization", () => {
         .where("session_key", "=", "agent:main:main"),
     );
     expect(route).toEqual({ current_session_id: "current-session" });
+  });
+
+  it("does not treat a stale protected primary session as a reclaimable SQLite candidate", async () => {
+    const env = { ...process.env, OPENCLAW_STATE_DIR: paths.stateDir };
+    const scopeFor = (sessionKey: string) => ({
+      agentId: "main",
+      env,
+      sessionKey,
+      storePath: paths.sqlitePath,
+    });
+    const stalePrimary = {
+      sessionId: "stale-primary",
+      updatedAt: Date.now() - 2 * 24 * 60 * 60 * 1000,
+    };
+    await patchSqliteSessionEntry(scopeFor("agent:main:main"), () => stalePrimary, {
+      fallbackEntry: stalePrimary,
+      replaceEntry: true,
+      skipMaintenance: true,
+    });
+    for (let index = 0; index < 12; index += 1) {
+      const entry = { sessionId: `fresh-${index}`, updatedAt: Date.now() };
+      await patchSqliteSessionEntry(scopeFor(`agent:main:fresh-${index}`), () => entry, {
+        fallbackEntry: entry,
+        replaceEntry: true,
+        skipMaintenance: true,
+      });
+    }
+
+    const database = openOpenClawAgentDatabase({ agentId: "main", env, path: paths.sqlitePath });
+    expect(hasStaleSqliteSessionEntryCandidate(database, 24 * 60 * 60 * 1000, undefined)).toBe(
+      false,
+    );
+    expect(loadSqliteSessionEntry(scopeFor("agent:main:main"))).toMatchObject(stalePrimary);
   });
 
   it("applies SQLite session-entry maintenance inside entry write transactions", async () => {

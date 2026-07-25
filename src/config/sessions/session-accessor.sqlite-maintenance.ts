@@ -40,6 +40,7 @@ import {
   capEntryCount,
   pruneStaleModelRunEntries,
   pruneStaleEntries,
+  shouldPreserveMaintenanceEntry,
   shouldRunModelRunPrune,
   shouldRunSessionEntryMaintenance,
   type ResolvedSessionMaintenanceConfig,
@@ -63,7 +64,7 @@ function collectSqliteSessionMaintenanceBaseKeys(
   return keys;
 }
 
-function hasStaleSqliteSessionEntryCandidate(
+export function hasStaleSqliteSessionEntryCandidate(
   database: OpenClawAgentDatabase,
   pruneAfterMs: number,
   preserveKeys: ReadonlySet<string> | undefined,
@@ -82,11 +83,17 @@ function hasStaleSqliteSessionEntryCandidate(
       )
       .orderBy("updated_at", "asc"),
   ).rows;
-  return rows.some(
-    (row) =>
-      parseSessionEntryRow(row) !== null &&
-      !preserveKeys?.has(normalizeStoreSessionKey(row.session_key)),
-  );
+  return rows.some((row) => {
+    const entry = parseSessionEntryRow(row);
+    if (!entry) {
+      return false;
+    }
+    return !shouldPreserveMaintenanceEntry({
+      key: normalizeStoreSessionKey(row.session_key),
+      entry,
+      preserveKeys,
+    });
+  });
 }
 
 export function applySqliteSessionEntryMaintenance(
