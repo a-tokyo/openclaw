@@ -31,7 +31,10 @@ import {
 } from "./session-accessor.sqlite-scope.js";
 import { parseSqliteSessionEntryJson as parseSessionEntryRow } from "./session-accessor.sqlite-status.js";
 import { normalizeStoreSessionKey } from "./store-entry.js";
-import { collectSessionMaintenancePreserveKeys } from "./store-maintenance-preserve.js";
+import {
+  collectSessionMaintenancePreserveKeys,
+  collectSessionMaintenancePreserveKeysForStore,
+} from "./store-maintenance-preserve.js";
 import { resolveMaintenanceConfig } from "./store-maintenance-runtime.js";
 import {
   capEntryCount,
@@ -153,9 +156,11 @@ export function applySqliteSessionEntryMaintenance(
     }
   };
   const preserveKeys =
-    collectSessionMaintenancePreserveKeys(
-      collectSqliteSessionMaintenanceBaseKeys(store, params.activeSessionKey),
-    ) ?? new Set<string>();
+    collectSessionMaintenancePreserveKeysForStore({
+      storePath: database.path,
+      store,
+      baseKeys: collectSqliteSessionMaintenanceBaseKeys(store, params.activeSessionKey),
+    }) ?? new Set<string>();
   if (
     shouldRunModelRunPrune({
       maintenance,
