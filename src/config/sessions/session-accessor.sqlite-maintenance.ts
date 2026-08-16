@@ -342,7 +342,7 @@ export function collectAdmissionProtectedSessionIds(params: {
 }
 
 /** Live session_node keys that own any admission-protected generation. */
-export function collectAdmissionProtectedStoreKeys(params: {
+function collectAdmissionProtectedStoreKeys(params: {
   database: OpenClawAgentDatabase;
   storePath: string;
 }): Set<string> {
