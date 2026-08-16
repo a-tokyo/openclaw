@@ -756,10 +756,10 @@ async function enforceSessionHistoryMaintenanceSerialized(
       if (!victimKey) {
         break;
       }
-      const publishedArchives = await finalizeSessionEntryMaintenancePlansAfterWriterReleaseBestEffort(
-        resolved,
-        [livePlan],
-      );
+      const publishedArchives =
+        await finalizeSessionEntryMaintenancePlansAfterWriterReleaseBestEffort(resolved, [
+          livePlan,
+        ]);
       if (sqliteSessionNodeExists(database, victimKey)) {
         break;
       }
