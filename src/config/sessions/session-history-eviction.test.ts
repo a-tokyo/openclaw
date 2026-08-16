@@ -462,6 +462,72 @@ describe("SQLite historical session disk budget", () => {
     }
   });
 
+  it("inspects and evicts idle durable live nodes when no historical generations remain", async () => {
+    const mainKey = "agent:main:main";
+    const idleThreadKey = "agent:main:slack:channel:c3:thread:3";
+    const admittedThreadKey = "agent:main:slack:channel:c4:thread:4";
+    await replaceSessionEntry(
+      { sessionKey: mainKey, storePath },
+      { sessionId: "live-main", updatedAt: 40 },
+    );
+    await appendTranscriptMessage(
+      { sessionId: "live-main", sessionKey: mainKey, storePath },
+      { message: { role: "user", content: "main keep" } },
+    );
+    await replaceSessionEntry(
+      { sessionKey: idleThreadKey, storePath },
+      { sessionId: "idle-thread-live", updatedAt: 10 },
+    );
+    await appendTranscriptMessage(
+      { sessionId: "idle-thread-live", sessionKey: idleThreadKey, storePath },
+      { message: { role: "user", content: "idle live " + "x".repeat(64 * 1024) } },
+    );
+    await replaceSessionEntry(
+      { sessionKey: admittedThreadKey, storePath },
+      { sessionId: "admitted-thread", updatedAt: 5 },
+    );
+    await appendTranscriptMessage(
+      { sessionId: "admitted-thread", sessionKey: admittedThreadKey, storePath },
+      { message: { role: "user", content: "admitted keep" } },
+    );
+    const admission = await beginSessionWorkAdmission({
+      scope: storePath,
+      identities: [admittedThreadKey],
+      assertAllowed: () => {},
+    });
+    try {
+      settlePhysicalUsage();
+      expect(countHistoricalSessionIds()).toBe(0);
+      expect(sessionNodeExists(idleThreadKey)).toBe(true);
+      const before = await measureSessionPhysicalDiskUsage(storePath);
+      const maintenance = {
+        maxDiskBytes: before.totalBytes - 1,
+        highWaterBytes: Math.max(1, before.totalBytes - 32 * 1024),
+      };
+      const inspected = await inspectSqliteSessionHistoryDiskBudget({
+        storePath,
+        mode: "enforce",
+        maintenance,
+      });
+      const result = await enforceSqliteSessionHistoryDiskBudget({
+        storePath,
+        mode: "enforce",
+        maintenance,
+      });
+
+      expect(inspected.wouldMutate).toBe(true);
+      expect(result?.removedEntries).toBeGreaterThanOrEqual(1);
+      expect(sessionExists("idle-thread-live")).toBe(false);
+      expect(sessionNodeExists(idleThreadKey)).toBe(false);
+      expect(sessionExists("live-main")).toBe(true);
+      expect(sessionNodeExists(mainKey)).toBe(true);
+      expect(sessionExists("admitted-thread")).toBe(true);
+      expect(sessionNodeExists(admittedThreadKey)).toBe(true);
+    } finally {
+      admission.release();
+    }
+  });
+
   it("does not wipe live durables when highWaterBytes is 0", async () => {
     const threadKey = "agent:main:slack:channel:C9:thread:9";
     await replaceSessionEntry(
@@ -605,6 +671,32 @@ describe("SQLite historical session disk budget", () => {
         db.selectFrom("session_windows").select("session_id").where("session_id", "=", sessionId),
       ).rows.length === 1
     );
+  }
+
+  function sessionNodeExists(sessionKey: string): boolean {
+    const owner = database();
+    const db = getSessionKysely(owner.db);
+    return (
+      executeSqliteQuerySync(
+        owner.db,
+        db.selectFrom("session_nodes").select("session_key").where("session_key", "=", sessionKey),
+      ).rows.length === 1
+    );
+  }
+
+  function countHistoricalSessionIds(): number {
+    const owner = database();
+    const db = getSessionKysely(owner.db);
+    const liveIds = new Set(
+      executeSqliteQuerySync(
+        owner.db,
+        db.selectFrom("session_nodes").select("current_session_id"),
+      ).rows.map((row) => row.current_session_id),
+    );
+    return executeSqliteQuerySync(
+      owner.db,
+      db.selectFrom("session_windows").select("session_id"),
+    ).rows.filter((row) => !liveIds.has(row.session_id)).length;
   }
 
   function readArchiveNames(sessionId: string): string[] {

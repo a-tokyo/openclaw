@@ -30,8 +30,8 @@ import {
   readReferencedSessionIds,
 } from "./session-accessor.sqlite-lifecycle-state.js";
 import {
-  finalizeSessionEntryMaintenancePlansAfterWriterReleaseBestEffort,
   planOldestCapacityEligibleSqliteLiveEntryRemoval,
+  reclaimSqliteLiveSessionEntriesToHighWater,
 } from "./session-accessor.sqlite-maintenance.js";
 import {
   getSessionKysely,
@@ -124,6 +124,11 @@ export async function inspectSqliteSessionHistoryDiskBudget(
   // real stop condition. Tests pass highWaterBytes: 0 directly to exhaust
   // historical generations without wiping live nodes (#119422 / #119909).
   if (highWaterBytes <= 0 || maxDiskBytes <= 0) {
+    return { diskBudget, wouldMutate: false };
+  }
+  // Enforce checkpoints before live eviction. WAL is the checkpoint-reclaimable
+  // lower bound; do not claim a live mutation if checkpoint alone would suffice.
+  if (usage.totalBytes - usage.databaseWalBytes <= highWaterBytes) {
     return { diskBudget, wouldMutate: false };
   }
   const livePlan = planOldestCapacityEligibleSqliteLiveEntryRemoval({
@@ -291,20 +296,6 @@ export function collectAdmissionProtectedSessionIds(params: {
     }
   }
   return protectedSessionIds;
-}
-
-function sqliteSessionNodeExists(database: OpenClawAgentDatabase, sessionKey: string): boolean {
-  const db = getSessionKysely(database.db);
-  return (
-    executeSqliteQuerySync(
-      database.db,
-      db
-        .selectFrom("session_nodes")
-        .select("session_key")
-        .where("session_key", "=", sessionKey)
-        .limit(1),
-    ).rows.length > 0
-  );
 }
 
 function readHistoricalSessionIds(params: {
@@ -746,44 +737,27 @@ async function enforceSessionHistoryMaintenanceSerialized(
   // capacity victims so maxDiskBytes still bounds the store. Skip when the
   // high-water mark is not a usable stop condition (#119422 / #119909).
   if (highWaterBytes > 0 && maxDiskBytes > 0) {
-    while (usage.totalBytes > highWaterBytes) {
-      const livePlan = planOldestCapacityEligibleSqliteLiveEntryRemoval({
-        archiveDirectory,
-        database,
-        storePath: params.storePath,
-      });
-      const victimKey = livePlan.entryRemovals[0]?.sessionKey;
-      if (!victimKey) {
-        break;
-      }
-      const publishedArchives =
-        await finalizeSessionEntryMaintenancePlansAfterWriterReleaseBestEffort(resolved, [
-          livePlan,
-        ]);
-      if (sqliteSessionNodeExists(database, victimKey)) {
-        break;
-      }
-      removedEntries += 1;
-      emitArchivedTranscriptUpdates(publishedArchives);
-      try {
-        reclaimSqliteFreePages(database);
-      } catch {
-        // Best-effort reclamation only.
-      }
-      usage = await measureSessionPhysicalDiskUsage(params.storePath);
-      if (usage.totalBytes > highWaterBytes) {
-        const repruned = await runExclusiveSqliteSessionWrite(resolved, async () =>
+    const live = await reclaimSqliteLiveSessionEntriesToHighWater({
+      archiveDirectory,
+      database,
+      highWaterBytes,
+      pruneArchivesToHighWater: async () =>
+        await runExclusiveSqliteSessionWrite(resolved, async () =>
           pruneAllSessionTranscriptArchivesToHighWater({
             archiveDirectory,
             database,
             highWaterBytes,
             storePath: params.storePath,
           }),
-        );
-        removedFiles += repruned.removedFiles;
-        usage = repruned.usage;
-      }
-    }
+        ),
+      reclaimFreePages: reclaimSqliteFreePages,
+      resolved,
+      storePath: params.storePath,
+      usage,
+    });
+    removedEntries += live.removedEntries;
+    removedFiles += live.removedFiles;
+    usage = live.usage;
   }
 
   if (usage.totalBytes > highWaterBytes) {

@@ -1,10 +1,12 @@
 import { uniqueStrings } from "@openclaw/normalization-core/string-normalization";
 import { executeSqliteQuerySync } from "../../infra/kysely-sync.js";
 import { getChildLogger } from "../../logging/logger.js";
+import { runExclusiveSessionLifecycleMutation } from "../../sessions/session-lifecycle-admission.js";
 import {
   runOpenClawAgentWriteTransaction,
   type OpenClawAgentDatabase,
 } from "../../state/openclaw-agent-db.js";
+import { measureSessionPhysicalDiskUsage, type SessionPhysicalDiskUsage } from "./disk-budget.js";
 import { publishSessionStateArchives } from "./session-accessor.sqlite-archive-store.js";
 import {
   materializeSessionStateDeletePlans,
@@ -12,6 +14,7 @@ import {
 } from "./session-accessor.sqlite-archive.js";
 import type { SessionLifecycleArchivedTranscript } from "./session-accessor.sqlite-contract.js";
 import { readSessionEntryCount } from "./session-accessor.sqlite-entry-store.js";
+import { emitArchivedTranscriptUpdates } from "./session-accessor.sqlite-events.js";
 import { emitCommittedSessionEntryRemovals } from "./session-accessor.sqlite-identity.js";
 import {
   assertPlannedLifecycleArtifactEntriesUnchanged,
@@ -25,6 +28,7 @@ import {
 import type {
   SessionEntryMaintenancePlan,
   SessionEntryMaintenanceResult,
+  SessionEntryRemovalPlan,
 } from "./session-accessor.sqlite-lifecycle-types.js";
 import {
   cloneSessionEntry,
@@ -287,6 +291,7 @@ function planSqliteLiveEntryRemovals(params: {
 export function planOldestCapacityEligibleSqliteLiveEntryRemoval(params: {
   archiveDirectory: string;
   database: OpenClawAgentDatabase;
+  skipSessionKeys?: ReadonlySet<string>;
   storePath: string;
 }): SessionEntryMaintenancePlan {
   // simplification: rescan session_nodes per victim; index by updated_at if stores grow huge
@@ -296,6 +301,9 @@ export function planOldestCapacityEligibleSqliteLiveEntryRemoval(params: {
       storePath: params.storePath,
       store,
     }) ?? new Set<string>();
+  for (const key of params.skipSessionKeys ?? []) {
+    preserveKeys.add(key);
+  }
   const projectedStore = { ...store };
   const removedKeys = new Set<string>();
   const removedEntriesByKey = new Map<string, SessionEntry>();
@@ -316,6 +324,124 @@ export function planOldestCapacityEligibleSqliteLiveEntryRemoval(params: {
   });
 }
 
+function sqliteSessionNodeExists(database: OpenClawAgentDatabase, sessionKey: string): boolean {
+  const db = getSessionKysely(database.db);
+  return (
+    executeSqliteQuerySync(
+      database.db,
+      db
+        .selectFrom("session_nodes")
+        .select("session_key")
+        .where("session_key", "=", sessionKey)
+        .limit(1),
+    ).rows.length > 0
+  );
+}
+
+function areCapacityEligibleLiveEntryRemovals(params: {
+  database: OpenClawAgentDatabase;
+  entryRemovals: readonly SessionEntryRemovalPlan[];
+  storePath: string;
+}): boolean {
+  if (params.entryRemovals.length === 0) {
+    return false;
+  }
+  const store = loadSqliteSessionMaintenanceStore(params.database);
+  const preserveKeys =
+    collectSessionMaintenancePreserveKeysForStore({
+      storePath: params.storePath,
+      store,
+    }) ?? new Set<string>();
+  return params.entryRemovals.every(
+    (removal) =>
+      !shouldPreserveMaintenanceEntry({
+        key: removal.sessionKey,
+        entry: store[removal.sessionKey] ?? removal.expectedEntry,
+        preserveKeys,
+        scope: "capacity",
+      }),
+  );
+}
+
+/** Last-resort live-node disk eviction. Historical generations must already be exhausted. */
+export async function reclaimSqliteLiveSessionEntriesToHighWater(params: {
+  archiveDirectory: string;
+  database: OpenClawAgentDatabase;
+  highWaterBytes: number;
+  pruneArchivesToHighWater: () => Promise<{
+    removedFiles: number;
+    usage: SessionPhysicalDiskUsage;
+  }>;
+  reclaimFreePages: (database: OpenClawAgentDatabase) => void;
+  resolved: Pick<ResolvedSqliteReadScope, "agentId" | "env" | "path">;
+  storePath: string;
+  usage: SessionPhysicalDiskUsage;
+}): Promise<{
+  removedEntries: number;
+  removedFiles: number;
+  usage: SessionPhysicalDiskUsage;
+}> {
+  let { usage } = params;
+  let removedEntries = 0;
+  let removedFiles = 0;
+  const skipSessionKeys = new Set<string>();
+  while (usage.totalBytes > params.highWaterBytes) {
+    const livePlan = planOldestCapacityEligibleSqliteLiveEntryRemoval({
+      archiveDirectory: params.archiveDirectory,
+      database: params.database,
+      skipSessionKeys,
+      storePath: params.storePath,
+    });
+    const victim = livePlan.entryRemovals[0];
+    if (!victim) {
+      break;
+    }
+    const identities = uniqueStrings(
+      [victim.sessionKey, victim.expectedEntry?.sessionId].filter(
+        (identity): identity is string => typeof identity === "string" && identity.length > 0,
+      ),
+    );
+    const publishedArchives = await runExclusiveSessionLifecycleMutation({
+      scope: params.storePath,
+      identities,
+      run: async () => {
+        const fencedPlan = planOldestCapacityEligibleSqliteLiveEntryRemoval({
+          archiveDirectory: params.archiveDirectory,
+          database: params.database,
+          skipSessionKeys,
+          storePath: params.storePath,
+        });
+        if (fencedPlan.entryRemovals[0]?.sessionKey !== victim.sessionKey) {
+          return null;
+        }
+        return await finalizeSessionEntryMaintenancePlansAfterWriterReleaseBestEffort(
+          params.resolved,
+          [fencedPlan],
+          { storePath: params.storePath },
+        );
+      },
+    });
+    if (!publishedArchives || sqliteSessionNodeExists(params.database, victim.sessionKey)) {
+      skipSessionKeys.add(victim.sessionKey);
+      continue;
+    }
+    removedEntries += 1;
+    emitArchivedTranscriptUpdates(publishedArchives);
+    try {
+      params.reclaimFreePages(params.database);
+    } catch {
+      // Best-effort reclamation only.
+    }
+    usage = await measureSessionPhysicalDiskUsage(params.storePath);
+    if (usage.totalBytes > params.highWaterBytes) {
+      const repruned = await params.pruneArchivesToHighWater();
+      removedFiles += repruned.removedFiles;
+      usage = repruned.usage;
+    }
+  }
+  return { removedEntries, removedFiles, usage };
+}
+
 export async function finalizeSessionEntryMaintenancePlansBestEffort(
   scope: Pick<ResolvedSqliteReadScope, "agentId" | "env" | "path">,
   plans: readonly SessionEntryMaintenancePlan[],
@@ -329,11 +455,13 @@ export async function finalizeSessionEntryMaintenancePlansBestEffort(
 export async function finalizeSessionEntryMaintenancePlansAfterWriterReleaseBestEffort(
   scope: Pick<ResolvedSqliteReadScope, "agentId" | "env" | "path">,
   plans: readonly SessionEntryMaintenancePlan[],
+  options?: { storePath?: string },
 ): Promise<SessionEntryMaintenanceResult> {
   return await finalizeSqliteSessionEntryMaintenancePlansWithCommit(
     scope,
     plans,
     async (commit) => await runExclusiveSqliteSessionWrite(scope, async () => commit()),
+    options,
   );
 }
 
@@ -343,8 +471,8 @@ async function finalizeSqliteSessionEntryMaintenancePlansWithCommit(
   commit: (
     fn: () => SessionLifecycleArchivedTranscript[],
   ) => Promise<SessionLifecycleArchivedTranscript[]>,
-): Promise<SessionEntryMaintenanceResult> {
-  const entryRemovals = plans.flatMap((plan) => plan.entryRemovals);
+  options?: { storePath?: string },
+): Promise<SessionEntryMaintenanceResult> {  const entryRemovals = plans.flatMap((plan) => plan.entryRemovals);
   const stateDeletePlans = plans.flatMap((plan) => plan.stateDeletePlans);
   const warn = (message: string, error: unknown) => {
     getChildLogger({ subsystem: "session-sqlite" }).warn(message, {
@@ -366,10 +494,22 @@ async function finalizeSqliteSessionEntryMaintenancePlansWithCommit(
   let archivedTranscripts: SessionLifecycleArchivedTranscript[];
   try {
     const materializedPlans = await materializeSessionStateDeletePlans(stateDeletePlans);
+    let aborted = false;
     archivedTranscripts = await commit(() => {
       let committed: SessionLifecycleArchivedTranscript[] = [];
       runOpenClawAgentWriteTransaction((database) => {
         assertPlannedLifecycleArtifactEntriesUnchanged(database, entryRemovals);
+        if (
+          options?.storePath &&
+          !areCapacityEligibleLiveEntryRemovals({
+            database,
+            entryRemovals,
+            storePath: options.storePath,
+          })
+        ) {
+          aborted = true;
+          return;
+        }
         committed = deleteMaterializedSessionStatePlans(
           database,
           materializedPlans,
@@ -380,6 +520,9 @@ async function finalizeSqliteSessionEntryMaintenancePlansWithCommit(
       }, toDatabaseOptions(scope));
       return committed;
     });
+    if (aborted) {
+      return emptyResult;
+    }
   } catch (error) {
     warn("SQLite session maintenance cleanup failed", error);
     return emptyResult;

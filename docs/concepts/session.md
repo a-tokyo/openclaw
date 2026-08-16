@@ -256,11 +256,14 @@ want immortal threads raise `maxEntries` / `maxDiskBytes` or set
 
 Shared or high-volume installations can set `preserveRecent` to protect
 recently active interactive sessions and every SQLite history generation owned
-by those sessions. The option is disabled when omitted or set to `false`, so
-personal installations keep the normal oldest-first policy. Synthetic
-model-run, cron, hook, heartbeat, ACP, and sub-agent sessions remain eligible
-for bounded cleanup. Protection can temporarily keep the store above its entry
-or disk target; it expires after the configured inactivity window.
+by those sessions from age pruning (`pruneAfter`) and SQLite
+historical-generation disk cleanup. `preserveRecent` does not exempt those
+sessions from `maxEntries` or live-node `maxDiskBytes` eviction; recently
+active interactive rows remain capacity-evictable oldest-first. The option is
+disabled when omitted or set to `false`, so personal installations keep the
+normal oldest-first policy. Synthetic model-run, cron, hook, heartbeat, ACP,
+and sub-agent sessions remain eligible for bounded cleanup. Age-window
+protection expires after the configured inactivity window.
 
 Recent-session protection does not archive sessions or change managed-worktree
 garbage collection. Archiving remains an explicit user action for sessions that

@@ -1656,7 +1656,7 @@ describe("sqlite session normalization", () => {
     ).toEqual(["agent:main:newer", "agent:main:newest"]);
   });
 
-  it("preserves recent SQLite entries and transcripts during write-triggered capping", async () => {
+  it("evicts recent SQLite entries during write-triggered capping", async () => {
     vi.mocked(getRuntimeConfig).mockReturnValue({
       session: {
         maintenance: {
@@ -1733,12 +1733,7 @@ describe("sqlite session normalization", () => {
         env,
         storePath: paths.sqlitePath,
       }).map((summary) => summary.sessionKey),
-    ).toEqual([
-      "agent:main:archived-1",
-      "agent:main:maintenance-trigger",
-      "agent:main:recent-dashboard-1",
-      "agent:main:recent-dashboard-2",
-    ]);
+    ).toEqual(["agent:main:archived-1", "agent:main:maintenance-trigger"]);
     await expect(
       loadTranscriptEvents({
         agentId: "main",
@@ -1746,7 +1741,7 @@ describe("sqlite session normalization", () => {
         sessionId: recentSessionId,
         storePath: paths.sqlitePath,
       }),
-    ).resolves.toEqual([recentTranscriptEvent]);
+    ).resolves.toEqual([]);
   });
 
   it("preserves pinned SQLite entries and transcripts during write-triggered capping", async () => {

@@ -13,7 +13,7 @@ import type { SessionEntry } from "./types.js";
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 describe("recent session maintenance preservation", () => {
-  it("is opt-in and keeps recent interactive sessions through prune and cap pressure", () => {
+  it("is opt-in and keeps recent interactive sessions through age prune, not capacity caps", () => {
     const now = Date.now();
     const recentKey = "agent:main:dashboard:recent";
     const staleKey = "agent:main:dashboard:stale";
@@ -42,13 +42,18 @@ describe("recent session maintenance preservation", () => {
     expect(store).not.toHaveProperty(staleKey);
     expect(store).not.toHaveProperty(syntheticKey);
 
-    store[staleKey] = { sessionId: "stale-2", updatedAt: now - 8 * DAY_MS };
-    expect(capEntryCount(store, 1, { preserveRecentMs })).toBe(1);
-    expect(store).toHaveProperty(recentKey);
-    expect(store).not.toHaveProperty(staleKey);
+    const olderRecentKey = "agent:main:dashboard:older-recent";
+    const newerRecentKey = "agent:main:dashboard:newer-recent";
+    const capStore: Record<string, SessionEntry> = {
+      [olderRecentKey]: { sessionId: "older-recent", updatedAt: now - DAY_MS },
+      [newerRecentKey]: { sessionId: "newer-recent", updatedAt: now },
+    };
+    expect(capEntryCount(capStore, 1, { preserveRecentMs })).toBe(1);
+    expect(capStore).not.toHaveProperty(olderRecentKey);
+    expect(capStore).toHaveProperty(newerRecentKey);
   });
 
-  it("keeps recent interactive sessions under file-store disk pressure", async () => {
+  it("evicts recent interactive sessions under file-store disk pressure", async () => {
     await withTestDir({ prefix: "openclaw-preserve-recent-budget-" }, async (dir) => {
       const now = Date.now();
       const recentKey = "agent:main:dashboard:recent";
@@ -77,8 +82,8 @@ describe("recent session maintenance preservation", () => {
         warnOnly: false,
       });
 
-      expect(result?.removedEntries).toBe(1);
-      expect(store).toHaveProperty(recentKey);
+      expect(result?.removedEntries).toBe(2);
+      expect(store).not.toHaveProperty(recentKey);
       expect(store).not.toHaveProperty(staleKey);
     });
   });
