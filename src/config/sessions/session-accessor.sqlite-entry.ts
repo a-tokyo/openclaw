@@ -644,6 +644,7 @@ async function patchSqliteSessionEntrySnapshot<TSnapshot>(
   await finalizeSessionEntryMaintenancePlansAfterWriterReleaseBestEffort(
     resolved,
     committed.maintenancePlans,
+    { storePath: params.storePath },
   );
   kickSessionHistoryDiskBudgetMaintenance({
     ...(resolved.agentId ? { agentId: resolved.agentId } : {}),

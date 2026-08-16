@@ -1,7 +1,10 @@
 import { uniqueStrings } from "@openclaw/normalization-core/string-normalization";
 import { executeSqliteQuerySync } from "../../infra/kysely-sync.js";
 import { getChildLogger } from "../../logging/logger.js";
-import { runExclusiveSessionLifecycleMutation } from "../../sessions/session-lifecycle-admission.js";
+import {
+  collectActiveSessionWorkAdmissionIdentities,
+  runExclusiveSessionLifecycleMutation,
+} from "../../sessions/session-lifecycle-admission.js";
 import {
   runOpenClawAgentWriteTransaction,
   type OpenClawAgentDatabase,
@@ -18,7 +21,6 @@ import { emitArchivedTranscriptUpdates } from "./session-accessor.sqlite-events.
 import { emitCommittedSessionEntryRemovals } from "./session-accessor.sqlite-identity.js";
 import {
   assertPlannedLifecycleArtifactEntriesUnchanged,
-  collectAdmissionProtectedStoreKeys,
   collectProjectedReferencedSessionIds,
   collectSessionStateIdsForEntry,
   deleteMaterializedSessionStatePlans,
@@ -170,12 +172,12 @@ export function applySessionEntryMaintenance(
   }
 
   const store = loadSqliteSessionMaintenanceStore(database);
-  const preserveKeys =
-    collectSessionMaintenancePreserveKeysForStore({
-      storePath: params.storePath,
-      store,
-      baseKeys: collectSqliteSessionMaintenanceBaseKeys(store, params.activeSessionKey),
-    }) ?? new Set<string>();
+  const preserveKeys = collectCapacityEligibleLivePreserveKeys({
+    baseKeys: collectSqliteSessionMaintenanceBaseKeys(store, params.activeSessionKey),
+    database,
+    store,
+    storePath: params.storePath,
+  });
   const removedKeys = new Set<string>();
   const removedEntriesByKey = new Map<string, SessionEntry>();
   const rememberRemovedEntry = (removed: { key: string; entry: SessionEntry }) => {
@@ -288,7 +290,92 @@ function planSqliteLiveEntryRemovals(params: {
   };
 }
 
+/** Session ids owned by in-flight work admissions, without live-reference protection. */
+export function collectAdmissionProtectedSessionIds(params: {
+  database: OpenClawAgentDatabase;
+  storePath: string;
+}): Set<string> {
+  const protectedSessionIds = new Set<string>();
+  const admissionIdentities = collectActiveSessionWorkAdmissionIdentities(params.storePath);
+  if (admissionIdentities.size === 0) {
+    return protectedSessionIds;
+  }
+
+  // Admissions may carry either the backing session id or its live session key. Protect both,
+  // then resolve admitted keys through their entries so cleanup cannot reclaim active work.
+  for (const identity of admissionIdentities) {
+    protectedSessionIds.add(identity);
+  }
+  const normalizedAdmissionKeys = new Set(
+    [...admissionIdentities].map((identity) => normalizeStoreSessionKey(identity)),
+  );
+  const db = getSessionKysely(params.database.db);
+  const rows = executeSqliteQuerySync(
+    params.database.db,
+    db.selectFrom("session_nodes").select(["entry_json", "current_session_id", "session_key"]),
+  ).rows;
+  for (const row of rows) {
+    if (!normalizedAdmissionKeys.has(normalizeStoreSessionKey(row.session_key))) {
+      continue;
+    }
+    protectedSessionIds.add(row.current_session_id);
+    const entry = parseSessionEntryRow(row);
+    if (entry) {
+      for (const sessionId of collectSessionStateIdsForEntry(entry)) {
+        protectedSessionIds.add(sessionId);
+      }
+    }
+  }
+  // Key-scoped admissions must survive rollover: an in-flight run admitted by
+  // key may still write to a generation the entry no longer references, so
+  // every generation of an admitted key stays off-limits.
+  const generationRows = executeSqliteQuerySync(
+    params.database.db,
+    db.selectFrom("session_windows").select(["session_id", "session_key"]),
+  ).rows;
+  for (const row of generationRows) {
+    if (normalizedAdmissionKeys.has(normalizeStoreSessionKey(row.session_key))) {
+      protectedSessionIds.add(row.session_id);
+    }
+  }
+  return protectedSessionIds;
+}
+
+/** Live session_node keys that own any admission-protected generation. */
+export function collectAdmissionProtectedStoreKeys(params: {
+  database: OpenClawAgentDatabase;
+  storePath: string;
+}): Set<string> {
+  const protectedSessionIds = collectAdmissionProtectedSessionIds(params);
+  if (protectedSessionIds.size === 0) {
+    return new Set();
+  }
+  const keys = new Set<string>();
+  const db = getSessionKysely(params.database.db);
+  for (const row of executeSqliteQuerySync(
+    params.database.db,
+    db.selectFrom("session_nodes").select(["current_session_id", "session_key"]),
+  ).rows) {
+    if (
+      protectedSessionIds.has(row.session_key) ||
+      protectedSessionIds.has(row.current_session_id)
+    ) {
+      keys.add(row.session_key);
+    }
+  }
+  for (const row of executeSqliteQuerySync(
+    params.database.db,
+    db.selectFrom("session_windows").select(["session_id", "session_key"]),
+  ).rows) {
+    if (protectedSessionIds.has(row.session_id)) {
+      keys.add(row.session_key);
+    }
+  }
+  return keys;
+}
+
 function collectCapacityEligibleLivePreserveKeys(params: {
+  baseKeys?: Iterable<string | undefined>;
   database: OpenClawAgentDatabase;
   skipSessionKeys?: ReadonlySet<string>;
   store: Record<string, SessionEntry>;
@@ -296,6 +383,7 @@ function collectCapacityEligibleLivePreserveKeys(params: {
 }): Set<string> {
   const preserveKeys =
     collectSessionMaintenancePreserveKeysForStore({
+      baseKeys: params.baseKeys,
       storePath: params.storePath,
       store: params.store,
     }) ?? new Set<string>();
@@ -478,9 +566,13 @@ export async function reclaimSqliteLiveSessionEntriesToHighWater(params: {
 export async function finalizeSessionEntryMaintenancePlansBestEffort(
   scope: Pick<ResolvedSqliteReadScope, "agentId" | "env" | "path">,
   plans: readonly SessionEntryMaintenancePlan[],
+  options?: { storePath?: string },
 ): Promise<SessionEntryMaintenanceResult> {
-  return await finalizeSqliteSessionEntryMaintenancePlansWithCommit(scope, plans, async (commit) =>
-    commit(),
+  return await finalizeSqliteSessionEntryMaintenancePlansWithCommit(
+    scope,
+    plans,
+    async (commit) => commit(),
+    options,
   );
 }
 

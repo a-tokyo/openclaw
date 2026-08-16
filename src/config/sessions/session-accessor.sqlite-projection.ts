@@ -188,6 +188,7 @@ export async function applySessionStoreProjection<T>(params: {
   await finalizeSessionEntryMaintenancePlansAfterWriterReleaseBestEffort(
     resolved,
     committed.maintenancePlans,
+    { storePath: params.storePath },
   );
   return committed.result;
 }
@@ -438,6 +439,7 @@ export async function applySessionEntryLifecycleMutation(params: {
     await finalizeSessionEntryMaintenancePlansAfterWriterReleaseBestEffort(
       resolved,
       committed.maintenancePlans,
+      { storePath: params.storePath },
     );
   let publishedRemovalTranscripts: SessionLifecycleArchivedTranscript[] = [];
   try {
@@ -570,10 +572,12 @@ export async function purgeDeletedAgentSessionEntries(
     await finalizeSessionEntryMaintenancePlansAfterWriterReleaseBestEffort(
       resolved,
       committed.maintenancePlans,
+      { storePath: params.storePath },
     );
   const archivedTranscripts = [
     ...(await publishSessionStateArchives(resolved, committed.archivedTranscripts)),
     ...maintenanceArchivedTranscripts,
+  ];
   ];
   emitArchivedTranscriptUpdates(archivedTranscripts);
 }

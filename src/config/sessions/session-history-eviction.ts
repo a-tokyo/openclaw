@@ -21,12 +21,12 @@ import { publishSessionStateArchives } from "./session-accessor.sqlite-archive-s
 import { materializeSessionStateDeletePlans } from "./session-accessor.sqlite-archive.js";
 import { emitArchivedTranscriptUpdates } from "./session-accessor.sqlite-events.js";
 import {
-  collectAdmissionProtectedSessionIds,
   deleteMaterializedSessionStatePlans,
   planSessionStateDeleteIfUnreferenced,
   readReferencedSessionIds,
 } from "./session-accessor.sqlite-lifecycle-state.js";
 import {
+  collectAdmissionProtectedSessionIds,
   planOldestCapacityEligibleSqliteLiveEntryRemoval,
   reclaimSqliteLiveSessionEntriesToHighWater,
 } from "./session-accessor.sqlite-maintenance.js";

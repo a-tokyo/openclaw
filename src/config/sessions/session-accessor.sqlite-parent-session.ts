@@ -268,7 +268,9 @@ export async function forkSessionEntryFromParentTarget(
       };
     }, toDatabaseOptions(resolved));
     emitCommittedSessionIdentityDiff(previousIdentity, currentIdentity);
-    await finalizeSessionEntryMaintenancePlansBestEffort(resolved, maintenancePlans);
+    await finalizeSessionEntryMaintenancePlansBestEffort(resolved, maintenancePlans, {
+      storePath: params.storePath,
+    });
     return result;
   });
 }
@@ -319,7 +321,9 @@ async function persistSqliteParentForkSkipPatch(params: {
     currentIdentity = readSessionIdentitySnapshot(database, params.sessionTarget.storeKeys);
   }, toDatabaseOptions(params.resolved));
   emitCommittedSessionIdentityDiff(previousIdentity, currentIdentity);
-  await finalizeSessionEntryMaintenancePlansBestEffort(params.resolved, maintenancePlans);
+  await finalizeSessionEntryMaintenancePlansBestEffort(params.resolved, maintenancePlans, {
+    storePath: params.params.storePath,
+  });
   return cloneSessionEntry(next);
 }
 

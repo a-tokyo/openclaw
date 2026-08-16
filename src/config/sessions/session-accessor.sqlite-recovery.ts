@@ -230,6 +230,8 @@ export async function recoverSessionEntryFromRestartTombstone(params: {
   });
 
   emitCommittedSessionIdentityDiff(previousIdentity, currentIdentity);
-  await finalizeSessionEntryMaintenancePlansBestEffort(resolved, maintenancePlans);
+  await finalizeSessionEntryMaintenancePlansBestEffort(resolved, maintenancePlans, {
+    storePath: params.storePath,
+  });
   return result;
 }

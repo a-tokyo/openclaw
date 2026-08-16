@@ -34,6 +34,7 @@ import { measureSessionPhysicalDiskUsage } from "./disk-budget.js";
 import {
   appendTranscriptMessage,
   deleteSessionEntryLifecycle,
+  patchSessionEntryCore,
   replaceSessionEntry,
   resetSessionEntryLifecycle,
 } from "./session-accessor.js";
@@ -44,6 +45,7 @@ import {
   kickSessionHistoryDiskBudgetMaintenance,
 } from "./session-history-eviction.js";
 import { resolveSqliteTargetFromSessionStorePath } from "./session-sqlite-target.js";
+import { resolveMaintenanceConfigFromInput } from "./store-maintenance.js";
 
 describe("SQLite historical session disk budget", () => {
   let testState: OpenClawTestState;
@@ -364,6 +366,47 @@ describe("SQLite historical session disk budget", () => {
 
       expect(highWaterBytes).toBeGreaterThan(0);
       expect(result?.removedEntries ?? 0).toBe(0);
+      expect(sessionExists("admitted-history")).toBe(true);
+      expect(sessionExists("live-history")).toBe(true);
+      expect(sessionNodeExists(sessionKey)).toBe(true);
+    } finally {
+      admission.release();
+    }
+  });
+
+  it("does not cap a live node when the admission identity is a prior generation", async () => {
+    const sessionKey = "agent:main:history-protection";
+    const fillerKey = "agent:main:history-filler";
+    await replaceSessionEntry(
+      { sessionKey: fillerKey, storePath },
+      { sessionId: "filler-live", updatedAt: 1 },
+    );
+    await replaceSessionEntry(
+      { sessionKey, storePath },
+      { sessionId: "admitted-history", updatedAt: 2 },
+    );
+    await appendTranscriptMessage(
+      { sessionId: "admitted-history", sessionKey, storePath },
+      { message: { role: "user", content: "admitted" } },
+    );
+    await resetSessionEntryLifecycle({
+      storePath,
+      target: { canonicalKey: sessionKey, storeKeys: [sessionKey] },
+      buildNextEntry: () => ({ sessionId: "live-history", updatedAt: 3 }),
+    });
+    const admission = await beginSessionWorkAdmission({
+      scope: storePath,
+      identities: ["admitted-history"],
+      assertAllowed: () => {},
+    });
+    try {
+      await patchSessionEntryCore({ sessionKey: fillerKey, storePath }, () => ({ updatedAt: 4 }), {
+        maintenanceConfig: resolveMaintenanceConfigFromInput({
+          maxEntries: 1,
+          mode: "enforce",
+          pruneAfter: "365d",
+        }),
+      });
       expect(sessionExists("admitted-history")).toBe(true);
       expect(sessionExists("live-history")).toBe(true);
       expect(sessionNodeExists(sessionKey)).toBe(true);

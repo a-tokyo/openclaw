@@ -4,7 +4,6 @@ import {
   executeSqliteQueryTakeFirstSync,
 } from "../../infra/kysely-sync.js";
 import { normalizeAgentId, parseAgentSessionKey } from "../../routing/session-key.js";
-import { collectActiveSessionWorkAdmissionIdentities } from "../../sessions/session-lifecycle-admission.js";
 import {
   isIncognitoOpenClawAgentDatabase,
   type OpenClawAgentDatabase,
@@ -42,7 +41,6 @@ import { cloneSessionEntry, getSessionKysely } from "./session-accessor.sqlite-s
 import { parseSessionEntryJson as parseSessionEntryRow } from "./session-accessor.sqlite-status.js";
 import { buildSessionResetBoundaryPlan } from "./session-reset-boundary-event.js";
 import { deleteSessionTranscriptIndexInTransaction } from "./session-transcript-index.js";
-import { normalizeStoreSessionKey } from "./store-entry.js";
 import type { SessionEntry } from "./types.js";
 
 // Transcript-state reclamation owner. Planning stays async-free; transactions revalidate before delete.
@@ -306,90 +304,6 @@ export function readSessionGenerationIdsForKeys(
     database.db,
     db.selectFrom("session_windows").select("session_id").where("session_key", "in", sessionKeys),
   ).rows.map((row) => row.session_id);
-}
-
-/** Session ids owned by in-flight work admissions, without live-reference protection. */
-export function collectAdmissionProtectedSessionIds(params: {
-  database: OpenClawAgentDatabase;
-  storePath: string;
-}): Set<string> {
-  const protectedSessionIds = new Set<string>();
-  const admissionIdentities = collectActiveSessionWorkAdmissionIdentities(params.storePath);
-  if (admissionIdentities.size === 0) {
-    return protectedSessionIds;
-  }
-
-  // Admissions may carry either the backing session id or its live session key. Protect both,
-  // then resolve admitted keys through their entries so cleanup cannot reclaim active work.
-  for (const identity of admissionIdentities) {
-    protectedSessionIds.add(identity);
-  }
-  const normalizedAdmissionKeys = new Set(
-    [...admissionIdentities].map((identity) => normalizeStoreSessionKey(identity)),
-  );
-  const db = getSessionKysely(params.database.db);
-  const rows = executeSqliteQuerySync(
-    params.database.db,
-    db.selectFrom("session_nodes").select(["entry_json", "current_session_id", "session_key"]),
-  ).rows;
-  for (const row of rows) {
-    if (!normalizedAdmissionKeys.has(normalizeStoreSessionKey(row.session_key))) {
-      continue;
-    }
-    protectedSessionIds.add(row.current_session_id);
-    const entry = parseSessionEntryRow(row);
-    if (entry) {
-      for (const sessionId of collectSessionStateIdsForEntry(entry)) {
-        protectedSessionIds.add(sessionId);
-      }
-    }
-  }
-  // Key-scoped admissions must survive rollover: an in-flight run admitted by
-  // key may still write to a generation the entry no longer references, so
-  // every generation of an admitted key stays off-limits.
-  const generationRows = executeSqliteQuerySync(
-    params.database.db,
-    db.selectFrom("session_windows").select(["session_id", "session_key"]),
-  ).rows;
-  for (const row of generationRows) {
-    if (normalizedAdmissionKeys.has(normalizeStoreSessionKey(row.session_key))) {
-      protectedSessionIds.add(row.session_id);
-    }
-  }
-  return protectedSessionIds;
-}
-
-/** Live session_node keys that own any admission-protected generation. */
-export function collectAdmissionProtectedStoreKeys(params: {
-  database: OpenClawAgentDatabase;
-  storePath: string;
-}): Set<string> {
-  const protectedSessionIds = collectAdmissionProtectedSessionIds(params);
-  if (protectedSessionIds.size === 0) {
-    return new Set();
-  }
-  const keys = new Set<string>();
-  const db = getSessionKysely(params.database.db);
-  for (const row of executeSqliteQuerySync(
-    params.database.db,
-    db.selectFrom("session_nodes").select(["current_session_id", "session_key"]),
-  ).rows) {
-    if (
-      protectedSessionIds.has(row.session_key) ||
-      protectedSessionIds.has(row.current_session_id)
-    ) {
-      keys.add(row.session_key);
-    }
-  }
-  for (const row of executeSqliteQuerySync(
-    params.database.db,
-    db.selectFrom("session_windows").select(["session_id", "session_key"]),
-  ).rows) {
-    if (protectedSessionIds.has(row.session_id)) {
-      keys.add(row.session_key);
-    }
-  }
-  return keys;
 }
 
 // Projects removals and upserts before archive materialization so same-call

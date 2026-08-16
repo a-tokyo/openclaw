@@ -206,6 +206,7 @@ async function applySqliteSessionEntryReplacementProjection<T, TReplacement>(
   await finalizeSessionEntryMaintenancePlansAfterWriterReleaseBestEffort(
     resolved,
     committed.maintenancePlans,
+    { storePath: params.storePath },
   );
   return committed.result;
 }
