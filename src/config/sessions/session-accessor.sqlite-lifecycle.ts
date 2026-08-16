@@ -43,6 +43,7 @@ import { emitArchivedTranscriptUpdates } from "./session-accessor.sqlite-events.
 import { emitCommittedSessionEntryRemovals } from "./session-accessor.sqlite-identity.js";
 import {
   assertPlannedLifecycleArtifactEntriesUnchanged,
+  collectAdmissionProtectedSessionIds,
   deleteMaterializedSessionStatePlans,
   deletePlannedLifecycleArtifactEntries,
   planSessionLifecycleArtifactCleanup,
@@ -63,10 +64,7 @@ import {
   toDatabaseOptions,
 } from "./session-accessor.sqlite-scope.js";
 import { appendTranscriptEventsInTransaction } from "./session-accessor.sqlite-transcript-store.js";
-import {
-  collectAdmissionProtectedSessionIds,
-  kickSessionHistoryDiskBudgetMaintenance,
-} from "./session-history-eviction.js";
+import { kickSessionHistoryDiskBudgetMaintenance } from "./session-history-eviction.js";
 import { buildSessionResetBoundaryPlan } from "./session-reset-boundary-event.js";
 import type { InternalSessionEntry as SessionEntry } from "./types.js";
 

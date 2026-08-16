@@ -18,6 +18,7 @@ import { emitArchivedTranscriptUpdates } from "./session-accessor.sqlite-events.
 import { emitCommittedSessionEntryRemovals } from "./session-accessor.sqlite-identity.js";
 import {
   assertPlannedLifecycleArtifactEntriesUnchanged,
+  collectAdmissionProtectedStoreKeys,
   collectProjectedReferencedSessionIds,
   collectSessionStateIdsForEntry,
   deleteMaterializedSessionStatePlans,
@@ -287,6 +288,31 @@ function planSqliteLiveEntryRemovals(params: {
   };
 }
 
+function collectCapacityEligibleLivePreserveKeys(params: {
+  database: OpenClawAgentDatabase;
+  skipSessionKeys?: ReadonlySet<string>;
+  store: Record<string, SessionEntry>;
+  storePath: string;
+}): Set<string> {
+  const preserveKeys =
+    collectSessionMaintenancePreserveKeysForStore({
+      storePath: params.storePath,
+      store: params.store,
+    }) ?? new Set<string>();
+  for (const key of params.skipSessionKeys ?? []) {
+    preserveKeys.add(key);
+  }
+  // Admissions may name a non-current generation id. Map those ids back to the
+  // live session_node so capacity eviction cannot cascade-delete in-flight work.
+  for (const key of collectAdmissionProtectedStoreKeys({
+    database: params.database,
+    storePath: params.storePath,
+  })) {
+    preserveKeys.add(key);
+  }
+  return preserveKeys;
+}
+
 /** Plans at most one oldest capacity-eligible live session_node removal. */
 export function planOldestCapacityEligibleSqliteLiveEntryRemoval(params: {
   archiveDirectory: string;
@@ -296,14 +322,12 @@ export function planOldestCapacityEligibleSqliteLiveEntryRemoval(params: {
 }): SessionEntryMaintenancePlan {
   // simplification: rescan session_nodes per victim; index by updated_at if stores grow huge
   const store = loadSqliteSessionMaintenanceStore(params.database);
-  const preserveKeys =
-    collectSessionMaintenancePreserveKeysForStore({
-      storePath: params.storePath,
-      store,
-    }) ?? new Set<string>();
-  for (const key of params.skipSessionKeys ?? []) {
-    preserveKeys.add(key);
-  }
+  const preserveKeys = collectCapacityEligibleLivePreserveKeys({
+    database: params.database,
+    skipSessionKeys: params.skipSessionKeys,
+    store,
+    storePath: params.storePath,
+  });
   const projectedStore = { ...store };
   const removedKeys = new Set<string>();
   const removedEntriesByKey = new Map<string, SessionEntry>();
@@ -347,11 +371,11 @@ function areCapacityEligibleLiveEntryRemovals(params: {
     return false;
   }
   const store = loadSqliteSessionMaintenanceStore(params.database);
-  const preserveKeys =
-    collectSessionMaintenancePreserveKeysForStore({
-      storePath: params.storePath,
-      store,
-    }) ?? new Set<string>();
+  const preserveKeys = collectCapacityEligibleLivePreserveKeys({
+    database: params.database,
+    store,
+    storePath: params.storePath,
+  });
   return params.entryRemovals.every(
     (removal) =>
       !shouldPreserveMaintenanceEntry({
@@ -397,10 +421,15 @@ export async function reclaimSqliteLiveSessionEntriesToHighWater(params: {
       break;
     }
     const identities = uniqueStrings(
-      [victim.sessionKey, victim.expectedEntry?.sessionId].filter(
+      [
+        victim.sessionKey,
+        victim.expectedEntry?.sessionId,
+        ...readSessionGenerationIdsForKeys(params.database, [victim.sessionKey]),
+      ].filter(
         (identity): identity is string => typeof identity === "string" && identity.length > 0,
       ),
     );
+    let retargeted = false;
     const publishedArchives = await runExclusiveSessionLifecycleMutation({
       scope: params.storePath,
       identities,
@@ -412,6 +441,7 @@ export async function reclaimSqliteLiveSessionEntriesToHighWater(params: {
           storePath: params.storePath,
         });
         if (fencedPlan.entryRemovals[0]?.sessionKey !== victim.sessionKey) {
+          retargeted = true;
           return null;
         }
         return await finalizeSessionEntryMaintenancePlansAfterWriterReleaseBestEffort(
@@ -421,6 +451,9 @@ export async function reclaimSqliteLiveSessionEntriesToHighWater(params: {
         );
       },
     });
+    if (retargeted) {
+      continue;
+    }
     if (!publishedArchives || sqliteSessionNodeExists(params.database, victim.sessionKey)) {
       skipSessionKeys.add(victim.sessionKey);
       continue;

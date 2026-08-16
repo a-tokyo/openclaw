@@ -324,6 +324,54 @@ describe("SQLite historical session disk budget", () => {
     }
   });
 
+  it("does not live-evict a node when the admission identity is a prior generation", async () => {
+    const sessionKey = "agent:main:history-protection";
+    await replaceSessionEntry(
+      { sessionKey, storePath },
+      { sessionId: "admitted-history", updatedAt: 1 },
+    );
+    await appendTranscriptMessage(
+      { sessionId: "admitted-history", sessionKey, storePath },
+      { message: { role: "user", content: "admitted " + "a".repeat(64 * 1024) } },
+    );
+    await resetSessionEntryLifecycle({
+      storePath,
+      target: { canonicalKey: sessionKey, storeKeys: [sessionKey] },
+      buildNextEntry: () => ({ sessionId: "live-history", updatedAt: 2 }),
+    });
+    await appendTranscriptMessage(
+      { sessionId: "live-history", sessionKey, storePath },
+      { message: { role: "user", content: "live keep" } },
+    );
+    const admission = await beginSessionWorkAdmission({
+      scope: storePath,
+      identities: ["admitted-history"],
+      assertAllowed: () => {},
+    });
+    try {
+      settlePhysicalUsage();
+      expect(countHistoricalSessionIds()).toBe(1);
+      const before = await measureSessionPhysicalDiskUsage(storePath);
+      const highWaterBytes = Math.max(1, before.totalBytes - 32 * 1024);
+      const result = await enforceSqliteSessionHistoryDiskBudget({
+        storePath,
+        mode: "enforce",
+        maintenance: {
+          maxDiskBytes: before.totalBytes - 1,
+          highWaterBytes,
+        },
+      });
+
+      expect(highWaterBytes).toBeGreaterThan(0);
+      expect(result?.removedEntries ?? 0).toBe(0);
+      expect(sessionExists("admitted-history")).toBe(true);
+      expect(sessionExists("live-history")).toBe(true);
+      expect(sessionNodeExists(sessionKey)).toBe(true);
+    } finally {
+      admission.release();
+    }
+  });
+
   it("preserves every generation of a recently active session under physical pressure", async () => {
     const now = Date.now();
     const dayMs = 24 * 60 * 60 * 1000;

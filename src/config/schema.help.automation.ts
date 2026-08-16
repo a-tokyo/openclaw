@@ -79,7 +79,7 @@ export const AUTOMATION_FIELD_HELP: Record<string, string> = {
   "session.maintenance.pruneAfter":
     "Removes entries older than this duration (for example `30d` or `12h`) during maintenance passes. Use this as the primary age-retention control and align it with data retention policy.",
   "session.maintenance.maxEntries":
-    "Caps total session entry count retained in the store to prevent unbounded growth over time. Protected entries count toward the limit but are never automatically removed, so the store can remain above the cap when protection alone exceeds it. Use lower limits for constrained environments, or higher limits when longer history is required.",
+    "Caps total live session entry count (default 500). Always-protected entries (primary main/global, archived, pinned, model-locked, and active/admitted work) count toward the cap but are never automatically removed, so the store can remain above the cap when those rows alone exceed it. Durable conversations are evictable oldest-first under this cap. Use lower limits for constrained environments, or higher limits when longer history is required.",
   "session.maintenance.preserveRecent":
     "Protects interactive sessions active within this duration (for example `7d`) from automatic age pruning and SQLite historical-generation disk cleanup. It does not block `maxEntries` or live-node `maxDiskBytes` eviction. Unset or `false` keeps the normal oldest-first policy. Synthetic model-run, cron, hook, heartbeat, ACP, and sub-agent rows remain eligible for bounded cleanup.",
   "session.maintenance.resetArchiveRetention":
