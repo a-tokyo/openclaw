@@ -578,7 +578,6 @@ export async function purgeDeletedAgentSessionEntries(
     ...(await publishSessionStateArchives(resolved, committed.archivedTranscripts)),
     ...maintenanceArchivedTranscripts,
   ];
-  ];
   emitArchivedTranscriptUpdates(archivedTranscripts);
 }
 

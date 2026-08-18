@@ -131,6 +131,7 @@ export async function inspectSqliteSessionHistoryDiskBudget(
     archiveDirectory: resolveSqliteTranscriptArchiveDirectory(resolved),
     database,
     storePath: params.storePath,
+    preserveRecentMs: params.maintenance.preserveRecentMs,
   });
   return { diskBudget, wouldMutate: livePlan.entryRemovals.length > 0 };
 }
@@ -699,6 +700,7 @@ async function enforceSessionHistoryMaintenanceSerialized(
       resolved,
       storePath: params.storePath,
       usage,
+      preserveRecentMs: params.maintenance.preserveRecentMs,
     });
     removedEntries += live.removedEntries;
     removedFiles += live.removedFiles;

@@ -535,15 +535,16 @@ export function shouldPreserveMaintenanceEntry(params: {
   ) {
     return true;
   }
-  // Under hard capacity/disk enforcement, durable conversations are reclaimable oldest-first;
-  // only age-based pruning preserves them (including recently active entries).
+  // Recently active interactive sessions stay protected under both age and
+  // capacity. Durables stay immortal for age prune, but are reclaimable
+  // oldest-first once the store hits maxEntries / maxDiskBytes.
+  if (isRecentSessionMaintenanceEntry(params)) {
+    return true;
+  }
   if ((params.scope ?? "age") === "capacity") {
     return false;
   }
-  return (
-    isRecentSessionMaintenanceEntry(params) ||
-    isDurableConversationMaintenanceEntry(params.key, params.entry)
-  );
+  return isDurableConversationMaintenanceEntry(params.key, params.entry);
 }
 
 function selectSessionEntryCapVictims(

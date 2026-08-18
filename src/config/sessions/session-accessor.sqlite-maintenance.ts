@@ -407,6 +407,7 @@ export function planOldestCapacityEligibleSqliteLiveEntryRemoval(params: {
   database: OpenClawAgentDatabase;
   skipSessionKeys?: ReadonlySet<string>;
   storePath: string;
+  preserveRecentMs?: number | null;
 }): SessionEntryMaintenancePlan {
   // simplification: rescan session_nodes per victim; index by updated_at if stores grow huge
   const store = loadSqliteSessionMaintenanceStore(params.database);
@@ -426,6 +427,7 @@ export function planOldestCapacityEligibleSqliteLiveEntryRemoval(params: {
       removedEntriesByKey.set(removed.key, cloneSessionEntry(removed.entry));
     },
     preserveKeys,
+    preserveRecentMs: resolveLivePreserveRecentMs(params.preserveRecentMs),
   });
   return planSqliteLiveEntryRemovals({
     archiveDirectory: params.archiveDirectory,
@@ -450,10 +452,17 @@ function sqliteSessionNodeExists(database: OpenClawAgentDatabase, sessionKey: st
   );
 }
 
+function resolveLivePreserveRecentMs(preserveRecentMs?: number | null): number | null {
+  return preserveRecentMs === undefined
+    ? (resolveMaintenanceConfig().preserveRecentMs ?? null)
+    : preserveRecentMs;
+}
+
 function areCapacityEligibleLiveEntryRemovals(params: {
   database: OpenClawAgentDatabase;
   entryRemovals: readonly SessionEntryRemovalPlan[];
   storePath: string;
+  preserveRecentMs?: number | null;
 }): boolean {
   if (params.entryRemovals.length === 0) {
     return false;
@@ -470,6 +479,7 @@ function areCapacityEligibleLiveEntryRemovals(params: {
         key: removal.sessionKey,
         entry: store[removal.sessionKey] ?? removal.expectedEntry,
         preserveKeys,
+        preserveRecentMs: resolveLivePreserveRecentMs(params.preserveRecentMs),
         scope: "capacity",
       }),
   );
@@ -488,6 +498,7 @@ export async function reclaimSqliteLiveSessionEntriesToHighWater(params: {
   resolved: Pick<ResolvedSqliteReadScope, "agentId" | "env" | "path">;
   storePath: string;
   usage: SessionPhysicalDiskUsage;
+  preserveRecentMs?: number | null;
 }): Promise<{
   removedEntries: number;
   removedFiles: number;
@@ -497,13 +508,15 @@ export async function reclaimSqliteLiveSessionEntriesToHighWater(params: {
   let removedEntries = 0;
   let removedFiles = 0;
   const skipSessionKeys = new Set<string>();
+  const livePlanParams = {
+    archiveDirectory: params.archiveDirectory,
+    database: params.database,
+    skipSessionKeys,
+    storePath: params.storePath,
+    preserveRecentMs: params.preserveRecentMs,
+  };
   while (usage.totalBytes > params.highWaterBytes) {
-    const livePlan = planOldestCapacityEligibleSqliteLiveEntryRemoval({
-      archiveDirectory: params.archiveDirectory,
-      database: params.database,
-      skipSessionKeys,
-      storePath: params.storePath,
-    });
+    const livePlan = planOldestCapacityEligibleSqliteLiveEntryRemoval(livePlanParams);
     const victim = livePlan.entryRemovals[0];
     if (!victim) {
       break;
@@ -518,16 +531,11 @@ export async function reclaimSqliteLiveSessionEntriesToHighWater(params: {
       ),
     );
     let retargeted = false;
-    const publishedArchives = await runExclusiveSessionLifecycleMutation({
+    const published = await runExclusiveSessionLifecycleMutation({
       scope: params.storePath,
       identities,
       run: async () => {
-        const fencedPlan = planOldestCapacityEligibleSqliteLiveEntryRemoval({
-          archiveDirectory: params.archiveDirectory,
-          database: params.database,
-          skipSessionKeys,
-          storePath: params.storePath,
-        });
+        const fencedPlan = planOldestCapacityEligibleSqliteLiveEntryRemoval(livePlanParams);
         if (fencedPlan.entryRemovals[0]?.sessionKey !== victim.sessionKey) {
           retargeted = true;
           return null;
@@ -535,19 +543,19 @@ export async function reclaimSqliteLiveSessionEntriesToHighWater(params: {
         return await finalizeSessionEntryMaintenancePlansAfterWriterReleaseBestEffort(
           params.resolved,
           [fencedPlan],
-          { storePath: params.storePath },
+          { storePath: params.storePath, preserveRecentMs: params.preserveRecentMs },
         );
       },
     });
     if (retargeted) {
       continue;
     }
-    if (!publishedArchives || sqliteSessionNodeExists(params.database, victim.sessionKey)) {
+    if (!published || sqliteSessionNodeExists(params.database, victim.sessionKey)) {
       skipSessionKeys.add(victim.sessionKey);
       continue;
     }
     removedEntries += 1;
-    emitArchivedTranscriptUpdates(publishedArchives);
+    emitArchivedTranscriptUpdates(published.archivedTranscripts);
     try {
       params.reclaimFreePages(params.database);
     } catch {
@@ -563,10 +571,15 @@ export async function reclaimSqliteLiveSessionEntriesToHighWater(params: {
   return { removedEntries, removedFiles, usage };
 }
 
+type SessionEntryMaintenanceFinalizeOptions = {
+  storePath?: string;
+  preserveRecentMs?: number | null;
+};
+
 export async function finalizeSessionEntryMaintenancePlansBestEffort(
   scope: Pick<ResolvedSqliteReadScope, "agentId" | "env" | "path">,
   plans: readonly SessionEntryMaintenancePlan[],
-  options?: { storePath?: string },
+  options?: SessionEntryMaintenanceFinalizeOptions,
 ): Promise<SessionEntryMaintenanceResult> {
   return await finalizeSqliteSessionEntryMaintenancePlansWithCommit(
     scope,
@@ -580,7 +593,7 @@ export async function finalizeSessionEntryMaintenancePlansBestEffort(
 export async function finalizeSessionEntryMaintenancePlansAfterWriterReleaseBestEffort(
   scope: Pick<ResolvedSqliteReadScope, "agentId" | "env" | "path">,
   plans: readonly SessionEntryMaintenancePlan[],
-  options?: { storePath?: string },
+  options?: SessionEntryMaintenanceFinalizeOptions,
 ): Promise<SessionEntryMaintenanceResult> {
   return await finalizeSqliteSessionEntryMaintenancePlansWithCommit(
     scope,
@@ -596,8 +609,9 @@ async function finalizeSqliteSessionEntryMaintenancePlansWithCommit(
   commit: (
     fn: () => SessionLifecycleArchivedTranscript[],
   ) => Promise<SessionLifecycleArchivedTranscript[]>,
-  options?: { storePath?: string },
-): Promise<SessionEntryMaintenanceResult> {  const entryRemovals = plans.flatMap((plan) => plan.entryRemovals);
+  options?: SessionEntryMaintenanceFinalizeOptions,
+): Promise<SessionEntryMaintenanceResult> {
+  const entryRemovals = plans.flatMap((plan) => plan.entryRemovals);
   const stateDeletePlans = plans.flatMap((plan) => plan.stateDeletePlans);
   const warn = (message: string, error: unknown) => {
     getChildLogger({ subsystem: "session-sqlite" }).warn(message, {
@@ -630,6 +644,7 @@ async function finalizeSqliteSessionEntryMaintenancePlansWithCommit(
             database,
             entryRemovals,
             storePath: options.storePath,
+            preserveRecentMs: options.preserveRecentMs,
           })
         ) {
           aborted = true;

@@ -619,6 +619,64 @@ describe("SQLite historical session disk budget", () => {
     }
   });
 
+  it("preserves recently active live nodes under physical pressure", async () => {
+    const now = Date.now();
+    const dayMs = 24 * 60 * 60 * 1000;
+    const mainKey = "agent:main:main";
+    const recentKey = "agent:main:dashboard:recent";
+    const idleThreadKey = "agent:main:slack:channel:c5:thread:5";
+    await replaceSessionEntry(
+      { sessionKey: mainKey, storePath },
+      { sessionId: "live-main", updatedAt: now },
+    );
+    await appendTranscriptMessage(
+      { sessionId: "live-main", sessionKey: mainKey, storePath },
+      { message: { role: "user", content: "main keep" } },
+    );
+    await replaceSessionEntry(
+      { sessionKey: recentKey, storePath },
+      { sessionId: "recent-live", updatedAt: now },
+    );
+    await appendTranscriptMessage(
+      { sessionId: "recent-live", sessionKey: recentKey, storePath },
+      { message: { role: "user", content: "recent keep" } },
+    );
+    await replaceSessionEntry(
+      { sessionKey: idleThreadKey, storePath },
+      { sessionId: "idle-thread-live", updatedAt: 10 },
+    );
+    await appendTranscriptMessage(
+      { sessionId: "idle-thread-live", sessionKey: idleThreadKey, storePath },
+      { message: { role: "user", content: "idle live " + "x".repeat(64 * 1024) } },
+    );
+    settlePhysicalUsage();
+    expect(countHistoricalSessionIds()).toBe(0);
+    const before = await measureSessionPhysicalDiskUsage(storePath);
+    const maintenance = {
+      maxDiskBytes: before.totalBytes - 1,
+      highWaterBytes: Math.max(1, before.totalBytes - 32 * 1024),
+      preserveRecentMs: 7 * dayMs,
+    };
+    const inspected = await inspectSqliteSessionHistoryDiskBudget({
+      storePath,
+      mode: "enforce",
+      maintenance,
+    });
+    const result = await enforceSqliteSessionHistoryDiskBudget({
+      storePath,
+      mode: "enforce",
+      maintenance,
+    });
+
+    expect(inspected.wouldMutate).toBe(true);
+    expect(result?.removedEntries).toBeGreaterThanOrEqual(1);
+    expect(sessionExists("idle-thread-live")).toBe(false);
+    expect(sessionNodeExists(idleThreadKey)).toBe(false);
+    expect(sessionExists("recent-live")).toBe(true);
+    expect(sessionNodeExists(recentKey)).toBe(true);
+    expect(sessionExists("live-main")).toBe(true);
+  });
+
   it("does not wipe live durables when highWaterBytes is 0", async () => {
     const threadKey = "agent:main:slack:channel:C9:thread:9";
     await replaceSessionEntry(
