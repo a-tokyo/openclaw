@@ -1,7 +1,6 @@
 // Gateway RPC call helper.
 // Builds a GatewayClient, resolves auth/scopes, and performs one request.
 import { randomUUID } from "node:crypto";
-import { isLoopbackIpAddress } from "@openclaw/net-policy/ip";
 import { redactSensitiveUrlLikeString } from "@openclaw/net-policy/redact-sensitive-url";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
@@ -45,7 +44,6 @@ import {
 } from "../infra/device-identity.js";
 import { isVitestRuntimeEnv } from "../infra/env.js";
 import { extractErrorCodeOrErrno } from "../infra/error-graph-internal.js";
-import { loadGatewayTlsRuntime } from "../infra/tls/gateway.js";
 import type { DeviceAuthEntry } from "../shared/device-auth.js";
 import { roleScopesAllow } from "../shared/operator-scope-compat.js";
 import { resolveSafeTimeoutDelayMs } from "../utils/timer-delay.js";
@@ -62,6 +60,7 @@ import {
   GatewayClient,
   isGatewayConnectAssemblyError,
   type GatewayClientCloseInfo,
+  type GatewayClientOptions,
   type GatewayClientRequestOptions,
 } from "./client.js";
 import {
@@ -76,7 +75,16 @@ import {
   trimToUndefined,
   type ExplicitGatewayAuth,
 } from "./credentials.js";
-import { canSkipGatewayConfigLoad } from "./explicit-connection-policy.js";
+import {
+  gatewayEdgeAuthValueForTarget,
+  normalizeEdgeAuthHeadersConfig,
+  resolveEdgeAuthHeaders,
+  type EdgeAuthHeadersConfig,
+} from "./edge-auth.js";
+import {
+  canSkipGatewayConfigLoad,
+  isExplicitGatewayConnection,
+} from "./explicit-connection-policy.js";
 import { resolvePreauthHandshakeTimeoutMs } from "./handshake-timeouts.js";
 import {
   CLI_DEFAULT_OPERATOR_SCOPES,
@@ -86,7 +94,7 @@ import {
   resolveLeastPrivilegeOperatorScopesForMethod,
   type OperatorScope,
 } from "./method-scopes.js";
-import { resolveGatewayConnectionTlsFingerprint } from "./tls-fingerprint.js";
+import { isLoopbackGatewayUrl } from "./net.js";
 import {
   GatewayTransportError,
   type GatewayTransportErrorKind,
@@ -110,6 +118,7 @@ type CallGatewayBaseOptions = {
   token?: string;
   password?: string;
   tlsFingerprint?: string;
+  preauthHandshakeTimeoutMs?: number;
   config?: OpenClawConfig;
   method: string;
   params?: unknown;
@@ -129,6 +138,7 @@ type CallGatewayBaseOptions = {
   requiredStoredDeviceAuthScopes?: OperatorScope[];
   requireLocalBackendSharedAuth?: boolean;
   sharedStateMode?: "read-only";
+  onHelloOk?: GatewayClientOptions["onHelloOk"];
   deviceIdentity?: DeviceIdentity | null;
   instanceId?: string;
   minProtocol?: number;
@@ -401,6 +411,19 @@ async function loadGatewayConfig(): Promise<OpenClawConfig> {
   return await defaultGetRuntimeConfig();
 }
 
+/**
+ * Load config for a fully flag-addressed connection. Config only supplies
+ * gateway.remote.edgeAuth here, so an unreadable or invalid config degrades to
+ * empty rather than blocking a connection the flags already describe.
+ */
+async function loadGatewayConfigForExplicitConnection(): Promise<OpenClawConfig> {
+  try {
+    return await loadGatewayConfig();
+  } catch {
+    return {};
+  }
+}
+
 function loadGatewayConfigForConnectionDetails(): OpenClawConfig {
   return readGatewayDispatchConfig();
 }
@@ -434,17 +457,6 @@ export function buildGatewayConnectionDetails(
   });
 }
 
-function isLoopbackGatewayUrl(rawUrl: string): boolean {
-  try {
-    const hostname = new URL(rawUrl).hostname.toLowerCase();
-    const unbracketed =
-      hostname.startsWith("[") && hostname.endsWith("]") ? hostname.slice(1, -1) : hostname;
-    return unbracketed === "localhost" || isLoopbackIpAddress(unbracketed);
-  } catch {
-    return false;
-  }
-}
-
 function shouldOmitDeviceIdentityForGatewayCall(params: {
   opts: CallGatewayBaseOptions;
   url: string;
@@ -474,7 +486,9 @@ function shouldOmitDeviceIdentityForGatewayCall(params: {
   return isLocalBackendSharedAuth || isLocalCliSharedAuth;
 }
 
-function resolveDeviceIdentityForGatewayCall(sharedStateMode?: "read-only"): DeviceIdentity | null {
+export function resolveDeviceIdentityForGatewayCall(
+  sharedStateMode?: "read-only",
+): DeviceIdentity | null {
   try {
     return sharedStateMode === "read-only"
       ? loadDeviceIdentityIfPresent()
@@ -618,8 +632,18 @@ async function resolveGatewayCallContext(
     urlOverride,
     explicitAuth,
   });
+  const explicitConnection = isExplicitGatewayConnection({
+    config: opts.config,
+    urlOverride,
+    explicitAuth,
+  });
   const config =
-    opts.config ?? (canSkipConfigLoad ? ({} as OpenClawConfig) : await loadGatewayConfig());
+    opts.config ??
+    (canSkipConfigLoad
+      ? ({} as OpenClawConfig)
+      : explicitConnection
+        ? await loadGatewayConfigForExplicitConnection()
+        : await loadGatewayConfig());
   const configPath = opts.configPath ?? resolveGatewayConfigPath(process.env);
   const isRemoteMode = opts.localPortOverride === undefined && config.gateway?.mode === "remote";
   return {
@@ -820,8 +844,8 @@ async function executeGatewayRequestWithScopes<T>(params: {
   url: string;
   token?: string;
   password?: string;
+  edgeAuthHeaders?: Readonly<Record<string, string>>;
   tlsFingerprint?: string;
-  preauthHandshakeTimeoutMs?: number;
   timeoutMs: number | null;
   startupTimeoutMs: number;
   safeTimerTimeoutMs: number;
@@ -837,8 +861,8 @@ async function executeGatewayRequestWithScopes<T>(params: {
     url,
     token,
     password,
+    edgeAuthHeaders,
     tlsFingerprint,
-    preauthHandshakeTimeoutMs,
     timeoutMs,
     startupTimeoutMs,
     safeTimerTimeoutMs,
@@ -919,8 +943,9 @@ async function executeGatewayRequestWithScopes<T>(params: {
       url,
       token,
       password,
+      edgeAuthHeaders,
       tlsFingerprint,
-      preauthHandshakeTimeoutMs,
+      preauthHandshakeTimeoutMs: opts.preauthHandshakeTimeoutMs,
       instanceId: opts.instanceId ?? randomUUID(),
       clientName: opts.clientName ?? GATEWAY_CLIENT_NAMES.CLI,
       clientDisplayName: resolveGatewayClientDisplayName(opts),
@@ -943,6 +968,13 @@ async function executeGatewayRequestWithScopes<T>(params: {
         if (timeoutMs === null && timer) {
           clearTimeout(timer);
           timer = undefined;
+        }
+        try {
+          opts.onHelloOk?.(hello);
+        } catch {}
+        // An observer may cancel after inspecting hello, before any RPC is sent.
+        if (settled) {
+          return;
         }
         void (async () => {
           try {
@@ -1105,11 +1137,6 @@ async function callGatewayWithScopes<T = Record<string, unknown>>(
             "Fix: pass --token or --password with --url (or gatewayToken in tools).",
         }),
     buildConnectionDetails: buildGatewayConnectionDetails,
-    resolveTlsFingerprint: async (params) =>
-      await resolveGatewayConnectionTlsFingerprint({
-        ...params,
-        loadGatewayTlsRuntime,
-      }),
   });
   ensureRemoteModeUrlConfigured({
     context,
@@ -1158,6 +1185,15 @@ async function callGatewayWithScopes<T = Record<string, unknown>>(
     }
   }
   const tlsFingerprint = bootstrap.tlsFingerprint;
+  const edgeAuthConfig: EdgeAuthHeadersConfig | undefined = normalizeEdgeAuthHeadersConfig(
+    gatewayEdgeAuthValueForTarget({ config: context.config, targetUrl: url }),
+  );
+  const edgeAuthHeaders = await resolveEdgeAuthHeaders({
+    config: context.config,
+    value: edgeAuthConfig,
+    targetUrl: url,
+    env: process.env,
+  });
   if (useStoredDeviceAuth) {
     if (!storedAuth?.token) {
       throw new GatewayCredentialsRequiredError({
@@ -1199,6 +1235,7 @@ async function callGatewayWithScopes<T = Record<string, unknown>>(
     url,
     token,
     password,
+    edgeAuthHeaders,
     tlsFingerprint,
     timeoutMs,
     startupTimeoutMs,
@@ -1244,11 +1281,6 @@ export async function buildGatewayProbeConnectionDetails(
     explicitTlsFingerprint: opts.tlsFingerprint,
     skipImplicitAuth: true,
     buildConnectionDetails: buildGatewayConnectionDetails,
-    resolveTlsFingerprint: async (params) =>
-      await resolveGatewayConnectionTlsFingerprint({
-        ...params,
-        loadGatewayTlsRuntime,
-      }),
   });
   ensureRemoteModeUrlConfigured({
     context,

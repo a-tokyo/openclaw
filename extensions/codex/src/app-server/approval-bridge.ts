@@ -31,6 +31,7 @@ import {
   truncateCodexApprovalDisplayText as truncate,
   type AppServerApprovalOutcome,
   type CodexApprovalKind,
+  type ExecApprovalDecision,
   waitForPluginApprovalDecision,
 } from "./plugin-approval-roundtrip.js";
 import { isJsonObject, type JsonObject, type JsonValue } from "./protocol.js";
@@ -117,6 +118,12 @@ export async function handleCodexAppServerApprovalRequest(params: {
       resolvedOutcome = "approved-once";
       resolvedMessage = "Codex app-server approval granted for this byte-bound command only.";
     }
+    // Permission changes close this native turn while its outer run stays live.
+    // Recheck after byte revalidation before releasing a grant to Codex.
+    params.signal?.throwIfAborted();
+    if (resolvedOutcome !== "denied") {
+      params.paramsForRun.hostCapabilities.assertActive();
+    }
     emitApprovalEvent(params.paramsForRun, {
       phase: "resolved",
       kind: context.kind,
@@ -130,7 +137,10 @@ export async function handleCodexAppServerApprovalRequest(params: {
     return buildApprovalResponse(params.method, context.requestParams, resolvedOutcome);
   };
   try {
-    if (params.method === "item/commandExecution/requestApproval") {
+    if (
+      params.method === "item/commandExecution/requestApproval" &&
+      !readNetworkApprovalContext(requestParams)
+    ) {
       const command = readPolicyCommand(requestParams);
       const cwd = readString(requestParams, "cwd") ?? params.paramsForRun.workspaceDir;
       // Snapshot the executable file operands before policy or operator waits;
@@ -162,6 +172,7 @@ export async function handleCodexAppServerApprovalRequest(params: {
       autoApprove: params.autoApprove,
       signal: params.signal,
     });
+    params.signal?.throwIfAborted();
     if (policyOutcome?.outcome === "denied") {
       recordNativeToolFailureDisposition(params, context, policyOutcome.failureDisposition);
       return await resolvePolicyApproval("denied", policyOutcome.reason);
@@ -172,7 +183,9 @@ export async function handleCodexAppServerApprovalRequest(params: {
     ) {
       return await resolvePolicyApproval(policyOutcome.outcome);
     }
-    const canAutoApproveConcreteToolCall = CONCRETE_TOOL_AUTO_APPROVAL_METHODS.has(params.method);
+    const canAutoApproveConcreteToolCall =
+      CONCRETE_TOOL_AUTO_APPROVAL_METHODS.has(params.method) &&
+      !readNetworkApprovalContext(requestParams);
     if (canAutoApproveConcreteToolCall && params.autoApprove === true) {
       return await resolvePolicyApproval(
         "approved-session",
@@ -183,11 +196,17 @@ export async function handleCodexAppServerApprovalRequest(params: {
     // executable, so unresolved requests must stay on the human approval route.
     const requestResult = await requestPluginApproval({
       hostCapabilities: params.paramsForRun.hostCapabilities,
+      signal: params.signal,
       title: context.title,
       description: context.description,
       severity: context.severity,
       toolName: context.toolName,
       toolCallId: context.approvalId,
+      allowedDecisions: nativeApprovalAllowedDecisions({
+        method: params.method,
+        requestParams,
+        requiresOneShot: mutableFileApprovalRequiresOneShot,
+      }),
     });
 
     const approvalId = requestResult?.id;
@@ -386,6 +405,10 @@ function buildApprovalContext(params: {
   );
   const command = commandPreview.text;
   const reason = reasonPreview.text;
+  const networkApproval =
+    params.method === "item/commandExecution/requestApproval"
+      ? readNetworkApprovalContext(params.requestParams)
+      : undefined;
   const approvalKind: CodexApprovalKind = params.method.includes("commandExecution")
     ? "command"
     : params.method.includes("fileChange")
@@ -399,8 +422,9 @@ function buildApprovalContext(params: {
     params.method === "item/permissions/requestApproval"
       ? describeRequestedPermissions(params.requestParams)
       : [];
-  const title =
-    kind === "exec"
+  const title = networkApproval
+    ? "Codex app-server network approval"
+    : kind === "exec"
       ? "Codex app-server command approval"
       : params.method === "item/permissions/requestApproval"
         ? "Codex app-server permission approval"
@@ -408,6 +432,9 @@ function buildApprovalContext(params: {
           ? "Codex app-server file approval"
           : "Codex app-server approval";
   const subject =
+    (networkApproval
+      ? `Network: ${sanitizePermissionScalar(networkApproval.protocol)}://${sanitizePermissionHostValue(networkApproval.host)}`
+      : undefined) ??
     permissionLines[0] ??
     (command
       ? `Command: ${formatApprovalPreviewSubject(command, commandPreview.omitted)}`
@@ -428,8 +455,9 @@ function buildApprovalContext(params: {
     title,
     description,
     severity: kind === "exec" ? ("warning" as const) : ("info" as const),
-    toolName:
-      kind === "exec"
+    toolName: networkApproval
+      ? "codex_network_approval"
+      : kind === "exec"
         ? "codex_command_approval"
         : params.method === "item/permissions/requestApproval"
           ? "codex_permission_approval"
@@ -742,6 +770,12 @@ function buildOpenClawToolPolicyRequest(
   requestParams: JsonObject | undefined,
 ): { toolName: string; params: JsonObject } | undefined {
   if (method === "item/commandExecution/requestApproval") {
+    if (readNetworkApprovalContext(requestParams)) {
+      return {
+        toolName: "codex_network_approval",
+        params: { approval: requestParams ?? {} },
+      };
+    }
     const command = readPolicyCommand(requestParams);
     return {
       toolName: "exec",
@@ -809,16 +843,38 @@ function commandApprovalDecision(
   if (outcome === "denied" || outcome === "unavailable") {
     return "decline";
   }
-  if (outcome === "approved-session") {
-    if (hasAvailableDecision(requestParams, "acceptForSession")) {
-      return "acceptForSession";
-    }
-    const amendmentDecision = findAvailableCommandAmendmentDecision(requestParams);
-    if (amendmentDecision) {
-      return amendmentDecision;
-    }
+  const capabilities = commandApprovalCapabilities(requestParams);
+  if (outcome === "approved-session" && capabilities.sessionDecision !== undefined) {
+    return capabilities.sessionDecision;
   }
-  return hasAvailableDecision(requestParams, "accept") ? "accept" : "decline";
+  return capabilities.once ? "accept" : "decline";
+}
+
+function nativeApprovalAllowedDecisions(params: {
+  method: string;
+  requestParams: JsonObject | undefined;
+  requiresOneShot: boolean;
+}): ExecApprovalDecision[] | undefined {
+  if (params.method === "item/fileChange/requestApproval") {
+    return ["allow-once", "allow-always", "deny"];
+  }
+  if (params.method !== "item/commandExecution/requestApproval") {
+    return undefined;
+  }
+  const available = params.requestParams?.availableDecisions;
+  if (!Array.isArray(available)) {
+    return undefined;
+  }
+  const capabilities = commandApprovalCapabilities(params.requestParams);
+  const decisions: ExecApprovalDecision[] = [];
+  if (capabilities.once) {
+    decisions.push("allow-once");
+  }
+  if (!params.requiresOneShot && capabilities.sessionDecision !== undefined) {
+    decisions.push("allow-always");
+  }
+  decisions.push("deny");
+  return decisions;
 }
 
 function fileChangeApprovalDecision(outcome: AppServerApprovalOutcome): JsonValue {
@@ -1167,9 +1223,20 @@ function isPrivateNetworkHostPattern(value: string): boolean {
   return /^172\.(1[6-9]|2\d|3[0-1])\./.test(wildcardStripped);
 }
 
-function hasAvailableDecision(requestParams: JsonObject | undefined, decision: string): boolean {
+function commandApprovalCapabilities(requestParams: JsonObject | undefined): {
+  once: boolean;
+  sessionDecision?: JsonValue;
+} {
   const available = requestParams?.availableDecisions;
-  return !Array.isArray(available) || available.includes(decision);
+  if (!Array.isArray(available)) {
+    return { once: true, sessionDecision: "acceptForSession" };
+  }
+  return {
+    once: available.includes("accept"),
+    ...(available.includes("acceptForSession")
+      ? { sessionDecision: "acceptForSession" }
+      : { sessionDecision: findAvailableCommandAmendmentDecision(requestParams) }),
+  };
 }
 
 function findAvailableCommandAmendmentDecision(
@@ -1236,6 +1303,17 @@ function readPolicyCommand(record: JsonObject | undefined): string | undefined {
     return actionCommands.join(" && ");
   }
   return undefined;
+}
+
+function readNetworkApprovalContext(
+  record: JsonObject | undefined,
+): { host: string; protocol: string } | undefined {
+  const context = isJsonObject(record?.networkApprovalContext)
+    ? record.networkApprovalContext
+    : undefined;
+  const host = readString(context, "host");
+  const protocol = readString(context, "protocol");
+  return host && protocol ? { host, protocol } : undefined;
 }
 
 function readCommandActions(record: JsonObject | undefined): string[] {

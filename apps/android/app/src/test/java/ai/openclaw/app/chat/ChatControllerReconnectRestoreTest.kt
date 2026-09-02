@@ -483,6 +483,29 @@ class ChatControllerReconnectRestoreTest {
     }
 
   @Test
+  fun reconnectHistoryOmissionClearsStaleExactRunIds() =
+    runTest {
+      val gateway = ScriptedGateway(json)
+      val controller = loadController(gateway, history(emptyList()))
+      controller.handleGatewayEvent(
+        "sessions.changed",
+        """{"reason":"patch","session":{"key":"main","agentId":"main","hasActiveRun":true,"activeRunIds":["run-stale"]}}""",
+      )
+      assertEquals("run-stale", controller.selectedActiveRunPresentation.value.runId)
+
+      gateway.respondWith(
+        "chat.history",
+        history(emptyList(), hasActiveRun = true, activeRunIds = null),
+      )
+      val pendingSessionList = CompletableDeferred<String>()
+      gateway.respond("sessions.list") { pendingSessionList.await() }
+      reconnect(controller)
+
+      assertEquals(1, controller.selectedActiveRunPresentation.value.count)
+      assertNull(controller.selectedActiveRunPresentation.value.runId)
+    }
+
+  @Test
   fun reconnectStaysUnhealthyUntilRecoveryHistoryApplies() =
     runTest {
       val gateway = ScriptedGateway(json)
@@ -659,19 +682,26 @@ class ChatControllerReconnectRestoreTest {
   @Test
   fun explicitRefreshClearsPriorHistoryError() =
     runTest {
-      val gateway = ScriptedGateway(json)
-      val controller = loadController(gateway, history(emptyList()))
+      for (automaticLoad in listOf(false, true)) {
+        val gateway = ScriptedGateway(json)
+        val controller = loadController(gateway, history(emptyList()))
 
-      gateway.respond("chat.history") { error("history unavailable") }
-      controller.refresh()
-      runCurrent()
-      assertEquals("history unavailable", controller.errorText.value)
+        gateway.respond("chat.history") { error("history unavailable") }
+        controller.refresh()
+        runCurrent()
+        assertEquals("history unavailable", controller.errorText.value)
 
-      gateway.respondWith("chat.history", history(emptyList()))
-      controller.refresh()
-      assertNull(controller.errorText.value)
-      runCurrent()
-      assertNull(controller.errorText.value)
+        gateway.respondWith("chat.history", history(emptyList()))
+        if (automaticLoad) {
+          controller.load("main")
+        } else {
+          controller.refresh()
+        }
+        assertNull(controller.errorText.value)
+        runCurrent()
+        assertNull(controller.errorText.value)
+        assertEquals(3, gateway.callCount("chat.history"))
+      }
     }
 
   @Test
@@ -1342,14 +1372,19 @@ class ChatControllerReconnectRestoreTest {
             firstRecoveryStarted.complete(Unit)
             releaseFirstRecovery.await()
           }
-          2 -> history(emptyList())
-          else ->
+
+          2 -> {
+            history(emptyList())
+          }
+
+          else -> {
             history(
               listOf(
                 ReplayHistoryMessage("user", "ordered recovery", 1_000, idempotencyKey = "$runId:user"),
                 ReplayHistoryMessage("assistant", "done", 2_000),
               ),
             )
+          }
         }
       }
 

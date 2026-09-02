@@ -364,6 +364,7 @@ describe("agent runtime identity token", () => {
       sessionKey: "agent:main:main",
       operationalRunInstance: run.operationalRunInstance,
       cronToolsAllowCapture: "final-executable-surface",
+      cronExecToolTarget: { host: "gateway", ask: "always" },
     });
 
     await expect(runtimeToken.verifyAgentRuntimeIdentityToken(token)).resolves.toMatchObject({
@@ -372,6 +373,7 @@ describe("agent runtime identity token", () => {
       sessionKey: "agent:main:main",
       operationalRunInstance: run.operationalRunInstance,
       cronToolsAllowCapture: "final-executable-surface",
+      cronExecToolTarget: { host: "gateway", ask: "always" },
     });
   });
 
@@ -463,6 +465,9 @@ describe("agent runtime identity token", () => {
         sessionId: "session-id-1",
         requesterAccountId: "ops",
         requesterSenderId: "sender-1",
+        requesterSenderName: "Sender One",
+        requesterSenderUsername: "sender-one",
+        requesterSenderE164: "+15551234567",
         toolContext: {
           currentChannelProvider: "matrix",
           currentChannelId: "!room:example.org",
@@ -485,6 +490,9 @@ describe("agent runtime identity token", () => {
         sessionId: "session-id-1",
         requesterAccountId: "ops",
         requesterSenderId: "sender-1",
+        requesterSenderName: "Sender One",
+        requesterSenderUsername: "sender-one",
+        requesterSenderE164: "+15551234567",
         toolContext: {
           currentChannelProvider: "matrix",
           currentChannelId: "!room:example.org",

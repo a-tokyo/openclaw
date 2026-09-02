@@ -1,5 +1,7 @@
+import { html, nothing, render } from "lit";
+import { unsafeHTML } from "lit/directives/unsafe-html.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { handleMarkdownCodeBlockCopy } from "./markdown-code-blocks.ts";
+import { handleMarkdownCodeBlockClick, markdownCodeBlocks } from "./markdown-code-blocks.ts";
 import { toSanitizedMarkdownHtml } from "./markdown.ts";
 
 const originalExecCommand = Object.getOwnPropertyDescriptor(document, "execCommand");
@@ -21,9 +23,57 @@ function renderCodeCopyButton(): HTMLButtonElement {
   if (!button) {
     throw new Error("Expected Markdown code-copy button");
   }
-  button.addEventListener("click", handleMarkdownCodeBlockCopy);
+  button.addEventListener("click", handleMarkdownCodeBlockClick);
   return button;
 }
+
+it("reobserves reused code DOM while fencing scans queued before disconnect", async () => {
+  const observed = new Set<Element>();
+  vi.stubGlobal(
+    "ResizeObserver",
+    class {
+      observe(target: Element) {
+        observed.add(target);
+      }
+      unobserve(target: Element) {
+        observed.delete(target);
+      }
+      disconnect() {
+        observed.clear();
+      }
+    },
+  );
+  const container = document.body.appendChild(document.createElement("div"));
+  const content = toSanitizedMarkdownHtml("```ts\nconst answer = 42;\n```", {
+    codeBlockInteraction: "interactive",
+  });
+  const part = render(
+    html`<section ${markdownCodeBlocks()}>${unsafeHTML(content)}</section>`,
+    container,
+  );
+  const code = container.querySelector("code");
+
+  try {
+    part.setConnected(false);
+    await Promise.resolve();
+    expect(observed.size).toBe(0);
+
+    part.setConnected(true);
+    await Promise.resolve();
+    expect(observed.size).toBe(2);
+    expect(observed.has(code!)).toBe(true);
+
+    part.setConnected(false);
+    expect(observed.size).toBe(0);
+    part.setConnected(true);
+    await Promise.resolve();
+    expect(container.querySelector("code")).toBe(code);
+    expect(observed.has(code!)).toBe(true);
+    expect(observed.size).toBe(2);
+  } finally {
+    render(nothing, container);
+  }
+});
 
 describe("Markdown code-block clipboard feedback", () => {
   it("visibly reports both denied clipboard paths and restores the idle state", async () => {
@@ -153,7 +203,7 @@ describe("Markdown code-block clipboard feedback", () => {
     });
     const first = renderCodeCopyButton();
     const second = first.cloneNode(true) as HTMLButtonElement;
-    second.addEventListener("click", handleMarkdownCodeBlockCopy);
+    second.addEventListener("click", handleMarkdownCodeBlockClick);
     document.body.append(second);
 
     first.click();

@@ -1,7 +1,7 @@
-import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import { chromium, type Browser } from "playwright";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { beforeEach, afterAll, beforeAll, describe, expect, it } from "vitest";
+import { createControlUiE2eArtifactDir } from "../test-helpers/control-ui-e2e-artifacts.ts";
 import {
   canRunPlaywrightChromium,
   installMockGateway,
@@ -15,10 +15,12 @@ const chromiumAvailable = canRunPlaywrightChromium(chromiumExecutablePath);
 const allowMissingChromium = process.env.OPENCLAW_UI_E2E_ALLOW_MISSING_CHROMIUM === "1";
 const describeControlUiE2e = chromiumAvailable || !allowMissingChromium ? describe : describe.skip;
 const captureProof = process.env.OPENCLAW_CAPTURE_UI_PROOF === "1";
-const artifactDir = path.resolve(
-  process.cwd(),
-  ".artifacts/control-ui-e2e/chat-markdown-table-interactions",
-);
+let artifactDir: string;
+beforeEach(() => {
+  if (captureProof) {
+    artifactDir = createControlUiE2eArtifactDir("chat-markdown-table-interactions");
+  }
+});
 
 const wideTable = `| Service | Owner | Region | Status | Version | Deploy | Incidents | Notes |
 | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -31,9 +33,6 @@ describeControlUiE2e("Control UI Markdown table interactions", () => {
   beforeAll(async () => {
     if (!chromiumAvailable) {
       throw new Error(`Playwright Chromium is unavailable at ${chromiumExecutablePath}`);
-    }
-    if (captureProof) {
-      await mkdir(artifactDir, { recursive: true });
     }
     server = await startControlUiE2eServer(undefined, { source: true });
     browser = await chromium.launch({ executablePath: chromiumExecutablePath });
@@ -94,10 +93,52 @@ describeControlUiE2e("Control UI Markdown table interactions", () => {
         .toContain("Service\tOwner\tRegion\tStatus\tVersion\tDeploy\tIncidents\tNotes");
 
       await expand.focus();
+      const inlineTable = shell.locator("table");
+      const inlineHeader = inlineTable.locator("th").first();
+      const inlineCell = inlineTable.locator("td").first();
       await expand.click();
       const dialog = page.locator("dialog.markdown-table-dialog");
       await expect.poll(() => dialog.getAttribute("open")).toBe("");
-      expect(await dialog.locator("table").textContent()).toContain("Gateway");
+      const fullscreenTable = dialog.locator("table");
+      const fullscreenHeader = fullscreenTable.locator("th").first();
+      const fullscreenCell = fullscreenTable.locator("td").first();
+      expect(await fullscreenTable.textContent()).toContain("Gateway");
+      const tableProperties = [
+        "background-color",
+        "border-collapse",
+        "border-top-width",
+        "box-shadow",
+      ] as const;
+      const cellProperties = [
+        "background-color",
+        "border-right-width",
+        "border-bottom-color",
+        "overflow-wrap",
+        "white-space",
+        "word-break",
+      ] as const;
+      const readStyles = async (locator: typeof inlineTable, properties: readonly string[]) =>
+        locator.evaluate((element, propertyNames) => {
+          const styles = getComputedStyle(element);
+          return Object.fromEntries(
+            propertyNames.map((property) => {
+              const value = styles.getPropertyValue(property);
+              if (!value) {
+                throw new Error(`Missing computed value for ${property}`);
+              }
+              return [property, value];
+            }),
+          );
+        }, properties);
+      expect(await readStyles(fullscreenTable, tableProperties)).toEqual(
+        await readStyles(inlineTable, tableProperties),
+      );
+      expect(await readStyles(fullscreenHeader, cellProperties)).toEqual(
+        await readStyles(inlineHeader, cellProperties),
+      );
+      expect(await readStyles(fullscreenCell, cellProperties)).toEqual(
+        await readStyles(inlineCell, cellProperties),
+      );
       if (captureProof) {
         await page.screenshot({
           animations: "disabled",
@@ -105,6 +146,21 @@ describeControlUiE2e("Control UI Markdown table interactions", () => {
         });
       }
 
+      const dialogBounds = await dialog.boundingBox();
+      if (!dialogBounds) {
+        throw new Error("Expanded table dialog has no layout bounds");
+      }
+      await page.mouse.click(
+        Math.max(1, dialogBounds.x - 8),
+        dialogBounds.y + Math.min(8, dialogBounds.height / 2),
+      );
+      await expect.poll(() => dialog.count()).toBe(0);
+      await expect
+        .poll(() => expand.evaluate((element) => element === document.activeElement))
+        .toBe(true);
+
+      await expand.click();
+      await expect.poll(() => dialog.getAttribute("open")).toBe("");
       await page.keyboard.press("Escape");
       await expect.poll(() => dialog.count()).toBe(0);
       await expect

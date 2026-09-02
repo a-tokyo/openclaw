@@ -5,7 +5,7 @@ import { DEFAULT_CONTEXT_TOKENS } from "../defaults.js";
 import { resolveCatalogOwnedModelCompat } from "../model-compat-catalog.js";
 import { attachModelProviderLocalService } from "../provider-local-service.js";
 import {
-  attachModelProviderMetadataOwners,
+  attachModelProviderRequestRouteFacts,
   attachModelProviderRequestTransport,
   resolveProviderRequestConfig,
   sanitizeConfiguredModelProviderRequest,
@@ -16,6 +16,7 @@ import {
   findConfiguredProviderModel,
   hasConfiguredFallbackSurface,
   mergeConfiguredRuntimeModelParams,
+  mergeConfiguredModelCost,
   resolveConfiguredProviderConfig,
   resolveConfiguredProviderDefaultApi,
   shouldSuppressConfiguredModel,
@@ -165,7 +166,7 @@ export function buildConfiguredFallbackModel(params: {
     cfg,
     agentDir,
     workspaceDir,
-    model: attachModelProviderMetadataOwners(
+    model: attachModelProviderRequestRouteFacts(
       attachModelProviderLocalService(
         attachModelProviderRequestTransport(
           {
@@ -184,7 +185,12 @@ export function buildConfiguredFallbackModel(params: {
             ...(configuredModel?.thinkingLevelMap !== undefined
               ? { thinkingLevelMap: configuredModel.thinkingLevelMap }
               : {}),
-            cost: metadataModel?.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            cost: mergeConfiguredModelCost({
+              provider,
+              cfg,
+              configuredModel,
+              catalogCost: staticCatalogModel?.cost,
+            }),
             contextWindow: resolvedFallbackContextWindow,
             contextTokens: configuredModel?.contextTokens ?? staticCatalogModel?.contextTokens,
             // maxTokens is a wire-level output cap, not a context-budget fallback.
