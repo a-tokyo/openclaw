@@ -30,7 +30,6 @@ import {
   reclaimSqliteLiveSessionEntriesToHighWater,
   refreshSqliteSessionPlannerStatisticsBestEffort,
 } from "./session-accessor.sqlite-maintenance.js";
-export { collectAdmissionProtectedSessionIds } from "./session-accessor.sqlite-maintenance.js";
 import {
   getSessionKysely,
   resolveSqliteScope,
@@ -52,6 +51,8 @@ import {
   type ResolvedSessionMaintenanceConfig,
 } from "./store-maintenance.js";
 import type { SessionEntry } from "./types.js";
+
+export { collectAdmissionProtectedSessionIds } from "./session-accessor.sqlite-maintenance.js";
 
 type SessionHistoryDiskBudgetParams = {
   agentId?: string;
