@@ -396,6 +396,18 @@
       }
     },
     {
+      "files": ["src/config/sessions/session-accessor.sqlite-maintenance.ts"],
+      "rules": {
+        "max-lines": ["error", { "max": 1000, "skipBlankLines": true, "skipComments": true }]
+      }
+    },
+    {
+      "files": ["src/config/sessions/session-history-eviction.test.ts"],
+      "rules": {
+        "max-lines": ["error", { "max": 1100, "skipBlankLines": true, "skipComments": true }]
+      }
+    },
+    {
       "files": ["**/*.{ts,tsx,mts,cts}"],
       "rules": {
         // tsgo owns TypeScript type/value namespace validity; no-var still rejects var declarations.
