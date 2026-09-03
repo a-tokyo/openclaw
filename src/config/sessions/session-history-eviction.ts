@@ -25,6 +25,7 @@ import {
 } from "./session-accessor.sqlite-lifecycle-state.js";
 import {
   collectAdmissionProtectedSessionIds,
+  finalizeSessionEntryMaintenancePlansAfterWriterReleaseBestEffort,
   planOldestCapacityEligibleSqliteLiveEntryRemoval,
   reclaimSqliteLiveSessionEntriesToHighWater,
   refreshSqliteSessionPlannerStatisticsBestEffort,
@@ -608,6 +609,7 @@ async function enforceSessionHistoryMaintenanceSerialized(
     const live = await reclaimSqliteLiveSessionEntriesToHighWater({
       archiveDirectory,
       database,
+      finalizePlans: finalizeSessionEntryMaintenancePlansAfterWriterReleaseBestEffort,
       highWaterBytes,
       pruneArchivesToHighWater: async () =>
         await runExclusiveSqliteSessionWrite(resolved, async () =>

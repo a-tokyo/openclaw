@@ -17,8 +17,10 @@ import {
   planSessionStateDeleteIfUnreferenced,
   readSessionGenerationIdsForKeys,
 } from "./session-accessor.sqlite-lifecycle-state.js";
-import type { SessionEntryMaintenancePlan } from "./session-accessor.sqlite-lifecycle-types.js";
-import { finalizeSessionEntryMaintenancePlansAfterWriterReleaseBestEffort } from "./session-accessor.sqlite-maintenance.js";
+import type {
+  SessionEntryMaintenancePlan,
+  SessionEntryMaintenanceResult,
+} from "./session-accessor.sqlite-lifecycle-types.js";
 import {
   cloneSessionEntry,
   getSessionKysely,
@@ -263,6 +265,10 @@ function sqliteSessionNodeExists(database: OpenClawAgentDatabase, sessionKey: st
 export async function reclaimSqliteLiveSessionEntriesToHighWater(params: {
   archiveDirectory: string;
   database: OpenClawAgentDatabase;
+  finalizePlans: (
+    scope: Pick<ResolvedSqliteReadScope, "agentId" | "env" | "path">,
+    plans: readonly SessionEntryMaintenancePlan[],
+  ) => Promise<SessionEntryMaintenanceResult>;
   highWaterBytes: number;
   pruneArchivesToHighWater: () => Promise<{
     removedFiles: number;
@@ -314,10 +320,7 @@ export async function reclaimSqliteLiveSessionEntriesToHighWater(params: {
           retargeted = true;
           return null;
         }
-        return await finalizeSessionEntryMaintenancePlansAfterWriterReleaseBestEffort(
-          params.resolved,
-          [fencedPlan],
-        );
+        return await params.finalizePlans(params.resolved, [fencedPlan]);
       },
     });
     if (retargeted) {
