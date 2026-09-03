@@ -29,8 +29,8 @@ import {
   readSessionEntryStore,
   writeSessionEntry,
 } from "./session-accessor.sqlite-entry-store.js";
-import { emitCommittedSessionEntryRemovals } from "./session-accessor.sqlite-identity.js";
 import { emitArchivedTranscriptUpdates } from "./session-accessor.sqlite-events.js";
+import { emitCommittedSessionEntryRemovals } from "./session-accessor.sqlite-identity.js";
 import {
   collectProjectedReferencedSessionIds,
   collectSessionStateIdsForEntry,
@@ -841,10 +841,9 @@ function planSqliteLiveEntryRemovals(params: {
       removedSessionIds.add(sessionId);
     }
   }
-  for (const sessionId of readSessionGenerationIdsForKeys(
-    params.database,
-    [...params.removedKeys],
-  )) {
+  for (const sessionId of readSessionGenerationIdsForKeys(params.database, [
+    ...params.removedKeys,
+  ])) {
     removedSessionIds.add(sessionId);
   }
   const referencedSessionIds = collectProjectedReferencedSessionIds({

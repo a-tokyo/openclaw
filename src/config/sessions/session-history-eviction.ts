@@ -2,10 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { executeSqliteQuerySync } from "../../infra/kysely-sync.js";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
-import {
-  collectActiveSessionWorkAdmissions,
-  runExclusiveSessionLifecycleMutation,
-} from "../../sessions/session-lifecycle-admission.js";
+import { runExclusiveSessionLifecycleMutation } from "../../sessions/session-lifecycle-admission.js";
 import { runQueuedStoreWrite, type StoreWriterQueue } from "../../shared/store-writer-queue.js";
 import {
   isIncognitoOpenClawAgentSqlitePath,
@@ -25,16 +22,17 @@ import { publishSessionStateArchives } from "./session-accessor.sqlite-archive-s
 import { materializeSessionStateDeletePlans } from "./session-accessor.sqlite-archive.js";
 import { emitArchivedTranscriptUpdates } from "./session-accessor.sqlite-events.js";
 import {
-  collectSessionStateIdsForEntry,
   deleteMaterializedSessionStatePlans,
   planSessionStateDeleteIfUnreferenced,
   readReferencedSessionIds,
 } from "./session-accessor.sqlite-lifecycle-state.js";
 import {
+  collectAdmissionProtectedSessionIds,
   planOldestCapacityEligibleSqliteLiveEntryRemoval,
   reclaimSqliteLiveSessionEntriesToHighWater,
   refreshSqliteSessionPlannerStatisticsBestEffort,
 } from "./session-accessor.sqlite-maintenance.js";
+export { collectAdmissionProtectedSessionIds } from "./session-accessor.sqlite-maintenance.js";
 import {
   getSessionKysely,
   resolveSqliteScope,
@@ -43,7 +41,6 @@ import {
   toDatabaseOptions,
 } from "./session-accessor.sqlite-scope.js";
 import { parseSessionEntryJson } from "./session-accessor.sqlite-status.js";
-import { normalizeStoreSessionKey } from "./store-entry.js";
 import { resolveMaintenanceConfig } from "./store-maintenance-runtime.js";
 import {
   isRecentSessionMaintenanceEntry,
@@ -232,58 +229,6 @@ function collectCandidateProtectedHistoricalSessionIds(params: {
   const protectedSessionIds = collectProtectedHistoricalSessionIds(params);
   if (isRecentHistoricalSessionId(params)) {
     protectedSessionIds.add(params.sessionId);
-  }
-  return protectedSessionIds;
-}
-
-/** Session ids owned by in-flight work admissions, without live-reference protection. */
-export function collectAdmissionProtectedSessionIds(params: {
-  database: OpenClawAgentDatabase;
-  storePath: string;
-}): Set<string> {
-  const protectedSessionIds = new Set<string>();
-  const admissionIdentities =
-    collectActiveSessionWorkAdmissions().get(params.storePath) ?? new Set<string>();
-  if (admissionIdentities.size === 0) {
-    return protectedSessionIds;
-  }
-
-  // Admissions may carry either the backing session id or its live session key. Protect both,
-  // then resolve admitted keys through their entries so cleanup cannot reclaim active work.
-  for (const identity of admissionIdentities) {
-    protectedSessionIds.add(identity);
-  }
-  const normalizedAdmissionKeys = new Set(
-    [...admissionIdentities].map((identity) => normalizeStoreSessionKey(identity)),
-  );
-  const db = getSessionKysely(params.database.db);
-  const rows = executeSqliteQuerySync(
-    params.database.db,
-    db.selectFrom("session_nodes").select(["entry_json", "current_session_id", "session_key"]),
-  ).rows;
-  for (const row of rows) {
-    if (!normalizedAdmissionKeys.has(normalizeStoreSessionKey(row.session_key))) {
-      continue;
-    }
-    protectedSessionIds.add(row.current_session_id);
-    const entry = parseSessionEntryJson(row);
-    if (entry) {
-      for (const sessionId of collectSessionStateIdsForEntry(entry)) {
-        protectedSessionIds.add(sessionId);
-      }
-    }
-  }
-  // Key-scoped admissions must survive rollover: an in-flight run admitted by
-  // key may still write to a generation the entry no longer references, so
-  // every generation of an admitted key stays off-limits.
-  const generationRows = executeSqliteQuerySync(
-    params.database.db,
-    db.selectFrom("session_windows").select(["session_id", "session_key"]),
-  ).rows;
-  for (const row of generationRows) {
-    if (normalizedAdmissionKeys.has(normalizeStoreSessionKey(row.session_key))) {
-      protectedSessionIds.add(row.session_id);
-    }
   }
   return protectedSessionIds;
 }
