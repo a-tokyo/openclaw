@@ -30,6 +30,7 @@ import {
   planOldestCapacityEligibleSqliteLiveEntryRemoval,
   reclaimSqliteLiveSessionEntriesToHighWater,
 } from "./session-accessor.sqlite-maintenance.js";
+export { collectAdmissionProtectedSessionIds } from "./session-accessor.sqlite-maintenance.js";
 import {
   getSessionKysely,
   resolveSqliteScope,

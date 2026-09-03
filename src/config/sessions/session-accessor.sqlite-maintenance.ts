@@ -1,11 +1,14 @@
 import { uniqueStrings } from "@openclaw/normalization-core/string-normalization";
 import { executeSqliteQuerySync } from "../../infra/kysely-sync.js";
+import { runWithSqliteBusyTimeout } from "../../infra/sqlite-busy-timeout.js";
 import { getChildLogger } from "../../logging/logger.js";
 import {
-  collectActiveSessionWorkAdmissionIdentities,
+  collectActiveSessionWorkAdmissions,
   runExclusiveSessionLifecycleMutation,
 } from "../../sessions/session-lifecycle-admission.js";
 import {
+  openOpenClawAgentDatabase,
+  resolveOpenClawAgentSqlitePath,
   runOpenClawAgentWriteTransaction,
   type OpenClawAgentDatabase,
 } from "../../state/openclaw-agent-db.js";
@@ -59,6 +62,58 @@ import {
 import type { SessionEntry } from "./types.js";
 
 // Live-entry pruning owner. Produces plans inside writes; finalizes archives afterward.
+
+const SESSION_PLANNER_ANALYSIS_MIN_DELETED_ENTRIES = 64;
+const SESSION_PLANNER_ANALYSIS_LIMIT = 1_000;
+const plannerMaintenanceByStore = new Map<string, Promise<void>>();
+
+/** Coalesce bounded planner-statistics refreshes behind the per-store writer lane. */
+export async function refreshSqliteSessionPlannerStatisticsBestEffort(
+  scope: Pick<ResolvedSqliteReadScope, "agentId" | "env" | "path">,
+  deletedEntries: number,
+  options: { isCurrent?: () => boolean } = {},
+): Promise<void> {
+  const isCurrent = options.isCurrent ?? (() => true);
+  if (deletedEntries < SESSION_PLANNER_ANALYSIS_MIN_DELETED_ENTRIES || !isCurrent()) {
+    return;
+  }
+  const storePath = resolveOpenClawAgentSqlitePath(toDatabaseOptions(scope));
+  const active = plannerMaintenanceByStore.get(storePath);
+  if (active) {
+    await active;
+    return;
+  }
+  const completion = runExclusiveSqliteSessionWrite(scope, async () => {
+    if (!isCurrent()) {
+      return;
+    }
+    const database = openOpenClawAgentDatabase(toDatabaseOptions(scope));
+    runWithSqliteBusyTimeout(database.db, 0, () => {
+      const row = database.db.prepare("PRAGMA analysis_limit").get() as
+        | { analysis_limit?: unknown }
+        | undefined;
+      const previousLimit = Number(row?.analysis_limit ?? 0);
+      try {
+        database.db.exec(
+          `PRAGMA analysis_limit = ${SESSION_PLANNER_ANALYSIS_LIMIT}; ANALYZE main;`,
+        );
+      } finally {
+        database.db.exec(`PRAGMA analysis_limit = ${previousLimit};`);
+      }
+    });
+  })
+    .catch((error: unknown) => {
+      getChildLogger({ subsystem: "session-sqlite" }).warn(
+        "SQLite session planner-statistics refresh failed",
+        { agentId: scope.agentId, error, path: storePath },
+      );
+    })
+    .finally(() => {
+      plannerMaintenanceByStore.delete(storePath);
+    });
+  plannerMaintenanceByStore.set(storePath, completion);
+  await completion;
+}
 
 function collectSqliteSessionMaintenanceBaseKeys(
   store: Record<string, SessionEntry>,
@@ -296,7 +351,8 @@ export function collectAdmissionProtectedSessionIds(params: {
   storePath: string;
 }): Set<string> {
   const protectedSessionIds = new Set<string>();
-  const admissionIdentities = collectActiveSessionWorkAdmissionIdentities(params.storePath);
+  const admissionIdentities =
+    collectActiveSessionWorkAdmissions().get(params.storePath) ?? new Set<string>();
   if (admissionIdentities.size === 0) {
     return protectedSessionIds;
   }
