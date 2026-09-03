@@ -116,7 +116,7 @@ const { runCodexAppServerSideQuestion: runCodexAppServerSideQuestionImpl } =
 const baseBindingStore = createCodexTestBindingStore();
 const bindingStore: CodexAppServerBindingStore = {
   ...baseBindingStore,
-  read: async (...args) => await readCodexAppServerBindingMock(...args),
+  read: (...args) => readCodexAppServerBindingMock(...args),
 };
 
 function runCodexAppServerSideQuestion(
@@ -590,7 +590,7 @@ describe("runCodexAppServerSideQuestion", () => {
       },
     ]);
 
-    readCodexAppServerBindingMock.mockResolvedValue({
+    readCodexAppServerBindingMock.mockReturnValue({
       schemaVersion: 1,
       threadId: "parent-thread",
       sessionFile: "/tmp/session-1.jsonl",
@@ -831,7 +831,7 @@ describe("runCodexAppServerSideQuestion", () => {
     "clamps stale binding full access to the guarded side-session $boundary",
     async ({ sessionRoot }) => {
       const root = sessionRoot ?? "/tmp/workspace";
-      readCodexAppServerBindingMock.mockResolvedValue({
+      readCodexAppServerBindingMock.mockReturnValue({
         threadId: "parent-thread",
         cwd: "/tmp/outside-session-root",
         authProfileId: "openai:work",
@@ -1276,7 +1276,7 @@ describe("runCodexAppServerSideQuestion", () => {
   it("uses the default supervision runtime, native auth, and exact bound model pair", async () => {
     const client = createFakeClient();
     getSharedCodexAppServerClientMock.mockResolvedValue(client);
-    readCodexAppServerBindingMock.mockResolvedValue({
+    readCodexAppServerBindingMock.mockReturnValue({
       threadId: "parent-thread",
       connectionScope: "supervision",
       supervisionSourceThreadId: "source-thread",
@@ -1328,7 +1328,7 @@ describe("runCodexAppServerSideQuestion", () => {
   });
 
   it("rejects an incomplete supervised model pair before selecting a client", async () => {
-    readCodexAppServerBindingMock.mockResolvedValue({
+    readCodexAppServerBindingMock.mockReturnValue({
       threadId: "parent-thread",
       connectionScope: "supervision",
       supervisionSourceThreadId: "source-thread",
@@ -1350,7 +1350,7 @@ describe("runCodexAppServerSideQuestion", () => {
   it("cleans up a supervised fork that returns a different native model pair", async () => {
     const client = createFakeClient();
     getSharedCodexAppServerClientMock.mockResolvedValue(client);
-    readCodexAppServerBindingMock.mockResolvedValue({
+    readCodexAppServerBindingMock.mockReturnValue({
       threadId: "parent-thread",
       connectionScope: "supervision",
       supervisionSourceThreadId: "source-thread",
@@ -1388,7 +1388,7 @@ describe("runCodexAppServerSideQuestion", () => {
   it("replays app-scoped reviewer policy into side-thread forks", async () => {
     const client = createFakeClient();
     getSharedCodexAppServerClientMock.mockResolvedValue(client);
-    readCodexAppServerBindingMock.mockResolvedValue({
+    readCodexAppServerBindingMock.mockReturnValue({
       schemaVersion: 2,
       threadId: "parent-thread",
       sessionFile: "/tmp/session-1.jsonl",
@@ -2063,7 +2063,7 @@ describe("runCodexAppServerSideQuestion", () => {
   });
 
   it("includes permission request native hooks for side threads with yolo approval policy", async () => {
-    readCodexAppServerBindingMock.mockResolvedValue({
+    readCodexAppServerBindingMock.mockReturnValue({
       schemaVersion: 1,
       threadId: "parent-thread",
       sessionFile: "/tmp/session-1.jsonl",
@@ -2213,7 +2213,7 @@ describe("runCodexAppServerSideQuestion", () => {
   it("keeps Codex code-mode-only while disabling Guardian for provider-qualified local models", async () => {
     const client = createFakeClient();
     getSharedCodexAppServerClientMock.mockResolvedValue(client);
-    readCodexAppServerBindingMock.mockResolvedValue({
+    readCodexAppServerBindingMock.mockReturnValue({
       schemaVersion: 1,
       threadId: "parent-thread",
       sessionFile: "/tmp/session-1.jsonl",
@@ -2262,7 +2262,7 @@ describe("runCodexAppServerSideQuestion", () => {
   it("uses bound local model providers when disabling Guardian for side-thread forks", async () => {
     const client = createFakeClient();
     getSharedCodexAppServerClientMock.mockResolvedValue(client);
-    readCodexAppServerBindingMock.mockResolvedValue({
+    readCodexAppServerBindingMock.mockReturnValue({
       schemaVersion: 1,
       threadId: "parent-thread",
       sessionFile: "/tmp/session-1.jsonl",
@@ -2307,7 +2307,7 @@ describe("runCodexAppServerSideQuestion", () => {
   it("uses bound local providers for side-thread model ids that contain slashes", async () => {
     const client = createFakeClient();
     getSharedCodexAppServerClientMock.mockResolvedValue(client);
-    readCodexAppServerBindingMock.mockResolvedValue({
+    readCodexAppServerBindingMock.mockReturnValue({
       schemaVersion: 1,
       threadId: "parent-thread",
       sessionFile: "/tmp/session-1.jsonl",
@@ -2347,7 +2347,7 @@ describe("runCodexAppServerSideQuestion", () => {
   it("does not apply bound local model providers to provider-qualified side-thread models", async () => {
     const client = createFakeClient();
     getSharedCodexAppServerClientMock.mockResolvedValue(client);
-    readCodexAppServerBindingMock.mockResolvedValue({
+    readCodexAppServerBindingMock.mockReturnValue({
       schemaVersion: 1,
       threadId: "parent-thread",
       sessionFile: "/tmp/session-1.jsonl",
@@ -2387,7 +2387,7 @@ describe("runCodexAppServerSideQuestion", () => {
     const client = createFakeClient();
     getSharedCodexAppServerClientMock.mockResolvedValue(client);
     isCodexAppServerNativeAuthProfileMock.mockReturnValue(true);
-    readCodexAppServerBindingMock.mockResolvedValue({
+    readCodexAppServerBindingMock.mockReturnValue({
       schemaVersion: 1,
       threadId: "parent-thread",
       sessionFile: "/tmp/session-1.jsonl",
@@ -2703,6 +2703,44 @@ describe("runCodexAppServerSideQuestion", () => {
     expect(activeDiagnosticToolKeys(diagnosticEvents)).toEqual(new Set());
   });
 
+  it("hands a side thread's question tools this run's own way to show a prompt", async () => {
+    // A side thread dispatches tools through the same direct bridge as a normal Codex
+    // turn, so no tool-start handler reserves a blocking question's prompt for them.
+    // Without a sender the question is registered, waited on, and never shown.
+    const onToolResult = vi.fn();
+    let capturedQuestionPrompt:
+      | { send?: (payload: { text?: string }) => unknown; messageChannel?: string }
+      | undefined;
+    createOpenClawCodingToolsMock.mockImplementation((options) => {
+      capturedQuestionPrompt = (
+        options as {
+          questionPrompt?: {
+            send?: (payload: { text?: string }) => unknown;
+            messageChannel?: string;
+          };
+        }
+      ).questionPrompt;
+      return [
+        {
+          name: "ask_user",
+          description: "Ask the person a question",
+          parameters: { type: "object", properties: {}, additionalProperties: true },
+          execute: toolExecuteMock,
+        },
+      ];
+    });
+
+    await runSideQuestionWithManagedWebSearchCall(
+      sideParams({ messageChannel: "telegram", opts: { onToolResult } }),
+      { preserveToolFactory: true, toolName: "ask_user", toolArguments: { header: "Choice" } },
+    );
+
+    expect(toolExecuteMock).toHaveBeenCalledTimes(1);
+    expect(capturedQuestionPrompt?.messageChannel).toBe("telegram");
+    await capturedQuestionPrompt?.send?.({ text: "Question for you:" });
+    expect(onToolResult).toHaveBeenCalledWith({ text: "Question for you:" });
+  });
+
   it("bridges prepared restricted-profile tools into side threads", async () => {
     const preparedModelRuntime = {
       metadataSnapshot: {
@@ -2801,6 +2839,44 @@ describe("runCodexAppServerSideQuestion", () => {
       success: true,
       contentItems: [{ type: "inputText", text: "tool output" }],
     });
+  });
+
+  it("exposes blocking question tools to a side thread conversation", async () => {
+    const boundNames: string[][] = [];
+    const bindToolSurface = vi.fn((tools: Array<{ name: string }>) => {
+      boundNames.push(tools.map((tool) => tool.name));
+      return tools;
+    });
+    createOpenClawCodingToolsMock.mockReturnValue([
+      { name: "message", execute: vi.fn() },
+      { name: "ask_user", execute: vi.fn() },
+      { name: "secrets", execute: vi.fn() },
+    ]);
+    const client = createFakeClient();
+    client.request.mockImplementation(async (method: string) => {
+      if (method === "thread/fork") {
+        return threadResult("side-thread");
+      }
+      if (method === "turn/start") {
+        setTimeout(() => {
+          client.emit(turnCompleted("side-thread", "turn-1", "Answered."));
+        }, 0);
+        return turnStartResult("turn-1");
+      }
+      return {};
+    });
+    getSharedCodexAppServerClientMock.mockResolvedValue(client);
+
+    await runCodexAppServerSideQuestion(
+      sideParams({
+        hostCapabilities: {
+          ...TEST_HOST_CAPABILITIES,
+          bindToolSurface: bindToolSurface as never,
+        },
+      }),
+    );
+
+    expect(boundNames[0]).toEqual(["message", "ask_user", "secrets"]);
   });
 
   it("binds /btw tools and retained bound callbacks fail after capability closure", async () => {
@@ -3657,7 +3733,7 @@ describe("runCodexAppServerSideQuestion", () => {
   );
 
   it("returns a clear setup error when there is no Codex parent thread", async () => {
-    readCodexAppServerBindingMock.mockResolvedValue(undefined);
+    readCodexAppServerBindingMock.mockReturnValue(undefined);
 
     await expect(runCodexAppServerSideQuestion(sideParams())).rejects.toThrow(
       "Codex /btw needs an active Codex thread. Send a normal message first, then try /btw again.",

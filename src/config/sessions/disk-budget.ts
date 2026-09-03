@@ -25,7 +25,7 @@ import {
 import { resolveSessionFilePathCore } from "./paths.js";
 import { listDurableSqliteTargetPathsForSessionStorePath } from "./session-sqlite-target.js";
 import { projectSessionStoreForPersistence } from "./skill-prompt-blobs.js";
-import { shouldPreserveMaintenanceEntry } from "./store-maintenance.js";
+import { isSessionEntryDiskBudgetEvictable } from "./store-maintenance.js";
 import type { SessionEntry } from "./types.js";
 
 type SessionDiskBudgetConfig = {
@@ -115,14 +115,6 @@ function buildProjectedPromptBlobRefCounts(
     counts.set(hash, (counts.get(hash) ?? 0) + 1);
   }
   return counts;
-}
-
-function getEntryUpdatedAt(entry?: SessionEntry): number {
-  if (!entry) {
-    return 0;
-  }
-  const updatedAt = entry.updatedAt;
-  return Number.isFinite(updatedAt) ? updatedAt : 0;
 }
 
 function buildSessionIdRefCounts(store: Record<string, SessionEntry>): Map<string, number> {
@@ -808,12 +800,21 @@ export async function enforceSessionDiskBudget(params: {
     const activeSessionKey = normalizeOptionalLowercaseString(params.activeSessionKey);
     const sessionIdRefCounts = buildSessionIdRefCounts(params.store);
     const entryChunkBytesByKey = buildStoreEntryChunkSizeMap(projectedStore);
-    const keys = Object.keys(params.store).toSorted((a, b) => {
-      const aTime = getEntryUpdatedAt(params.store[a]);
-      const bTime = getEntryUpdatedAt(params.store[b]);
-      return aTime - bTime;
-    });
-    // Last resort: delete oldest non-preserved sessions, then their now-unreferenced artifacts.
+    const keys = Object.keys(params.store)
+      .filter((key) =>
+        isSessionEntryDiskBudgetEvictable({
+          key,
+          entry: params.store[key],
+          preserveKeys: params.preserveKeys,
+          preserveRecentMs: params.maintenance.preserveRecentMs,
+        }),
+      )
+      .toSorted(
+        (a, b) =>
+          (params.store[a]?.archivedAt ?? Number.POSITIVE_INFINITY) -
+            (params.store[b]?.archivedAt ?? Number.POSITIVE_INFINITY) || a.localeCompare(b),
+      );
+    // Last resort: permanently delete the oldest cap-archived sessions, then their artifacts.
     for (const key of keys) {
       if (total <= highWaterBytes) {
         break;
@@ -823,20 +824,6 @@ export async function enforceSessionDiskBudget(params: {
       }
       const entry = params.store[key];
       if (!entry) {
-        continue;
-      }
-      // `maxDiskBytes` is a hard cap: always-protected and preserveRecent entries
-      // survive. Durable conversations are evictable oldest-first (keys are sorted
-      // ascending by updatedAt above) so the disk budget actually bounds the store.
-      if (
-        shouldPreserveMaintenanceEntry({
-          key,
-          entry,
-          preserveKeys: params.preserveKeys,
-          preserveRecentMs: params.maintenance.preserveRecentMs,
-          scope: "capacity",
-        })
-      ) {
         continue;
       }
       const previousProjectedBytes = projectedStoreBytes;

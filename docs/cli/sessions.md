@@ -120,6 +120,12 @@ wait for the placement to settle, then retry. Agent main sessions remain
 protected. Already archived sessions are successful no-ops. Use `--dry-run` to
 validate every key and preview the result without changing session state.
 
+Archive reasons are assigned automatically and displayed as human-readable text
+in the Control UI. Explicit archive commands record `manual`; maintenance-owned
+archives record their owning trigger. Missing reasons remain protected as legacy
+state. Under disk pressure, only sessions explicitly archived by `maxEntries`
+are eligible for automatic deletion after cheaper cleanup tiers are exhausted.
+
 ## Delete sessions
 
 Delete one or more sessions through the running Gateway:
@@ -252,30 +258,28 @@ openclaw sessions cleanup --json
   pressure-gated: it only removes stale probe rows when session-entry
   maintenance/cap pressure is reached. When it runs, model-run cleanup
   happens before global stale cleanup and capping.
-- `maxEntries` caps the total live session row count. Always-protected rows
-  (primary `main`/`global`, archived, pinned, model-locked, and active or
-  admitted work) are reported as `keep` and count toward the cap, but they are
-  never automatic eviction targets. Durable conversations (threads, Telegram
-  topics, group/channel roots) are exempt from age pruning (`pruneAfter`) but
-  are evictable oldest-first under `maxEntries` and `maxDiskBytes`. If
-  always-protected rows prevent cleanup from reaching the cap, the store remains
-  above it. `--enforce` does not remove that protection; unarchive, unpin, wait
-  for active work to finish, raise the caps, or explicitly delete sessions you
-  no longer want to retain.
+- `maxEntries` caps the unarchived session row count; archived rows do not
+  consume it. Eligible ordinary overflow is reported as `archive-cap` and
+  archived, while synthetic runtime overflow remains disposable. Protected
+  unarchived rows are reported as `keep` and still consume the cap. If those
+  protected rows prevent cleanup from reaching the cap, the unarchived store
+  remains above it. `--enforce` does not remove that protection; unpin, wait
+  for active work to finish, or explicitly delete sessions you no longer want
+  to retain.
 
 Flags:
 
-| Flag                 | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--dry-run`          | Preview how many entries would be pruned/capped without writing. In text mode, prints a per-session action table (`Action`, `Key`, `Age`, `Model`, `Flags`) plus a summary grouped by session label.                                                                                                                                                                                                                                                                                                        |
-| `--enforce`          | Apply maintenance even when `session.maintenance.mode` is `warn`.                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| `--fix-missing`      | Remove legacy entries whose archived transcript artifacts are missing or header-only/empty, even if they would not normally age/count out yet.                                                                                                                                                                                                                                                                                                                                                              |
-| `--fix-dm-scope`     | When `session.dmScope` is `main`, retire stale peer-keyed direct-DM rows left behind by earlier `per-peer`, `per-channel-peer`, or `per-account-channel-peer` routing. Use `--dry-run` first; applying removes those rows from SQLite and preserves their legacy transcript artifacts as deleted archives.                                                                                                                                                                                                  |
-| `--active-key <key>` | Protect a specific active key from automatic maintenance. It still counts toward `maxEntries`. Durable conversations (threads, Telegram topics, group/channel roots) are exempt from age pruning (`pruneAfter`) but are evictable oldest-first under `maxEntries` / `maxDiskBytes`. Always-protected rows (primary main/global, archived, pinned, model-locked, active/admitted work) are never reclaimed. SQLite disk cleanup extracts historical generations first, then idle durable live session nodes. |
-| `--agent <id>`       | Run cleanup for one configured agent store.                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| `--all-agents`       | Run cleanup for all configured agent stores.                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| `--store <path>`     | Run against a specific legacy store selector path.                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| `--json`             | Print a JSON summary. With `--all-agents`, output includes one summary per store.                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| Flag                 | Description                                                                                                                                                                                                                                                                                                |
+| -------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--dry-run`          | Preview how many entries would be pruned/capped without writing. In text mode, prints a per-session action table (`Action`, `Key`, `Age`, `Model`, `Flags`) plus a summary grouped by session label.                                                                                                       |
+| `--enforce`          | Apply maintenance even when `session.maintenance.mode` is `warn`.                                                                                                                                                                                                                                          |
+| `--fix-missing`      | Remove legacy entries whose archived transcript artifacts are missing or header-only/empty, even if they would not normally age/count out yet.                                                                                                                                                             |
+| `--fix-dm-scope`     | When `session.dmScope` is `main`, retire stale peer-keyed direct-DM rows left behind by earlier `per-peer`, `per-channel-peer`, or `per-account-channel-peer` routing. Use `--dry-run` first; applying removes those rows from SQLite and preserves their legacy transcript artifacts as deleted archives. |
+| `--active-key <key>` | Protect a specific active key from automatic maintenance. It still counts toward `maxEntries`. Durable external conversation pointers, such as group sessions and thread-scoped chat sessions, are also kept by age/count/disk-budget maintenance.                                                         |
+| `--agent <id>`       | Run cleanup for one configured agent store.                                                                                                                                                                                                                                                                |
+| `--all-agents`       | Run cleanup for all configured agent stores.                                                                                                                                                                                                                                                               |
+| `--store <path>`     | Run against a specific legacy store selector path.                                                                                                                                                                                                                                                         |
+| `--json`             | Print a JSON summary. With `--all-agents`, output includes one summary per store.                                                                                                                                                                                                                          |
 
 When a Gateway is reachable, non-dry-run cleanup for configured agent stores is
 sent through the Gateway so it shares the same session-store writer as runtime

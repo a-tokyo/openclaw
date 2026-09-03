@@ -221,6 +221,8 @@ export async function runCliFallbackCandidate(
           onReasoningProgress: async (payload) => {
             await turn.opts?.onReasoningProgress?.(payload);
           },
+          onCompactionStart: turn.opts?.onCompactionStart,
+          onCompactionEnd: turn.opts?.onCompactionEnd,
           onToolEvent: async (payload) => {
             if (!params.preserveProgressCallbackStartOrder) {
               const commandBearing = await cliToolSummaryTracker.noteToolEvent(payload);
@@ -427,6 +429,10 @@ export async function runCliFallbackCandidate(
               toolAuthorityRoute,
             ),
             abortSignal: params.runAbortSignal,
+            // Native input is already host-authored. Keep its stable delivery
+            // context out of the model-output normalization wrapper.
+            onBlockReply: turn.opts?.onBlockReply,
+            onPartialReply: turn.opts?.onPartialReply,
             onExecutionPhase: params.signalExecutionPhaseForTyping,
             replyOperation: turn.replyOperation,
           },

@@ -132,6 +132,7 @@ jobs:
       run_checks_node_core_dist: ${{ steps.manifest.outputs.run_checks_node_core_dist }}
       run_check: ${{ steps.manifest.outputs.run_check }}
       run_check_additional: ${{ steps.manifest.outputs.run_check_additional }}
+      check_additional_matrix: ${{ steps.manifest.outputs.check_additional_matrix }}
       run_check_docs: ${{ steps.manifest.outputs.run_check_docs }}
       run_format_check: ${{ steps.manifest.outputs.run_format_check }}
       compatibility_target: ${{ steps.manifest.outputs.compatibility_target }}
@@ -1178,6 +1179,12 @@ jobs:
                   },
                 ];
           const createMatrix = (include) => ({ include });
+          // Share setup without combining the target planner's process envelopes.
+          const createContractMatrix = (shards, task) => createMatrix(
+            frozenTarget
+              ? shards.map((shard) => ({ ...shard, task, groups: [shard] }))
+              : shards.length > 0 ? [{ checkName: `checks-fast-${task}`, task, groups: shards }] : [],
+          );
           const outputPath = process.env.GITHUB_OUTPUT;
           const packageJson = JSON.parse(readFileSync("package.json", "utf8"));
           const packageScripts = packageJson.scripts ?? {};
@@ -1281,10 +1288,15 @@ jobs:
             existsSync("test/vitest/vitest.ui-e2e.config.ts") &&
             readFileSync("test/vitest/vitest.ui-e2e.config.ts", "utf8")
               .includes("ui-e2e-projects-contract-v1");
-          // Twelve combined shards reduce repeated checkout/setup while retaining
-          // the target-owned two-worker and single-worker phases. Older configs
-          // retain their existing serial width.
-          const uiE2eJobCount = supportsUiE2eProjects ? 13 : usesHostedRunnerProfile ? 14 : 4;
+          // Six shards share setup on Blacksmith first attempts, including hybrid.
+          // Failed-job reruns retain this matrix and its existing live routing;
+          // frozen targets and fresh hosted plans retain their established widths.
+          const compactUiE2e = !frozenTarget &&
+            (runnerProfile === "blacksmith" || runnerProfile === "hybrid") &&
+            process.env.GITHUB_RUN_ATTEMPT === "1";
+          const uiE2eJobCount = supportsUiE2eProjects
+            ? (compactUiE2e ? 7 : 13)
+            : usesHostedRunnerProfile ? 14 : 4;
           const qaSmokeCiPartCount = usesHostedRunnerProfile ? 6 : 4;
           const supportsNativeI18n =
             hasPackageScript("native:i18n:check") &&
@@ -1518,6 +1530,28 @@ jobs:
             protocolCoverageRequested &&
             (!frozenTarget || existsSync("scripts/check-protocol-event-coverage.mjs"));
 
+          const additionalChecks = [
+            { check_name: "check-additional-boundaries", group: "boundaries", runner: "blacksmith-8vcpu-ubuntu-2404" },
+            // Prompt regeneration loads the full tool/prompt import graph independently.
+            { check_name: "check-prompt-snapshots", group: "prompt-snapshots", runner: "blacksmith-8vcpu-ubuntu-2404" },
+            // Frozen targets retain their original rows and command boundaries.
+            ...(frozenTarget ? [
+              { check_name: "check-export-name-collisions", group: "export-name-collisions", runner: "blacksmith-4vcpu-ubuntu-2404" },
+              { check_name: "check-session-accessor-boundary", group: "session-accessor-boundary", runner: "blacksmith-4vcpu-ubuntu-2404" },
+              { check_name: "check-sqlite-session-schema-baseline", group: "sqlite-session-schema-baseline", runner: "blacksmith-4vcpu-ubuntu-2404" },
+            ] : [
+              { check_name: "check-source-contracts", group: "source-contracts", runner: "blacksmith-4vcpu-ubuntu-2404" },
+            ]),
+            // Only dispatches execute this report; ordinary runs need no report runner.
+            ...(eventName === "workflow_dispatch" ? [
+              // Diff generation took 209–246s on smaller hosts; keep its 8GiB heap isolated.
+              { check_name: "report-plugin-sdk-api-diff", group: "plugin-sdk-api-diff", runner: "blacksmith-8vcpu-ubuntu-2404" },
+            ] : []),
+            // Cold SDK/plugin compilation and architecture scans need the measured 8CPU class.
+            { check_name: "check-additional-extension-package-boundary", group: "extension-package-boundary", runner: "blacksmith-32vcpu-ubuntu-2404" },
+            { check_name: "check-additional-runtime-topology-architecture", group: "runtime-topology-architecture", runner: "blacksmith-32vcpu-ubuntu-2404" },
+          ];
+
           const manifest = {
             release_scope: releaseScope,
             docs_only: docsOnly,
@@ -1551,17 +1585,19 @@ jobs:
             run_sqlite_session_lifecycle: runSqliteSessionLifecycle,
             checks_fast_core_matrix: createMatrix(checksFastCoreTasks),
             run_plugin_contracts_shards: runPluginContractShards,
-            plugin_contracts_matrix: createMatrix(
+            plugin_contracts_matrix: createContractMatrix(
               runPluginContractShards ? createPluginContractTestShards() : [],
+              "contracts-plugins",
             ),
             run_channel_contracts_shards: channelContractShards.length > 0,
-            channel_contracts_matrix: createMatrix(channelContractShards),
+            channel_contracts_matrix: createContractMatrix(channelContractShards, "contracts-channels"),
             run_checks: runNodeFull,
             run_checks_node_core_nondist: nodeTestNonDistShards.length > 0,
             checks_node_core_nondist_matrix: createMatrix(nodeTestNonDistShards),
             run_checks_node_core_dist: runNodeCoreDist,
             run_check: runNodeFull,
             run_check_additional: runNodeFull,
+            check_additional_matrix: createMatrix(runNodeFull ? additionalChecks : []),
             run_check_docs: docsChanged && eventName !== "push",
             run_format_check: runFormatCheck,
             run_control_ui_i18n: runControlUiI18n,
@@ -2300,6 +2336,38 @@ jobs:
           path: .local/gateway-watch-regression/
           retention-days: 7
 
+  control-ui-performance:
+    permissions:
+      contents: read
+    needs: [preflight]
+    if: needs.preflight.outputs.run_build_artifacts == 'true' || needs.preflight.outputs.run_ui_tests == 'true'
+    runs-on: ${{ (vars.OPENCLAW_CI_RUNNER_BACKEND == 'github' || vars.OPENCLAW_CI_RUNNER_BACKEND == 'hybrid') && 'ubuntu-24.04' || (github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && github.run_attempt > 1)) && 'ubuntu-24.04' || (github.repository == 'openclaw/openclaw' && (github.event_name != 'pull_request' || contains(fromJSON('["OWNER","MEMBER","COLLABORATOR","CONTRIBUTOR"]'), github.event.pull_request.author_association)) && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-24.04') }}
+    timeout-minutes: 15
+    env:
+      CHECKOUT_BASE_SHA: ${{ needs.preflight.outputs.diff_base_revision }}
+      COMPATIBILITY_TARGET: ${{ needs.preflight.outputs.compatibility_target }}
+    steps:
+      - *linux_node_checkout_step
+      - name: Setup Node environment
+        uses: ./.ci-harness/.github/actions/setup-node-env
+        with:
+          cache-mode: ${{ needs.preflight.outputs.cache_mode }}
+          install-bun: "false"
+          dependency-cache: ${{ vars.OPENCLAW_CI_RUNNER_BACKEND != 'github' && runner.environment == 'self-hosted' && github.event_name != 'workflow_dispatch' && github.repository == 'openclaw/openclaw' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == 'openclaw/openclaw') && 'true' || 'false' }}
+
+      - name: Check Control UI performance against base
+        shell: bash
+        run: |
+          set -euo pipefail
+          if node -e 'process.exit(require("./package.json").scripts?.["ui:check-performance:base"] ? 0 : 1)'; then
+            pnpm ui:check-performance:base "$CHECKOUT_BASE_SHA"
+          elif [[ "$COMPATIBILITY_TARGET" == "true" ]]; then
+            echo "Skipping separate Control UI performance check: unavailable on the selected compatibility target; its artifact build retains its historical policy." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "ui:check-performance:base is required for non-compatibility targets." >&2
+            exit 1
+          fi
+
   native-i18n:
     permissions:
       contents: read
@@ -2422,9 +2490,10 @@ jobs:
     # Compatibility targets pin a frozen Control UI whose e2e expectations track
     # that release, not current main.
     if: needs.preflight.outputs.run_ui_tests == 'true' && needs.preflight.outputs.compatibility_target != 'true'
-    # Hybrid attempt 1 uses Blacksmith; github mode, hybrid retries, manual
-    # dispatches, forks, and same-repo PR retries use GitHub-hosted capacity.
-    runs-on: ${{ vars.OPENCLAW_CI_RUNNER_BACKEND == 'github' && 'ubuntu-24.04' || (vars.OPENCLAW_CI_RUNNER_BACKEND == 'hybrid' && github.run_attempt > 1) && 'ubuntu-24.04' || (github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.run_attempt > 1)) && 'ubuntu-24.04' || (github.repository == 'openclaw/openclaw' && (github.event_name != 'pull_request' || contains(fromJSON('["OWNER","MEMBER","COLLABORATOR","CONTRIBUTOR"]'), github.event.pull_request.author_association)) && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-24.04') }}
+    # Backend and contributor routing stays shared with real-Gateway tests.
+    # UI's two workers received two CPUs on the 8-vCPU label; request the measured
+    # eight-CPU class only for Control UI, retaining browser-extension placement.
+    runs-on: ${{ vars.OPENCLAW_CI_RUNNER_BACKEND == 'github' && 'ubuntu-24.04' || (vars.OPENCLAW_CI_RUNNER_BACKEND == 'hybrid' && github.run_attempt > 1) && 'ubuntu-24.04' || (github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.run_attempt > 1)) && 'ubuntu-24.04' || (github.repository == 'openclaw/openclaw' && (github.event_name != 'pull_request' || contains(fromJSON('["OWNER","MEMBER","COLLABORATOR","CONTRIBUTOR"]'), github.event.pull_request.author_association)) && (matrix.task == 'control-ui' && 'blacksmith-32vcpu-ubuntu-2404' || 'blacksmith-8vcpu-ubuntu-2404') || 'ubuntu-24.04') }}
     # Source-server and runtime-budget owners retain serial Chromium execution.
     timeout-minutes: 25
     env:
@@ -2499,8 +2568,10 @@ jobs:
       - *cache_playwright_chromium
       - *install_playwright_chromium
 
-      - name: Build Control UI bundle for real-Gateway tests
-        run: pnpm ui:build
+      - name: Build runtime and Control UI artifacts for real-Gateway tests
+        env:
+          OPENCLAW_BUILD_PRIVATE_QA: "1"
+        run: pnpm build:ci-artifacts
 
       - name: Test Control UI suites with a real Gateway
         env:
@@ -2515,8 +2586,11 @@ jobs:
           ui/src/e2e/usage-sessions-owner-attribution.e2e.test.ts
           ui/src/e2e/logs-lifecycle.e2e.test.ts
           ui/src/e2e/agent-file-lifecycle.real-gateway.e2e.test.ts
+          ui/src/e2e/cron-duration-save.real-gateway.e2e.test.ts
           ui/src/e2e/session-progress-hovercard.real-gateway.e2e.test.ts
           extensions/qa-lab/src/control-ui-media-transcript.real-gateway.e2e.test.ts
+          extensions/qa-lab/src/session-host-command-state.real-gateway.e2e.test.ts
+          extensions/qa-lab/src/control-ui-openclaw-delegation.real-gateway.e2e.test.ts
 
       - name: Upload sanitized Control UI real-Gateway proof
         if: always() && github.event_name == 'workflow_dispatch' && inputs.capture_ui_proof
@@ -2932,22 +3006,42 @@ jobs:
 
       - name: Run plugin contract shard
         env:
-          OPENCLAW_CONTRACT_INCLUDE_PATTERNS_JSON: ${{ toJson(matrix.includePatterns) }}
+          OPENCLAW_CONTRACT_INCLUDE_PATTERNS_JSON: ${{ toJson(matrix) }}
         shell: bash
-        run: |
+        run: &run_contract_groups |
           set -euo pipefail
-          include_file="$RUNNER_TEMP/plugin-contract-include.json"
-          INCLUDE_FILE="$include_file" node --input-type=module <<'EOF'
+          include_list="$RUNNER_TEMP/contract-includes.list"
+          INCLUDE_FILE="$include_list" node --input-type=module <<'EOF'
           import { writeFileSync } from "node:fs";
 
-          const includePatterns = JSON.parse(process.env.OPENCLAW_CONTRACT_INCLUDE_PATTERNS_JSON ?? "[]");
-          if (!Array.isArray(includePatterns) || includePatterns.length === 0) {
-            console.error("Missing plugin contract include patterns");
-            process.exit(1);
+          const { task, groups } = JSON.parse(process.env.OPENCLAW_CONTRACT_INCLUDE_PATTERNS_JSON ?? "{}");
+          const script = {
+            "contracts-plugins": "test:contracts:plugins",
+            "contracts-channels": "test:contracts:channels",
+          }[task];
+          if (!script || !Array.isArray(groups) || groups.length === 0) {
+            throw new Error("Missing contract task or process groups");
           }
-          writeFileSync(process.env.INCLUDE_FILE, JSON.stringify(includePatterns), "utf8");
+          const entries = groups.map(({ checkName, includePatterns }, index) => {
+            if (!Array.isArray(includePatterns) || includePatterns.length === 0) {
+              throw new Error("Missing contract include patterns");
+            }
+            const includeFile = `${process.env.INCLUDE_FILE}.${index}.json`;
+            writeFileSync(includeFile, JSON.stringify(includePatterns), "utf8");
+            return `${includeFile}\t${script}\t${checkName}`;
+          });
+          writeFileSync(process.env.INCLUDE_FILE, `${entries.join("\n")}\n`, "utf8");
           EOF
-          OPENCLAW_VITEST_INCLUDE_FILE="$include_file" pnpm test:contracts:plugins
+          # A nonzero exit can mean unverified cleanup; do not admit another envelope.
+          while IFS=$'\t' read -r include_file contract_script contract_name; do
+            echo "::group::${contract_name}"
+            contract_exit=0
+            OPENCLAW_VITEST_INCLUDE_FILE="$include_file" pnpm "$contract_script" || contract_exit=$?
+            echo "::endgroup::"
+            if [[ "$contract_exit" -ne 0 ]]; then
+              exit "$contract_exit"
+            fi
+          done < "$include_list"
 
   checks-fast-channel-contracts-shard:
     permissions:
@@ -2973,23 +3067,10 @@ jobs:
 
       - name: Run channel contract shard
         env:
-          OPENCLAW_CONTRACT_INCLUDE_PATTERNS_JSON: ${{ toJson(matrix.includePatterns) }}
+          OPENCLAW_CONTRACT_INCLUDE_PATTERNS_JSON: ${{ toJson(matrix) }}
           OPENCLAW_TEST_PROJECTS_PARALLEL: "4"
         shell: bash
-        run: |
-          set -euo pipefail
-          include_file="$RUNNER_TEMP/channel-contract-include.json"
-          INCLUDE_FILE="$include_file" node --input-type=module <<'EOF'
-          import { writeFileSync } from "node:fs";
-
-          const includePatterns = JSON.parse(process.env.OPENCLAW_CONTRACT_INCLUDE_PATTERNS_JSON ?? "[]");
-          if (!Array.isArray(includePatterns) || includePatterns.length === 0) {
-            console.error("Missing channel contract include patterns");
-            process.exit(1);
-          }
-          writeFileSync(process.env.INCLUDE_FILE, JSON.stringify(includePatterns), "utf8");
-          EOF
-          OPENCLAW_VITEST_INCLUDE_FILE="$include_file" pnpm test:contracts:channels
+        run: *run_contract_groups
 
   checks-node-compat:
     permissions:
@@ -3213,6 +3294,7 @@ jobs:
     runs-on: ${{ vars.OPENCLAW_CI_RUNNER_BACKEND == 'github' && 'ubuntu-24.04' || (vars.OPENCLAW_CI_RUNNER_BACKEND == 'hybrid' && github.repository == 'openclaw/openclaw' && github.event_name == 'workflow_dispatch' && !inputs.release_gate && startsWith(inputs.dispatch_id, 'full-release-validation-') && needs.preflight.outputs.frozen_target == 'true' && matrix.task == 'lint') && (matrix.runner || 'blacksmith-4vcpu-ubuntu-2404') || (vars.OPENCLAW_CI_RUNNER_BACKEND == 'hybrid' && (github.event_name == 'workflow_dispatch' || github.run_attempt > 1 || (matrix.task != 'lint' && matrix.task != 'test-types' && matrix.task != 'dependencies'))) && 'ubuntu-24.04' || ((github.event_name == 'workflow_dispatch' && inputs.release_gate) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && github.run_attempt > 1)) && 'ubuntu-24.04' || (github.repository == 'openclaw/openclaw' && (github.event_name != 'pull_request' || contains(fromJSON('["OWNER","MEMBER","COLLABORATOR","CONTRIBUTOR"]'), github.event.pull_request.author_association)) && (matrix.runner || 'blacksmith-4vcpu-ubuntu-2404') || 'ubuntu-24.04') }}
     timeout-minutes: 20
     env:
+      # Prepare comparison history before checkout's credential scope ends.
       CHECKOUT_BASE_SHA: ${{ ((matrix.task == 'guards' && github.event_name == 'pull_request') || (matrix.task == 'npm-lock' && github.event_name != 'workflow_dispatch')) && needs.preflight.outputs.diff_base_revision || '' }}
     strategy:
       fail-fast: false
@@ -3334,8 +3416,6 @@ jobs:
           RUNNER_PROFILE: ${{ needs.preflight.outputs.runner_profile }}
           OPENCLAW_LOCAL_CHECK: "0"
           TASK: ${{ matrix.task }}
-          PR_BASE_SHA: ${{ github.event_name == 'pull_request' && needs.preflight.outputs.diff_base_revision || '' }}
-          DIFF_BASE_SHA: ${{ needs.preflight.outputs.diff_base_revision }}
         shell: bash
         run: |
           set -euo pipefail
@@ -3379,9 +3459,9 @@ jobs:
                 echo "Current CI targets must provide the check:coercion-helpers package script." >&2
                 exit 1
               fi
-              if [ -n "$PR_BASE_SHA" ]; then
-                test "$(git rev-parse refs/remotes/origin/ci-ratchet-base^{commit})" = "$PR_BASE_SHA"
-                node scripts/report-test-temp-creations.mjs --base refs/remotes/origin/ci-ratchet-base --head HEAD --no-merge-base
+              if [ -n "$CHECKOUT_BASE_SHA" ]; then
+                test "$(git rev-parse refs/remotes/origin/ci-ratchet-base^{commit})" = "$CHECKOUT_BASE_SHA"
+                node scripts/report-test-temp-creations.mjs --base "$CHECKOUT_BASE_SHA" --head HEAD --no-merge-base
               fi
               pnpm deps:patches:check
               pnpm lint:webhook:no-low-level-body-read
@@ -3395,14 +3475,10 @@ jobs:
               # dependency-surface changes resolve nothing); dispatches and
               # release validation keep the full sweep, which also covers
               # registry-side drift on unchanged lockfiles.
-              npm_lock_base=""
-              if [[ "${GITHUB_EVENT_NAME:-}" != "workflow_dispatch" && -n "$DIFF_BASE_SHA" ]] &&
+              if [[ -n "$CHECKOUT_BASE_SHA" ]] &&
                 has_package_script "deps:npm-lock:check:changed"; then
-                npm_lock_base="refs/remotes/origin/ci-ratchet-base"
-                test "$(git rev-parse "${npm_lock_base}^{commit}")" = "$DIFF_BASE_SHA"
-              fi
-              if [[ -n "$npm_lock_base" ]]; then
-                pnpm deps:npm-lock:check:changed --base "$npm_lock_base" --head HEAD
+                test "$(git rev-parse refs/remotes/origin/ci-ratchet-base^{commit})" = "$CHECKOUT_BASE_SHA"
+                pnpm deps:npm-lock:check:changed --base "$CHECKOUT_BASE_SHA" --head HEAD
               elif has_package_script "deps:npm-lock:check"; then
                 pnpm deps:npm-lock:check
               elif [[ "$HISTORICAL_TARGET" != "true" ]]; then
@@ -3710,40 +3786,7 @@ jobs:
     strategy:
       fail-fast: false
       max-parallel: 12
-      matrix:
-        include:
-          - check_name: check-additional-boundaries
-            group: boundaries
-            runner: blacksmith-8vcpu-ubuntu-2404
-          # Prompt snapshot regeneration evaluates the full agent tool/prompt
-          # import graph and used to own the boundaries-a wall clock; keep it
-          # in its own lane.
-          - check_name: check-prompt-snapshots
-            group: prompt-snapshots
-            runner: blacksmith-8vcpu-ubuntu-2404
-          - check_name: check-export-name-collisions
-            group: export-name-collisions
-            runner: blacksmith-4vcpu-ubuntu-2404
-          - check_name: check-session-accessor-boundary
-            group: session-accessor-boundary
-            runner: blacksmith-4vcpu-ubuntu-2404
-          - check_name: check-sqlite-session-schema-baseline
-            group: sqlite-session-schema-baseline
-            runner: blacksmith-4vcpu-ubuntu-2404
-          - check_name: report-plugin-sdk-api-diff
-            group: plugin-sdk-api-diff
-            # Measured 209s hosted and 246s on 4 vCPU; diff generation is
-            # CPU-bound and the 8 vCPU class keeps it off the critical path.
-            runner: blacksmith-8vcpu-ubuntu-2404
-          - check_name: check-additional-extension-package-boundary
-            group: extension-package-boundary
-            # Cold SDK declaration builds and plugin compilation need CPU and memory headroom.
-            runner: blacksmith-32vcpu-ubuntu-2404
-          - check_name: check-additional-runtime-topology-architecture
-            group: runtime-topology-architecture
-            # The 8 label delivered only 2 CPUs/8 GiB in the capacity probe.
-            # Request 32 for measured 8 CPUs/31 GiB; see docs/ci.md#blacksmith-runner-capacity.
-            runner: blacksmith-32vcpu-ubuntu-2404
+      matrix: ${{ fromJSON(needs.preflight.outputs.check_additional_matrix) }}
     steps:
       - *linux_node_checkout_step
       # The report is dispatch-only; fetching its inputs can otherwise fail skipped PR work.
@@ -3877,95 +3920,102 @@ jobs:
             echo "::endgroup::"
           }
 
-          case "$ADDITIONAL_CHECK_GROUP" in
-            boundaries)
-              boundary_runner=(node --import tsx scripts/run-additional-boundary-checks.mts)
-              if [[ ! -f scripts/run-additional-boundary-checks.mts ]]; then
-                boundary_runner=(node scripts/run-additional-boundary-checks.mjs)
-              fi
-              "${boundary_runner[@]}"
-              ;;
-            prompt-snapshots)
-              # No presence fallback: the boundary runner previously invoked
-              # this unconditionally, and silent success would drop snapshot
-              # drift coverage. The manifest gates the lane on the generator's
-              # import graph and fixtures; diffs outside both cannot change
-              # generated snapshots.
-              if [ "$RUN_PROMPT_SNAPSHOTS" != "true" ]; then
-                echo "[skip] changed scope cannot affect generated prompt snapshots"
-              else
-                run_check "prompt:snapshots:check" pnpm prompt:snapshots:check
-              fi
-              ;;
-            export-name-collisions)
-              if [ ! -f scripts/check-export-name-collisions.mts ]; then
-                echo "[skip] export name collision check is not present in this checkout"
-              elif ! node -e 'const pkg = require("./package.json"); process.exit(pkg.scripts?.["lint:tmp:export-name-collisions"] ? 0 : 1);'; then
-                echo "[skip] export name collision script is not present in package.json"
-              else
-                run_check "lint:tmp:export-name-collisions" pnpm run lint:tmp:export-name-collisions
-              fi
-              ;;
-            session-accessor-boundary)
-              if ! node -e 'const pkg = require("./package.json"); process.exit(pkg.scripts?.["lint:tmp:session-accessor-boundary"] ? 0 : 1);'; then
-                echo "[skip] session accessor boundary script is not present in package.json"
-              else
-                run_check "lint:tmp:session-accessor-boundary" pnpm run lint:tmp:session-accessor-boundary
-              fi
-              if ! node -e 'const pkg = require("./package.json"); process.exit(pkg.scripts?.["lint:tmp:sqlite-transaction-boundary"] ? 0 : 1);'; then
-                echo "[skip] SQLite transaction boundary script is not present in package.json"
-              else
-                run_check "lint:tmp:sqlite-transaction-boundary" pnpm run lint:tmp:sqlite-transaction-boundary
-              fi
-              if ! node -e 'const pkg = require("./package.json"); process.exit(pkg.scripts?.["lint:tmp:session-transcript-reader-boundary"] ? 0 : 1);'; then
-                echo "[skip] session transcript reader boundary script is not present in package.json"
-              else
-                run_check "lint:tmp:session-transcript-reader-boundary" pnpm run lint:tmp:session-transcript-reader-boundary
-              fi
-              ;;
-            sqlite-session-schema-baseline)
-              if ! node -e 'const pkg = require("./package.json"); process.exit(pkg.scripts?.["sqlite:sessions-schema:check"] ? 0 : 1);'; then
-                echo "[skip] SQLite sessions/transcripts schema baseline script is not present in package.json"
-              else
-                run_check "sqlite:sessions-schema:check" pnpm run sqlite:sessions-schema:check
-              fi
-              ;;
-            plugin-sdk-api-diff)
-              # Pure reporting: no caller passes --require-acknowledgement, so
-              # this can only surface an artifact/summary. Keep it off the
-              # push/PR critical path; dispatch (incl. release validation)
-              # still produces the report.
-              if [[ "${GITHUB_EVENT_NAME:-}" != "workflow_dispatch" ]]; then
-                echo "[skip] plugin SDK API diff reports on manual and release dispatches only"
-              elif node -e 'const pkg = require("./package.json"); process.exit(pkg.scripts?.["plugin-sdk:api:diff"] ? 0 : 1);'; then
-                mkdir -p .artifacts
-                run_check "plugin-sdk:api:diff" pnpm run plugin-sdk:api:diff -- \
-                  --base "${{ needs.preflight.outputs.diff_base_revision }}" \
-                  --head "${{ needs.preflight.outputs.diff_head_revision }}" \
-                  --json .artifacts/plugin-sdk-api-diff.json \
-                  --summary "$GITHUB_STEP_SUMMARY"
-              elif [[ "$COMPATIBILITY_TARGET" == "true" ]] && node -e 'const pkg = require("./package.json"); process.exit(pkg.scripts?.["plugin-sdk:api:check"] ? 0 : 1);'; then
-                run_check "plugin-sdk:api:check (historical compatibility)" pnpm run plugin-sdk:api:check
-              elif [[ "$COMPATIBILITY_TARGET" == "true" ]]; then
-                echo "::error title=Plugin SDK API check unavailable::Compatibility target provides neither plugin-sdk:api:diff nor plugin-sdk:api:check."
-                failures=1
-              else
-                echo "::error title=Plugin SDK API diff unavailable::Current CI targets must provide plugin-sdk:api:diff."
-                failures=1
-              fi
-              ;;
-            extension-package-boundary)
-              run_check "test:extensions:package-boundary:compile" pnpm run test:extensions:package-boundary:compile
-              run_check "test:extensions:package-boundary:canary" pnpm run test:extensions:package-boundary:canary
-              ;;
-            runtime-topology-architecture)
-              run_check "check:architecture" pnpm check:architecture
-              ;;
-            *)
-              echo "Unsupported additional check group: $ADDITIONAL_CHECK_GROUP" >&2
-              exit 1
-              ;;
-          esac
+          check_groups=("$ADDITIONAL_CHECK_GROUP")
+          if [[ "$ADDITIONAL_CHECK_GROUP" == "source-contracts" ]]; then
+            check_groups=(export-name-collisions session-accessor-boundary sqlite-session-schema-baseline)
+          fi
+          # Keep fresh, serial child processes and collect every command failure.
+          for check_group in "${check_groups[@]}"; do
+            case "$check_group" in
+              boundaries)
+                boundary_runner=(node --import tsx scripts/run-additional-boundary-checks.mts)
+                if [[ ! -f scripts/run-additional-boundary-checks.mts ]]; then
+                  boundary_runner=(node scripts/run-additional-boundary-checks.mjs)
+                fi
+                "${boundary_runner[@]}"
+                ;;
+              prompt-snapshots)
+                # No presence fallback: the boundary runner previously invoked
+                # this unconditionally, and silent success would drop snapshot
+                # drift coverage. The manifest gates the lane on the generator's
+                # import graph and fixtures; diffs outside both cannot change
+                # generated snapshots.
+                if [ "$RUN_PROMPT_SNAPSHOTS" != "true" ]; then
+                  echo "[skip] changed scope cannot affect generated prompt snapshots"
+                else
+                  run_check "prompt:snapshots:check" pnpm prompt:snapshots:check
+                fi
+                ;;
+              export-name-collisions)
+                if [ ! -f scripts/check-export-name-collisions.mts ]; then
+                  echo "[skip] export name collision check is not present in this checkout"
+                elif ! node -e 'const pkg = require("./package.json"); process.exit(pkg.scripts?.["lint:tmp:export-name-collisions"] ? 0 : 1);'; then
+                  echo "[skip] export name collision script is not present in package.json"
+                else
+                  run_check "lint:tmp:export-name-collisions" pnpm run lint:tmp:export-name-collisions
+                fi
+                ;;
+              session-accessor-boundary)
+                if ! node -e 'const pkg = require("./package.json"); process.exit(pkg.scripts?.["lint:tmp:session-accessor-boundary"] ? 0 : 1);'; then
+                  echo "[skip] session accessor boundary script is not present in package.json"
+                else
+                  run_check "lint:tmp:session-accessor-boundary" pnpm run lint:tmp:session-accessor-boundary
+                fi
+                if ! node -e 'const pkg = require("./package.json"); process.exit(pkg.scripts?.["lint:tmp:sqlite-transaction-boundary"] ? 0 : 1);'; then
+                  echo "[skip] SQLite transaction boundary script is not present in package.json"
+                else
+                  run_check "lint:tmp:sqlite-transaction-boundary" pnpm run lint:tmp:sqlite-transaction-boundary
+                fi
+                if ! node -e 'const pkg = require("./package.json"); process.exit(pkg.scripts?.["lint:tmp:session-transcript-reader-boundary"] ? 0 : 1);'; then
+                  echo "[skip] session transcript reader boundary script is not present in package.json"
+                else
+                  run_check "lint:tmp:session-transcript-reader-boundary" pnpm run lint:tmp:session-transcript-reader-boundary
+                fi
+                ;;
+              sqlite-session-schema-baseline)
+                if ! node -e 'const pkg = require("./package.json"); process.exit(pkg.scripts?.["sqlite:sessions-schema:check"] ? 0 : 1);'; then
+                  echo "[skip] SQLite sessions/transcripts schema baseline script is not present in package.json"
+                else
+                  run_check "sqlite:sessions-schema:check" pnpm run sqlite:sessions-schema:check
+                fi
+                ;;
+              plugin-sdk-api-diff)
+                # Pure reporting: no caller passes --require-acknowledgement, so
+                # this can only surface an artifact/summary. Keep it off the
+                # push/PR critical path; dispatch (incl. release validation)
+                # still produces the report.
+                if [[ "${GITHUB_EVENT_NAME:-}" != "workflow_dispatch" ]]; then
+                  echo "[skip] plugin SDK API diff reports on manual and release dispatches only"
+                elif node -e 'const pkg = require("./package.json"); process.exit(pkg.scripts?.["plugin-sdk:api:diff"] ? 0 : 1);'; then
+                  mkdir -p .artifacts
+                  run_check "plugin-sdk:api:diff" pnpm run plugin-sdk:api:diff -- \
+                    --base "${{ needs.preflight.outputs.diff_base_revision }}" \
+                    --head "${{ needs.preflight.outputs.diff_head_revision }}" \
+                    --json .artifacts/plugin-sdk-api-diff.json \
+                    --summary "$GITHUB_STEP_SUMMARY"
+                elif [[ "$COMPATIBILITY_TARGET" == "true" ]] && node -e 'const pkg = require("./package.json"); process.exit(pkg.scripts?.["plugin-sdk:api:check"] ? 0 : 1);'; then
+                  run_check "plugin-sdk:api:check (historical compatibility)" pnpm run plugin-sdk:api:check
+                elif [[ "$COMPATIBILITY_TARGET" == "true" ]]; then
+                  echo "::error title=Plugin SDK API check unavailable::Compatibility target provides neither plugin-sdk:api:diff nor plugin-sdk:api:check."
+                  failures=1
+                else
+                  echo "::error title=Plugin SDK API diff unavailable::Current CI targets must provide plugin-sdk:api:diff."
+                  failures=1
+                fi
+                ;;
+              extension-package-boundary)
+                run_check "test:extensions:package-boundary:compile" pnpm run test:extensions:package-boundary:compile
+                run_check "test:extensions:package-boundary:canary" pnpm run test:extensions:package-boundary:canary
+                ;;
+              runtime-topology-architecture)
+                run_check "check:architecture" pnpm check:architecture
+                ;;
+              *)
+                echo "Unsupported additional check group: $ADDITIONAL_CHECK_GROUP" >&2
+                exit 1
+                ;;
+            esac
+          done
 
           exit "$failures"
 
@@ -4163,12 +4213,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Jobs requesting the Blacksmith Windows class admit at most two project
-          # processes with one Vitest worker each; hosted fallbacks remain serial.
+          # Native allocation can be smaller than the runner label. Keep projects
+          # serial within each machine; the two matrix jobs still run concurrently.
           export OPENCLAW_TEST_PROJECTS_PARALLEL=1
-          if [[ "${RUNNER_ENVIRONMENT:-}" == "self-hosted" ]]; then
-            export OPENCLAW_TEST_PROJECTS_PARALLEL=2
-          fi
           case "$TASK" in
             # Linux owns the full repo test suite. Keep the Windows runner focused on
             # Windows-native process/path wrappers so platform regressions fail fast.
@@ -5260,6 +5307,7 @@ jobs:
       - security-fast
       - pnpm-store-warmup
       - build-artifacts
+      - control-ui-performance
       - native-i18n
       - checks-ui
       - checks-ui-e2e
@@ -5288,9 +5336,8 @@ jobs:
     # Report failed prerequisites, but let superseded runs release their slot
     # without waiting for an aggregate runner after workflow cancellation.
     if: ${{ !cancelled() && (github.event_name != 'pull_request' || !github.event.pull_request.draft) }}
-    # Follow preflight so canonical Blacksmith runs never wait on a second hosted
-    # assignment; security-fast intentionally stays hosted outside hybrid.
-    runs-on: ${{ (vars.OPENCLAW_CI_RUNNER_BACKEND == 'github' || (vars.OPENCLAW_CI_RUNNER_BACKEND == 'hybrid' && github.run_attempt > 1)) && 'ubuntu-24.04' || (github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && github.run_attempt > 1)) && 'ubuntu-24.04' || (github.repository == 'openclaw/openclaw' && (github.event_name != 'pull_request' || contains(fromJSON('["OWNER","MEMBER","COLLABORATOR","CONTRIBUTOR"]'), github.event.pull_request.author_association)) && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-24.04') }}
+    # The gate only aggregates job results; keep it independent of Blacksmith capacity.
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: Verify selected CI lanes
@@ -5301,6 +5348,7 @@ jobs:
             security-fast=${{ needs.security-fast.result }}|true
             pnpm-store-warmup=${{ needs.pnpm-store-warmup.result }}|${{ (needs.preflight.outputs.run_node == 'true' || needs.preflight.outputs.run_check_docs == 'true') && (needs.preflight.outputs.runner_profile == 'github' || needs.preflight.outputs.runner_profile == 'hybrid' || (!(github.repository == 'openclaw/openclaw' && github.event_name == 'push' && github.ref == 'refs/heads/main') && !(github.repository == 'openclaw/openclaw' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && needs.preflight.outputs.run_node == 'true'))) }}
             build-artifacts=${{ needs.build-artifacts.result }}|${{ needs.preflight.outputs.run_build_artifacts }}
+            control-ui-performance=${{ needs.control-ui-performance.result }}|${{ needs.preflight.outputs.run_build_artifacts == 'true' || needs.preflight.outputs.run_ui_tests == 'true' }}
             native-i18n=${{ needs.native-i18n.result }}|${{ needs.preflight.outputs.run_native_i18n }}
             checks-ui=${{ needs.checks-ui.result }}|${{ needs.preflight.outputs.run_ui_tests }}
             checks-ui-e2e=${{ needs.checks-ui-e2e.result }}|${{ needs.preflight.outputs.run_ui_tests == 'true' && needs.preflight.outputs.compatibility_target != 'true' }}

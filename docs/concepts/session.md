@@ -262,17 +262,13 @@ Session store reads do not prune or cap entries during Gateway startup, so
 startup and isolated cron sessions do not pay for a full store cleanup.
 `openclaw sessions cleanup --enforce` applies the cap immediately.
 
-`maxEntries` counts every live session row. Always-protected rows — archived or
-pinned sessions, active or admitted work, model-locked sessions, and the
-primary `main`/`global` session — are never automatic eviction targets, but
-still consume the cap. Durable conversations (threads, Telegram topics,
-group/channel roots) are exempt from age pruning (`pruneAfter`) and become
-evictable oldest-first under `maxEntries` and `maxDiskBytes`. Cleanup removes
-the oldest eligible rows until it reaches `maxEntries` or runs out of victims.
-The total can therefore remain above the cap when always-protected rows alone
-exceed it or active work temporarily blocks eviction. Cleanup does not
-unprotect those rows; unarchive, unpin, wait for active work to finish, raise
-the caps, or explicitly delete sessions you no longer want to retain.
+`maxEntries` caps unarchived session rows. Archived rows do not consume the cap.
+When pressure exceeds the cap, cleanup archives the oldest eligible ordinary
+sessions instead of deleting their transcripts. Synthetic runtime sessions such
+as cron, hooks, heartbeat, ACP, and sub-agents remain disposable and may be
+removed. Pinned sessions, active or admitted work, model-locked sessions, and
+durable external conversation pointers are protected; the unarchived total can
+therefore remain above the cap when protected rows alone exceed it.
 
 Gateway model-run probe sessions are short-lived by default. Rows matching
 `agent:*:explicit:model-run-<uuid>` use fixed `24h` retention, but cleanup is
@@ -281,29 +277,28 @@ maintenance/cap pressure is reached, and runs before the broader stale-entry
 age cutoff and entry cap. Normal direct, group, thread, cron, hook, heartbeat,
 ACP, and sub-agent sessions do not inherit this 24h retention.
 
-Age pruning preserves durable conversations while still allowing synthetic
-cron, hook, heartbeat, ACP, and sub-agent entries to age out. Operators who
-want immortal threads raise `maxEntries` / `maxDiskBytes` or set
-`maxDiskBytes: false`.
+Maintenance preserves durable external conversation pointers, including group
+sessions and thread-scoped chat sessions, while still allowing synthetic cron,
+hook, heartbeat, ACP, and sub-agent entries to age out.
 
 Shared or high-volume installations can set `preserveRecent` to protect
 recently active interactive sessions and every SQLite history generation owned
-by those sessions from age pruning (`pruneAfter`), `maxEntries`, live-node
-`maxDiskBytes` eviction, and SQLite historical-generation disk cleanup. The
-option is disabled when omitted or set to `false`, so personal installations
-keep the normal oldest-first policy. Synthetic model-run, cron, hook,
-heartbeat, ACP, and sub-agent sessions remain eligible for bounded cleanup.
-Protection can temporarily keep the store above its entry or disk target; it
-expires after the configured inactivity window.
+by those sessions. The option is disabled when omitted or set to `false`, so
+personal installations keep the normal oldest-first policy. Synthetic
+model-run, cron, hook, heartbeat, ACP, and sub-agent sessions remain eligible
+for bounded cleanup. Protection can temporarily keep the store above its entry
+or disk target; it expires after the configured inactivity window.
 
 Recent-session protection does not change managed-worktree garbage collection;
 durable dashboard sessions auto-archive after 7 days of inactivity by default,
 while other session types still require an explicit archive action.
 
-Archived and pinned sessions are user-protected and exempt from every automatic
-maintenance path, including age pruning, entry caps, model-run cleanup, and
-disk-budget eviction. They remain protected until you unarchive, unpin, or
-explicitly delete them.
+Pinned sessions and manual, legacy, stale-dashboard, or recovery archives are
+user-protected and exempt from automatic maintenance. Sessions archived because
+`maxEntries` was reached record that reason and remain searchable/restorable
+until physical usage exceeds `maxDiskBytes`; disk-budget cleanup may then delete
+the oldest cap archives after cheaper artifacts and unreferenced history are
+exhausted. Sessions without a recorded archive reason remain protected.
 
 If you previously used DM isolation and later returned `session.dmScope` to
 `main`, preview stale peer-keyed DM rows with
