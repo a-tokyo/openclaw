@@ -44,7 +44,6 @@ import {
   reclaimSqliteFreePages,
 } from "./session-history-archive-pruning.js";
 import { deleteDiskBudgetArchivedSessionEntry } from "./session-history-entry-eviction.runtime.js";
-import { normalizeStoreSessionKey } from "./store-entry.js";
 import { resolveMaintenanceConfig } from "./store-maintenance-runtime.js";
 import {
   isSessionEntryDiskBudgetEvictable,
