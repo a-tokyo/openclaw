@@ -515,62 +515,18 @@ function isPrimarySessionMaintenanceKey(sessionKey: string): boolean {
   return parseAgentSessionKey(sessionKey)?.rest === "main";
 }
 
-/**
- * Which maintenance pass is asking whether an entry may be reclaimed.
- * - `age`: opportunistic staleness pruning (`pruneAfter`). Durable human conversation
- *   surfaces are preserved here: being old is not sufficient reason to delete a real
- *   thread/channel conversation.
- * - `capacity`: hard resource-limit enforcement (`maxEntries` / `maxDiskBytes`). These are
- *   configured caps that must actually bound the store, so durable conversations become
- *   evictable oldest-first as a last resort. Only always-protected entries survive.
- */
-type SessionMaintenanceReclaimScope = "age" | "capacity";
-
-/**
- * Entries that no maintenance pass may reclaim, regardless of age or resource pressure:
- * the operator's primary `main` session, user-shelved archives, pinned sessions,
- * harness-locked sessions, and runtime-provided active/preserve keys (in-flight runs).
- */
-function isAlwaysProtectedMaintenanceEntry(params: {
-  key: string;
-  entry: SessionEntry | undefined;
-  preserveKeys?: ReadonlySet<string>;
-}): boolean {
-  // Archived and pinned sessions are user-retained; only an explicit user action may release them.
-  if (params.entry?.archivedAt !== undefined || params.entry?.pinnedAt !== undefined) {
-    return true;
-  }
-  // A model lock is durable harness ownership, not merely a UI restriction.
-  // Evicting the row can strand its native runtime binding and later recreate
-  // the same conversation under an incompatible model, so pressure may exceed
-  // configured retention limits while the lock remains.
-  if (params.entry?.modelSelectionLocked === true) {
-    return true;
-  }
-  // Runtime-provided keys cover the active session and other in-flight runs; evicting them
-  // corrupts the session file a live prompt still holds.
-  if (params.preserveKeys?.has(params.key) === true) {
-    return true;
-  }
-  // The operator-facing primary session (`agent:<id>:main`, or the literal `global` key for
-  // global scope) is the live interactive conversation. Evicting it out from under an in-flight
-  // run corrupts the session file the runtime still holds (surfacing as `session file changed
-  // while embedded prompt lock was released`), so it is always durable regardless of
-  // entry-cap/disk pressure from other sessions.
-  return isPrimarySessionMaintenanceKey(params.key);
-}
-
-/**
- * Durable human conversation surfaces (threads, telegram topics, group/channel roots).
- * Preserved from age-based pruning, but reclaimable under hard capacity/disk limits so the
- * configured caps stay enforceable. Synthetic automation sessions are never durable.
- */
-function isDurableConversationMaintenanceEntry(
+function isProtectedSessionMaintenanceEntry(
   sessionKey: string,
   entry: SessionEntry | undefined,
 ): boolean {
+  // Human conversation surfaces are protected; synthetic automation sessions are disposable.
   if (isSyntheticSessionMaintenanceKey(sessionKey)) {
     return false;
+  }
+  // Primary sessions are operator-facing and must survive maintenance even without an active
+  // admission. Global scope uses the literal `global` key instead of `agent:<id>:main`.
+  if (isPrimarySessionMaintenanceKey(sessionKey)) {
+    return true;
   }
   if (parseThreadSessionSuffix(sessionKey).threadId) {
     return true;
@@ -589,22 +545,20 @@ function shouldPreserveNonArchivedMaintenanceEntry(params: {
   entry: SessionEntry | undefined;
   preserveKeys?: ReadonlySet<string>;
   preserveRecentMs?: number | null;
-  /** Defaults to `age` so callers that only prune staleness keep durable conversations. */
-  scope?: SessionMaintenanceReclaimScope;
 }): boolean {
   if (params.entry?.pinnedAt !== undefined) {
     return true;
   }
-  // Recently active interactive sessions stay protected under both age and
-  // capacity. Durables stay immortal for age prune, but are reclaimable
-  // oldest-first once the store hits maxEntries / maxDiskBytes.
-  if (isRecentSessionMaintenanceEntry(params)) {
-    return true;
-  }
-  if ((params.scope ?? "age") === "capacity") {
-    return false;
-  }
-  return isDurableConversationMaintenanceEntry(params.key, params.entry);
+  // A model lock is durable harness ownership, not merely a UI restriction.
+  // Evicting the row can strand its native runtime binding and later recreate
+  // the same conversation under an incompatible model, so pressure may exceed
+  // configured retention limits while the lock remains.
+  return (
+    params.entry?.modelSelectionLocked === true ||
+    params.preserveKeys?.has(params.key) === true ||
+    isRecentSessionMaintenanceEntry(params) ||
+    isProtectedSessionMaintenanceEntry(params.key, params.entry)
+  );
 }
 
 export function shouldPreserveMaintenanceEntry(params: {
@@ -655,7 +609,6 @@ function selectSessionEntryCapVictims(
         entry: store[key],
         preserveKeys,
         preserveRecentMs,
-        scope: "capacity",
       }),
   );
   const victimCount = Math.min(overflow, eligibleKeys.length);
@@ -698,22 +651,13 @@ export function getActiveSessionMaintenanceWarning(params: {
       entry: activeEntry,
       preserveKeys: params.preserveKeys,
       preserveRecentMs: params.preserveRecentMs,
-      scope: "capacity",
     })
   ) {
     return null;
   }
   const now = params.nowMs ?? Date.now();
   const cutoffMs = now - params.pruneAfterMs;
-  const wouldPrune =
-    !shouldPreserveMaintenanceEntry({
-      key: activeSessionKey,
-      entry: activeEntry,
-      preserveKeys: params.preserveKeys,
-      preserveRecentMs: params.preserveRecentMs,
-    }) &&
-    activeEntry.updatedAt != null &&
-    activeEntry.updatedAt < cutoffMs;
+  const wouldPrune = activeEntry.updatedAt != null ? activeEntry.updatedAt < cutoffMs : false;
   const keys = Object.keys(params.store);
   const wouldCap = selectSessionEntryCapVictims(
     params.store,

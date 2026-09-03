@@ -884,6 +884,7 @@ function planSqliteLiveEntryRemovals(params: {
     })),
     stateDeletePlans: deletePlans,
     archived: 0,
+    capArchived: 0,
     modelRunPruned: 0,
     pruned: 0,
     capped: 0,
@@ -916,7 +917,7 @@ export function planOldestCapacityEligibleSqliteLiveEntryRemoval(params: {
   const removedEntriesByKey = new Map<string, SessionEntry>();
   capEntryCount(projectedStore, Math.max(0, Object.keys(store).length - 1), {
     log: false,
-    onCapped: (removed) => {
+    onRemoved: (removed) => {
       removedKeys.add(removed.key);
       removedEntriesByKey.set(removed.key, cloneSessionEntry(removed.entry));
     },
