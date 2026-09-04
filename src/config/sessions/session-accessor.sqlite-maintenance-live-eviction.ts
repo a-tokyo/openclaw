@@ -241,14 +241,28 @@ export function planOldestCapacityEligibleSqliteLiveEntryRemoval(params: {
   // durable conversations that the disk budget may destructively reclaim.
   let victim: { key: string; entry: SessionEntry } | undefined;
   for (const [key, entry] of Object.entries(store)) {
-    if (params.skipSessionKeys?.has(key)) continue;
-    if (entry.archivedAt !== undefined) continue;
-    if (entry.pinnedAt !== undefined) continue;
-    if (entry.modelSelectionLocked === true) continue;
-    if (preserveKeys.has(key)) continue;
+    if (params.skipSessionKeys?.has(key)) {
+      continue;
+    }
+    if (entry.archivedAt !== undefined) {
+      continue;
+    }
+    if (entry.pinnedAt !== undefined) {
+      continue;
+    }
+    if (entry.modelSelectionLocked === true) {
+      continue;
+    }
+    if (preserveKeys.has(key)) {
+      continue;
+    }
     const parsed = parseAgentSessionKey(key);
-    if (parsed?.rest === "main" || key === "global") continue;
-    if (isRecentSessionMaintenanceEntry({ key, entry, preserveRecentMs })) continue;
+    if (parsed?.rest === "main" || key === "global") {
+      continue;
+    }
+    if (isRecentSessionMaintenanceEntry({ key, entry, preserveRecentMs })) {
+      continue;
+    }
     if (!victim || (entry.updatedAt ?? 0) < (victim.entry.updatedAt ?? 0)) {
       victim = { key, entry };
     }
@@ -268,10 +282,15 @@ export function planOldestCapacityEligibleSqliteLiveEntryRemoval(params: {
 
   const removedKeys = new Set([victim.key]);
   const removedEntriesByKey = new Map([[victim.key, cloneSessionEntry(victim.entry)]]);
+  // The projected store must exclude the victim so collectProjectedReferencedSessionIds
+  // does not mark its session id as referenced — otherwise no state delete plan is
+  // produced and the session_nodes row survives deletion.
+  const projectedStore = { ...store };
+  delete projectedStore[victim.key];
   return planSqliteLiveEntryRemovals({
     archiveDirectory: params.archiveDirectory,
     database: params.database,
-    projectedStore: store,
+    projectedStore,
     removedEntriesByKey,
     removedKeys,
   });

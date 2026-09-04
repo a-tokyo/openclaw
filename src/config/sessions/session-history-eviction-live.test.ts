@@ -97,7 +97,7 @@ describe("SQLite live-node disk budget eviction", () => {
       const before = await measureSessionPhysicalDiskUsage(storePath);
       const maintenance = {
         maxDiskBytes: before.totalBytes - 1,
-        highWaterBytes: Math.max(1, before.totalBytes - 32 * 1024),
+        highWaterBytes: Math.max(1, before.totalBytes - 1),
       };
       const inspected = await inspectSqliteSessionHistoryDiskBudget({
         storePath,
@@ -160,7 +160,7 @@ describe("SQLite live-node disk budget eviction", () => {
       const before = await measureSessionPhysicalDiskUsage(storePath);
       const maintenance = {
         maxDiskBytes: before.totalBytes - 1,
-        highWaterBytes: Math.max(1, before.totalBytes - 32 * 1024),
+        highWaterBytes: Math.max(1, before.totalBytes - 1),
       };
       const inspected = await inspectSqliteSessionHistoryDiskBudget({
         storePath,
@@ -221,7 +221,7 @@ describe("SQLite live-node disk budget eviction", () => {
     const before = await measureSessionPhysicalDiskUsage(storePath);
     const maintenance = {
       maxDiskBytes: before.totalBytes - 1,
-      highWaterBytes: Math.max(1, before.totalBytes - 32 * 1024),
+      highWaterBytes: Math.max(1, before.totalBytes - 1),
       preserveRecentMs: 7 * dayMs,
     };
     const inspected = await inspectSqliteSessionHistoryDiskBudget({
