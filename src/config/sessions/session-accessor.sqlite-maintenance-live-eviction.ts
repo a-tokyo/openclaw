@@ -1,14 +1,19 @@
 // Live-node capacity eviction for the SQLite session disk budget.
 // Extracted from session-accessor.sqlite-maintenance.ts to stay within max-lines.
 
+import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
 import { uniqueStrings } from "@openclaw/normalization-core/string-normalization";
 import { executeSqliteQuerySync } from "../../infra/kysely-sync.js";
-import { parseAgentSessionKey } from "../../sessions/session-key-utils.js";
+import {
+  parseAgentSessionKey,
+  parseThreadSessionSuffix,
+} from "../../sessions/session-key-utils.js";
 import {
   collectActiveSessionWorkAdmissions,
   runExclusiveSessionLifecycleMutation,
 } from "../../sessions/session-lifecycle-admission.js";
 import type { OpenClawAgentDatabase } from "../../state/openclaw-agent-db.js";
+import { sessionDeliveryOrigin } from "../../utils/delivery-context.shared.js";
 import { measureSessionPhysicalDiskUsage, type SessionPhysicalDiskUsage } from "./disk-budget.js";
 import type { SessionStateDeletePlan } from "./session-accessor.sqlite-archive.js";
 import { emitArchivedTranscriptUpdates } from "./session-accessor.sqlite-events.js";
@@ -33,6 +38,32 @@ import { collectSessionMaintenancePreserveKeysForStore } from "./store-maintenan
 import { resolveMaintenanceConfig } from "./store-maintenance-runtime.js";
 import { isRecentSessionMaintenanceEntry } from "./store-maintenance.js";
 import type { SessionEntry } from "./types.js";
+
+/**
+ * True when the session key identifies a durable human conversation surface
+ * (thread, channel, group, Telegram topic) — the only live nodes the disk
+ * budget may destructively reclaim as a last resort.
+ */
+function isDurableConversationSessionKey(
+  sessionKey: string,
+  entry: SessionEntry | undefined,
+): boolean {
+  const parsed = parseAgentSessionKey(sessionKey);
+  const rest = normalizeLowercaseStringOrEmpty(parsed?.rest ?? sessionKey);
+  if (parseThreadSessionSuffix(sessionKey).threadId) {
+    return true;
+  }
+  if (
+    /^[^:]+:(?:group|channel):.+$/.test(rest) ||
+    /^telegram:(?:direct|dm):.+:topic:[^:]+$/.test(rest)
+  ) {
+    return true;
+  }
+  const chatType = normalizeLowercaseStringOrEmpty(
+    entry?.chatType ?? sessionDeliveryOrigin(entry)?.chatType,
+  );
+  return chatType === "group" || chatType === "channel" || chatType === "thread";
+}
 
 function loadSqliteSessionMaintenanceStore(
   database: OpenClawAgentDatabase,
@@ -261,6 +292,12 @@ export function planOldestCapacityEligibleSqliteLiveEntryRemoval(params: {
       continue;
     }
     if (isRecentSessionMaintenanceEntry({ key, entry, preserveRecentMs })) {
+      continue;
+    }
+    // Only durable conversation surfaces (threads, channels, groups, topics)
+    // are eligible for last-resort live-node eviction. Ordinary session entries
+    // are not destructively reclaimable under the disk budget.
+    if (!isDurableConversationSessionKey(key, entry)) {
       continue;
     }
     if (!victim || (entry.updatedAt ?? 0) < (victim.entry.updatedAt ?? 0)) {
