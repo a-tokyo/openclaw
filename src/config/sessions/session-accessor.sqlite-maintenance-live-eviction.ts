@@ -3,6 +3,7 @@
 
 import { uniqueStrings } from "@openclaw/normalization-core/string-normalization";
 import { executeSqliteQuerySync } from "../../infra/kysely-sync.js";
+import { parseAgentSessionKey } from "../../sessions/session-key-utils.js";
 import {
   collectActiveSessionWorkAdmissions,
   runExclusiveSessionLifecycleMutation,
@@ -30,7 +31,7 @@ import { parseSessionEntryJson as parseSessionEntryRow } from "./session-accesso
 import { normalizeStoreSessionKey } from "./store-entry.js";
 import { collectSessionMaintenancePreserveKeysForStore } from "./store-maintenance-preserve.js";
 import { resolveMaintenanceConfig } from "./store-maintenance-runtime.js";
-import { capEntryCount } from "./store-maintenance.js";
+import { isRecentSessionMaintenanceEntry } from "./store-maintenance.js";
 import type { SessionEntry } from "./types.js";
 
 function loadSqliteSessionMaintenanceStore(
@@ -211,7 +212,14 @@ function resolveLivePreserveRecentMs(preserveRecentMs?: number | null): number |
     : preserveRecentMs;
 }
 
-/** Plans at most one oldest capacity-eligible live session_node removal. */
+/** Plans at most one oldest capacity-eligible live session_node removal.
+ *
+ * This is the last-resort disk-budget tier. `capEntryCount` archives ordinary
+ * sessions instead of deleting them, so this function bypasses the cap path
+ * entirely and directly selects the oldest idle live node for deletion.
+ * Always-protected entries (primary, pinned, model-locked, active/admitted,
+ * recently active) are never victims.
+ */
 export function planOldestCapacityEligibleSqliteLiveEntryRemoval(params: {
   archiveDirectory: string;
   database: OpenClawAgentDatabase;
@@ -226,22 +234,44 @@ export function planOldestCapacityEligibleSqliteLiveEntryRemoval(params: {
     store,
     storePath: params.storePath,
   });
-  const projectedStore = { ...store };
-  const removedKeys = new Set<string>();
-  const removedEntriesByKey = new Map<string, SessionEntry>();
-  capEntryCount(projectedStore, Math.max(0, Object.keys(store).length - 1), {
-    log: false,
-    onRemoved: (removed) => {
-      removedKeys.add(removed.key);
-      removedEntriesByKey.set(removed.key, cloneSessionEntry(removed.entry));
-    },
-    preserveKeys,
-    preserveRecentMs: resolveLivePreserveRecentMs(params.preserveRecentMs),
-  });
+  const preserveRecentMs = resolveLivePreserveRecentMs(params.preserveRecentMs);
+
+  // Select the single oldest eligible live node. After excluding
+  // always-protected and recently active entries, the remainder are idle
+  // durable conversations that the disk budget may destructively reclaim.
+  let victim: { key: string; entry: SessionEntry } | undefined;
+  for (const [key, entry] of Object.entries(store)) {
+    if (params.skipSessionKeys?.has(key)) continue;
+    if (entry.archivedAt !== undefined) continue;
+    if (entry.pinnedAt !== undefined) continue;
+    if (entry.modelSelectionLocked === true) continue;
+    if (preserveKeys.has(key)) continue;
+    const parsed = parseAgentSessionKey(key);
+    if (parsed?.rest === "main" || key === "global") continue;
+    if (isRecentSessionMaintenanceEntry({ key, entry, preserveRecentMs })) continue;
+    if (!victim || (entry.updatedAt ?? 0) < (victim.entry.updatedAt ?? 0)) {
+      victim = { key, entry };
+    }
+  }
+
+  if (!victim) {
+    return {
+      entryRemovals: [],
+      stateDeletePlans: [],
+      archived: 0,
+      capArchived: 0,
+      modelRunPruned: 0,
+      pruned: 0,
+      capped: 0,
+    };
+  }
+
+  const removedKeys = new Set([victim.key]);
+  const removedEntriesByKey = new Map([[victim.key, cloneSessionEntry(victim.entry)]]);
   return planSqliteLiveEntryRemovals({
     archiveDirectory: params.archiveDirectory,
     database: params.database,
-    projectedStore,
+    projectedStore: store,
     removedEntriesByKey,
     removedKeys,
   });
