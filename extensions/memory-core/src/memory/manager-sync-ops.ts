@@ -9,6 +9,7 @@ import {
 } from "openclaw/plugin-sdk/memory-core-host-engine-foundation";
 import {
   MEMORY_CHUNKING_VERSION,
+  MEMORY_INDEX_VECTOR_TABLE,
   type MemorySyncParams,
   type MemorySyncProgressUpdate,
 } from "openclaw/plugin-sdk/memory-core-host-engine-storage";
@@ -22,6 +23,7 @@ import {
 import { MemoryIndexDatabase } from "./manager-database-context.js";
 import {
   cleanupAgedMemoryReindexTempFiles,
+  memoryDatabaseTableExists,
   openMemoryDatabaseAtPath,
   publishMemoryDatabaseTables,
   readMemoryDatabaseRevision,
@@ -197,6 +199,7 @@ export abstract class MemoryManagerSyncOps extends MemoryManagerSourceSyncOps {
         : this.providerKey;
       const syncProviderIdentities =
         this.syncProviderGeneration?.identities ?? this.resolveProviderIndexIdentities();
+      const hasIndexedChunks = this.hasIndexedChunks();
       const indexIdentity = resolveMemoryIndexIdentityState({
         meta,
         // Also detects provider→FTS-only transitions so orphaned old-model FTS rows are cleaned up.
@@ -216,10 +219,9 @@ export abstract class MemoryManagerSyncOps extends MemoryManagerSourceSyncOps {
         chunkTokens: this.settings.chunking.tokens,
         chunkOverlap: this.settings.chunking.overlap,
         vectorReady,
-        hasIndexedChunks: this.hasIndexedChunks(),
+        hasIndexedChunks,
         ftsTokenizer: this.settings.store.fts.tokenizer,
       });
-      const hasIndexedChunks = this.hasIndexedChunks();
       const needsInitialIndex = indexIdentity.status !== "valid" && !hasIndexedChunks;
       // Missing metadata cannot prove whether existing chunks were semantic.
       // Wait for the configured provider before replacing them with a rebuilt index,
@@ -607,7 +609,11 @@ export abstract class MemoryManagerSyncOps extends MemoryManagerSourceSyncOps {
           // Bound the cache before copying it into the shared agent database;
           // deleting overflow afterward does not undo primary-file growth.
           this.pruneEmbeddingCacheIfNeeded();
-          return { nextMeta, vectorIndexComplete };
+          return {
+            nextMeta,
+            vectorIndexComplete,
+            hasVectors: memoryDatabaseTableExists(shadow.db, "main", MEMORY_INDEX_VECTOR_TABLE),
+          };
         } finally {
           // Escaped continuations must fail closed, never write to the live DB.
           shadow.closed = true;
@@ -621,6 +627,7 @@ export abstract class MemoryManagerSyncOps extends MemoryManagerSourceSyncOps {
             sourcePath: tempDbPath,
             metaKey: MEMORY_INDEX_META_KEY,
             expectedRevision: originalRevision,
+            sourceHasVectors: rebuilt.hasVectors,
             vectorExtensionPath: shadow.vector.extensionPath,
           });
         });

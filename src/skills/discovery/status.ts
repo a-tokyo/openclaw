@@ -1,6 +1,7 @@
 // Skill discovery status helpers summarize installed, workspace, and bundled skills.
 import path from "node:path";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import { createSubsystemLogger } from "../../logging/subsystem.js";
 import { evaluateEntryRequirementsForCurrentPlatform } from "../../shared/entry-status.js";
 import type { RequirementConfigCheck, Requirements } from "../../shared/requirements.js";
 import { CONFIG_DIR } from "../../utils.js";
@@ -12,7 +13,7 @@ import {
   type ClawHubSkillsLockfileStatusRead,
   type LocalSkillCardStatus,
 } from "../lifecycle/clawhub.js";
-import { resolveBundledSkillsContext } from "../loading/bundled-context.js";
+import { resolveBundledSkillsDir } from "../loading/bundled-dir.js";
 import {
   hasBinary,
   isBundledSkillAllowed,
@@ -36,6 +37,9 @@ import {
   normalizeSkillIndexName,
   type SkillIndexEntry,
 } from "./skill-index.js";
+
+const skillsLogger = createSubsystemLogger("skills");
+let hasWarnedMissingBundledDir = false;
 
 type SkillInstallOption = {
   id: string;
@@ -86,10 +90,10 @@ export type SkillStatusReport = {
   skills: SkillStatusEntry[];
 };
 
-export function resolveSkillStatusEntry(
-  skills: readonly SkillStatusEntry[],
+export function resolveSkillStatusEntry<T extends Pick<SkillStatusEntry, "name" | "skillKey">>(
+  skills: readonly T[],
   requestedName: string,
-): SkillStatusEntry | null {
+): T | null {
   const raw = requestedName.trim();
   if (!raw) {
     return null;
@@ -99,7 +103,7 @@ export function resolveSkillStatusEntry(
   const normalized = normalizeSkillIndexName(raw);
   // Names outrank metadata aliases. A tie at the strongest matching level
   // must not redirect inspection or Workshop updates to the first loaded skill.
-  const matchers: Array<(skill: SkillStatusEntry) => boolean> = [
+  const matchers: Array<(skill: T) => boolean> = [
     (skill) => skill.name === raw,
     (skill) => skill.skillKey === raw,
     (skill) => skill.name.toLowerCase() === lower || skill.skillKey.toLowerCase() === lower,
@@ -320,7 +324,13 @@ export function buildWorkspaceSkillStatus(
   },
 ): SkillStatusReport {
   const managedSkillsDir = opts?.managedSkillsDir ?? path.join(CONFIG_DIR, "skills");
-  const bundledContext = resolveBundledSkillsContext();
+  const bundledSkillsDir = resolveBundledSkillsDir();
+  if (!bundledSkillsDir && !hasWarnedMissingBundledDir) {
+    hasWarnedMissingBundledDir = true;
+    skillsLogger.warn(
+      "Bundled skills directory could not be resolved; built-in skills may be missing.",
+    );
+  }
   const agentSkillFilter = opts?.agentId
     ? resolveEffectiveAgentSkillFilter(opts.config, opts.agentId)
     : undefined;
@@ -335,7 +345,7 @@ export function buildWorkspaceSkillStatus(
         agentId: opts?.agentId,
         agentSkillFilter: "ignore",
         managedSkillsDir,
-        bundledSkillsDir: bundledContext.dir,
+        bundledSkillsDir,
       }),
     {
       canExec: opts?.eligibility?.nodeSkills?.canExec,
@@ -352,7 +362,6 @@ export function buildWorkspaceSkillStatus(
       ? clawhubLockRead
       : readClawHubSkillsLockfileStatusSync(managedParentDir);
   const skillIndexEntries = buildSkillIndexEntries(skillEntries, {
-    bundledNames: bundledContext.names,
     agentSkillFilter,
   });
   return {

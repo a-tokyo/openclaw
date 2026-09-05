@@ -10,6 +10,7 @@ import {
   agentVitestProjectOwners,
   embeddedAgentVitestProjectOwners,
   isAgentsCoreIsolatedTestFile,
+  isAgentsSpawnProductionBoundaryTestFile,
 } from "../test/vitest/vitest.agents-paths.mjs";
 import { isChannelSurfaceTestFile } from "../test/vitest/vitest.channel-paths.mjs";
 import {
@@ -76,7 +77,11 @@ import {
   isUiIsolatedTestFile,
   uiIsolatedTestFiles,
 } from "../test/vitest/vitest.ui-isolated-paths.mjs";
-import { isUiBrowserTestFile } from "../test/vitest/vitest.ui-paths.mjs";
+import {
+  isControlUiSourcePath,
+  isPluginControlUiPath,
+  isUiBrowserTestFile,
+} from "../test/vitest/vitest.ui-paths.mjs";
 import {
   getUnitFastIsolatedTestFiles,
   getUnitFastTestFiles,
@@ -183,6 +188,8 @@ type UnmatchedExplicitTestTarget = {
 
 const DEFAULT_VITEST_CONFIG = "test/vitest/vitest.unit.config.ts";
 const AGENTS_EMBEDDED_AGENT_TEST_ROOT = agentVitestProjectOwners.embedded.root;
+const AGENTS_SPAWN_PRODUCTION_BOUNDARY_VITEST_CONFIG =
+  agentVitestProjectOwners.spawnProductionBoundary.config;
 const AGENTS_CORE_ISOLATED_VITEST_CONFIG = agentVitestProjectOwners.coreIsolated.config;
 const AGENTS_CORE_VITEST_CONFIG = agentVitestProjectOwners.core.config;
 const AGENTS_EMBEDDED_AGENT_VITEST_CONFIG = agentVitestProjectOwners.embedded.config;
@@ -461,7 +468,7 @@ const TUI_VITEST_CONFIG = "test/vitest/vitest.tui.config.ts";
 const TUI_PTY_VITEST_CONFIG = "test/vitest/vitest.tui-pty.config.ts";
 const UI_VITEST_CONFIG = "test/vitest/vitest.ui.config.ts";
 const UI_BROWSER_VITEST_CONFIG = "test/vitest/vitest.ui-browser.config.ts";
-const UI_E2E_VITEST_CONFIG = "test/vitest/vitest.ui-e2e.config.ts";
+export const UI_E2E_VITEST_CONFIG = "test/vitest/vitest.ui-e2e.config.ts";
 const UI_ISOLATED_VITEST_CONFIG = "test/vitest/vitest.ui-isolated.config.ts";
 const UTILS_VITEST_CONFIG = "test/vitest/vitest.utils.config.ts";
 const WIZARD_VITEST_CONFIG = "test/vitest/vitest.wizard.config.ts";
@@ -522,6 +529,7 @@ const VITEST_CONFIG_BY_KIND: Record<string, string> = {
   agentSupport: AGENTS_SUPPORT_VITEST_CONFIG,
   agentTools: AGENTS_TOOLS_VITEST_CONFIG,
   agent: AGENTS_VITEST_CONFIG,
+  agentsSpawnProductionBoundary: AGENTS_SPAWN_PRODUCTION_BOUNDARY_VITEST_CONFIG,
   agentsCoreIsolated: AGENTS_CORE_ISOLATED_VITEST_CONFIG,
   agentsCore: AGENTS_CORE_VITEST_CONFIG,
   agentsSupport: AGENTS_SUPPORT_VITEST_CONFIG,
@@ -1030,7 +1038,10 @@ function listUnitFastFullSuiteTestTargets() {
 }
 
 function listAgentsCoreFullSuiteTestTargets(cwd: string) {
-  const isolatedTests = new Set(agentVitestProjectOwners.coreIsolated.include);
+  const isolatedTests = new Set([
+    ...agentVitestProjectOwners.spawnProductionBoundary.include,
+    ...agentVitestProjectOwners.coreIsolated.include,
+  ]);
   const agentsDir = path.join(cwd, "src/agents");
   if (!fs.existsSync(agentsDir)) {
     return [];
@@ -1318,7 +1329,10 @@ function expandExplicitSourceTestTargets(targetArgs: string[], cwd: string) {
   const forceFullImportGraph = sourceTargetCount > EXPLICIT_SOURCE_FULL_IMPORT_GRAPH_THRESHOLD;
   return targetArgs.flatMap((targetArg) => {
     const relative = toRepoRelativeTarget(targetArg, cwd);
-    if (isPathAtOrUnder(relative, "ui") && isGlobTarget(relative)) {
+    if (
+      (isPathAtOrUnder(relative, "ui") || isPluginControlUiPath(relative)) &&
+      isGlobTarget(relative)
+    ) {
       // Expand mixed browser globs before assigning files to their disjoint runners.
       const targets = listExplicitTestTargetFilesForCwd(cwd).filter(
         (file) => isTestFileTarget(file) && path.matchesGlob(file, relative),
@@ -1954,7 +1968,7 @@ function isControlUiE2eTarget(relative: string) {
     relative === "ui/src/test-helpers/control-ui-e2e.ts" ||
     relative === "ui/src/e2e" ||
     relative.startsWith("ui/src/e2e/") ||
-    (relative.startsWith("ui/src/") && relative.endsWith(".e2e.test.ts"))
+    (isControlUiSourcePath(relative) && relative.endsWith(".e2e.test.ts"))
   );
 }
 
@@ -2730,6 +2744,10 @@ const SEMANTIC_TOOLING_TARGET_PATTERNS: Array<[RegExp, string[]]> = [
   [/^scripts\/lib\/swift-toolchain\.sh$/u, ["package-mac-app", "package-mac-dist"]],
   [/^scripts\/stage-cua-driver-macos\.sh$/u, ["package-mac-app"]],
   [
+    /^scripts\/(stage-cloudflared-macos\.sh|lib\/cloudflared-macos\.json)$/u,
+    ["stage-cloudflared-macos", "package-mac-app"],
+  ],
+  [
     /^scripts\/lib\/npm-publish-plan\.mjs$/u,
     [
       "test/npm-publish-plan.test.ts",
@@ -3282,7 +3300,7 @@ function shouldCombineSiblingTestWithImportGraph(changedPath: string) {
 }
 
 function shouldRouteChangedTargetWithoutImportGraph(changedPath: string) {
-  return changedPath.endsWith(".live.test.ts") || changedPath.startsWith("ui/src/");
+  return changedPath.endsWith(".live.test.ts") || isControlUiSourcePath(changedPath);
 }
 
 function resolvePromptSnapshotFixtureTargets(changedPath: string) {
@@ -3338,7 +3356,7 @@ function resolvePreciseChangedTestTargets(
     return [siblingTest];
   }
   if (shouldRouteChangedTargetWithoutImportGraph(changedPath)) {
-    return changedPath.startsWith("ui/src/") ? [changedPath] : null;
+    return isControlUiSourcePath(changedPath) ? [changedPath] : null;
   }
   if (options.skipImportGraph === true) {
     return null;
@@ -3484,6 +3502,9 @@ function classifyTarget(arg: string, cwd: string) {
   if (isAgentsCoreIsolatedTestFile(relative)) {
     return agentVitestProjectOwners.coreIsolated.kind;
   }
+  if (isAgentsSpawnProductionBoundaryTestFile(relative)) {
+    return agentVitestProjectOwners.spawnProductionBoundary.kind;
+  }
   if (isControlUiE2eTarget(relative)) {
     return "uiE2e";
   }
@@ -3496,7 +3517,7 @@ function classifyTarget(arg: string, cwd: string) {
   if (isUiBrowserTestFile(relative)) {
     return "uiBrowser";
   }
-  if (isPathAtOrUnder(relative, "ui")) {
+  if (isPathAtOrUnder(relative, "ui") || isPluginControlUiPath(relative)) {
     return "ui";
   }
   if (relative.startsWith("src/tui/tui-pty-") || tuiPtyTestFiles.includes(relative)) {
@@ -3787,7 +3808,10 @@ function shouldUseWholeConfigTarget(kind: string, targetArg: string, cwd: string
   if (isTestFileTarget(relative) || isExistingDirectoryTarget(targetArg, cwd)) {
     return false;
   }
-  return relative.startsWith("ui/src/");
+  if (isPluginControlUiPath(relative) && !isLikelyFileTarget(relative)) {
+    return false;
+  }
+  return isControlUiSourcePath(relative);
 }
 
 function createVitestArgs(
@@ -3871,9 +3895,13 @@ export function buildVitestRunPlans(
   const requestedTargetArgs = changedTargetArgs ?? targetArgs;
   if (
     watchMode &&
-    requestedTargetArgs.some(
-      (target) => isPathAtOrUnder(toRepoRelativeTarget(target, cwd), "ui") && isGlobTarget(target),
-    )
+    requestedTargetArgs.some((target) => {
+      const relative = toRepoRelativeTarget(target, cwd);
+      return (
+        (isPathAtOrUnder(relative, "ui") || isPluginControlUiPath(relative)) &&
+        isGlobTarget(relative)
+      );
+    })
   ) {
     throw new Error(
       "watch mode with UI glob targets is not supported; use a literal test path, directory, or dedicated UI suite",
