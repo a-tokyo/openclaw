@@ -690,6 +690,36 @@ async function enforceSessionHistoryMaintenanceSerialized(
       }
     }
   }
+  // Historical generations and cap-archived sessions first. Idle durable live
+  // nodes are last-resort capacity victims so maxDiskBytes still bounds the
+  // store. Skip when the high-water mark is not a usable stop condition.
+  if (usage.totalBytes > highWaterBytes && highWaterBytes > 0 && maxDiskBytes > 0) {
+    const database = openOpenClawAgentDatabase(databaseOptions);
+    const live = await reclaimSqliteLiveSessionEntriesToHighWater({
+      archiveDirectory,
+      database,
+      finalizePlans: finalizeSessionEntryMaintenancePlansAfterWriterReleaseBestEffort,
+      highWaterBytes,
+      pruneArchivesToHighWater: async () =>
+        await runExclusiveSqliteSessionWrite(resolved, async () =>
+          pruneAllSessionTranscriptArchivesToHighWater({
+            archiveDirectory,
+            databaseOptions,
+            highWaterBytes,
+            storePath: params.storePath,
+          }),
+        ),
+      reclaimFreePages: () => reclaimSqliteFreePages(databaseOptions),
+      resolved,
+      storePath: params.storePath,
+      usage,
+      preserveRecentMs: params.maintenance.preserveRecentMs,
+    });
+    removedEntries += live.removedEntries;
+    removedFiles += live.removedFiles;
+    usage = live.usage;
+  }
+
   if (removedEntries > 0) {
     await refreshSqliteSessionPlannerStatisticsBestEffort(resolved, removedEntries);
     usage = await measureSessionPhysicalDiskUsage(params.storePath);
