@@ -220,7 +220,10 @@ async function buildActivity(
   sharePointSiteId?: string,
   sharePointFolder?: string,
   mediaMaxBytes?: number,
-  options?: { feedbackLoopEnabled?: boolean } & MSTeamsSendHandoff,
+  options?: {
+    feedbackLoopEnabled?: boolean;
+    getTeamDetails?: (teamId: string) => Promise<{ aadGroupId?: string }>;
+  } & MSTeamsSendHandoff,
 ): Promise<Record<string, unknown>> {
   const activity: Record<string, unknown> = buildMSTeamsMessageActivity(msg.text);
 
@@ -272,12 +275,14 @@ async function buildActivity(
         if (!tokenProvider) {
           throw new Error("MS Teams Graph token provider unavailable for SharePoint file send");
         }
+        const chatId = conversationRef.conversation?.id;
         const siteId = await resolveUploadSiteId({
           configuredSiteId: sharePointSiteId,
           teamId: conversationRef.teamId,
+          channelId: conversationType === "channel" ? chatId : undefined,
           tokenProvider,
+          getTeamDetails: options?.getTeamDetails,
         });
-        const chatId = conversationRef.conversation?.id;
 
         const uploaded = await uploadAndShareSharePoint({
           assertDirectAdapterHandoff: options?.assertDirectAdapterHandoff,
@@ -406,6 +411,9 @@ export async function sendMSTeamsMessages(
             {
               feedbackLoopEnabled: params.feedbackLoopEnabled,
               assertDirectAdapterHandoff: params.assertDirectAdapterHandoff,
+              getTeamDetails: params.app.api?.teams?.getById
+                ? (teamId) => params.app.api.teams.getById(teamId)
+                : undefined,
             },
           );
 
