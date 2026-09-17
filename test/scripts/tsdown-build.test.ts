@@ -7,9 +7,11 @@ import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { readProcessMemoryCapacity } from "../../scripts/lib/process-memory.mts";
 import {
   TSDOWN_NON_SDK_DTS_CONFIG_GROUPS,
   TSDOWN_PACKAGE_CONFIG_GROUP,
+  TSDOWN_PLUGIN_SDK_DTS_CONFIG_GROUPS,
   TSDOWN_UNIFIED_CONFIG_GROUP,
   TSDOWN_UNIFIED_DTS_CONFIG_GROUPS,
 } from "../../scripts/lib/tsdown-config-groups.mts";
@@ -26,8 +28,11 @@ import {
   resolveTsdownBuildInvocation,
   resolveTsdownBuildInvocations,
   resolveTsdownBuildPlan,
+  resolveStagedDeclarationConcurrency,
   resolveTsdownCleanOutputRoots,
+  runTsdownBuild,
   runTsdownBuildInvocation as runTsdownBuildInvocationImpl,
+  sanitizeTsdownBuildOutputRoots,
 } from "../../scripts/tsdown-build.mts";
 import { createFixtureLifetime } from "../helpers/fixture-lifetime.js";
 import {
@@ -49,10 +54,14 @@ const TEST_PHYSICAL_MEMORY_BYTES = 16 * 1024 * 1024 * 1024;
 // fixtures prove only their declared hierarchy instead of inheriting the runner's RAM.
 vi.spyOn(os, "totalmem").mockReturnValue(TEST_PHYSICAL_MEMORY_BYTES);
 const readFileSync = fs.readFileSync.bind(fs);
-vi.spyOn(fs, "readFileSync").mockImplementation((filePath, options) =>
-  filePath === "/proc/meminfo" && options === "utf8"
-    ? "MemTotal:       16777216 kB\nMemAvailable:   16777216 kB\n"
-    : readFileSync(filePath, options),
+vi.spyOn(fs, "readFileSync").mockImplementation(
+  (filePath, options?: BufferEncoding | fs.ReadFileSyncOptions | null) =>
+    filePath === "/proc/meminfo" && options === "utf8"
+      ? "MemTotal:       16777216 kB\nMemAvailable:   16777216 kB\n"
+      : readFileSync(
+          filePath,
+          typeof options === "string" ? { encoding: options } : (options ?? {}),
+        ),
 );
 const NO_MEMORY_LIMIT = {
   availableMemoryBytes: TEST_PHYSICAL_MEMORY_BYTES,
@@ -776,35 +785,41 @@ describe("resolveTsdownBuildInvocation", () => {
       ],
     ]);
     const fsFixture = createMemoryFileSystem(cgroupFiles);
-    const result = resolveTsdownBuildPlan({
+    const memory = {
       env: {},
       cgroupMemoryLimitPaths: ["/test/memory.max"],
       physicalMemoryBytes: 16 * 1024 * 1024 * 1024,
       processResidentMemoryBytes: 64 * 1024 * 1024,
       procMeminfoPath: "/openclaw-test-missing-proc-meminfo",
       fs: fsFixture,
-    });
+    };
+    const result = resolveTsdownBuildPlan(memory);
 
     // Credit 768 MiB of inactive file pages and this wrapper's 64 MiB RSS. Anonymous memory,
     // shmem, and the remaining 128 MiB kernel charge all compete with the child heap.
     expect(result.maxOldSpaceMb).toBe(3520);
     expect(result.heapShortfall?.fatal).toBe(true);
+    expect(readProcessMemoryCapacity(memory)).toMatchObject({
+      capacityBytes: 5 * 1024 * 1024 * 1024,
+      limitBytes: 4288 * 1024 * 1024,
+      usageKnown: true,
+      unresolved: false,
+    });
 
     cgroupFiles.set("/test/memory.current", `${832 * 1024 * 1024}\n`);
     cgroupFiles.set(
       "/test/memory.stat",
       `anon ${64 * 1024 * 1024}\nshmem 0\nfile ${768 * 1024 * 1024}\ninactive_file ${768 * 1024 * 1024}\nkernel 0\n`,
     );
-    const isolated = resolveTsdownBuildPlan({
-      env: {},
-      cgroupMemoryLimitPaths: ["/test/memory.max"],
-      physicalMemoryBytes: 16 * 1024 * 1024 * 1024,
-      processResidentMemoryBytes: 64 * 1024 * 1024,
-      procMeminfoPath: "/openclaw-test-missing-proc-meminfo",
-      fs: fsFixture,
-    });
+    const isolated = resolveTsdownBuildPlan(memory);
     expect(isolated.maxOldSpaceMb).toBe(4352);
     expect(isolated.heapShortfall).toBeNull();
+    expect(readProcessMemoryCapacity(memory)).toMatchObject({
+      capacityBytes: 5 * 1024 * 1024 * 1024,
+      limitBytes: 5 * 1024 * 1024 * 1024,
+      usageKnown: true,
+      unresolved: false,
+    });
   });
 
   it("refuses to start when the host budget cannot fit the build", () => {
@@ -1043,18 +1058,47 @@ describe("resolveTsdownBuildInvocation", () => {
 
     expect(resolveTsdownBuildPlan(base).maxOldSpaceMb).toBe(3328);
     expect(resolveTsdownBuildPlan({ ...base, availableMemoryBytes: 0 }).maxOldSpaceMb).toBe(1);
+    expect(readProcessMemoryCapacity(base)).toMatchObject({
+      capacityBytes: 8 * 1024 * 1024 * 1024,
+      limitBytes: 4 * 1024 * 1024 * 1024,
+      availableBytes: 4 * 1024 * 1024 * 1024,
+    });
+    expect(readProcessMemoryCapacity({ ...base, availableMemoryBytes: 0 })).toMatchObject({
+      capacityBytes: 8 * 1024 * 1024 * 1024,
+      limitBytes: 0,
+      availableBytes: 0,
+    });
   });
 
   it("caps an oversized cgroup limit by physical memory", () => {
-    const result = resolveTsdownBuildPlan({
+    const memory = {
       env: {},
       cgroupMemoryLimitBytes: 64 * 1024 * 1024 * 1024,
       procMeminfoPath: "/openclaw-test-missing-proc-meminfo",
       physicalMemoryBytes: 4 * 1024 * 1024 * 1024,
-    });
+    };
+    const result = resolveTsdownBuildPlan(memory);
 
     expect(result.maxOldSpaceMb).toBe(3328);
     expect(result.heapShortfall?.fatal).toBe(true);
+    expect(readProcessMemoryCapacity(memory).capacityBytes).toBe(4 * 1024 * 1024 * 1024);
+  });
+
+  it("keeps raw capacity unknown when a finite controller has no known physical bound", () => {
+    const memory = {
+      platform: "linux",
+      cgroupMemoryLimitBytes: 8 * 1024 * 1024 * 1024,
+      physicalMemoryBytes: Number.NaN,
+      availableMemoryBytes: 4 * 1024 * 1024 * 1024,
+      fs: createMemoryFileSystem(new Map()),
+    };
+
+    expect(readProcessMemoryCapacity(memory)).toMatchObject({
+      capacityBytes: null,
+      limitBytes: 4 * 1024 * 1024 * 1024,
+      availableBytes: 4 * 1024 * 1024 * 1024,
+      unresolved: false,
+    });
   });
 
   it("caps the tsdown heap using the process's own cgroup slice budget", () => {
@@ -1082,11 +1126,13 @@ describe("resolveTsdownBuildInvocation", () => {
       ["/sys/fs/cgroup/user.slice/memory.max", `${5 * 1024 * 1024 * 1024}\n`],
     ]);
 
-    const nodeOptions = resolveTestNodeOptions({
+    const memory = {
       fs: createMemoryFileSystem(cgroupFiles),
-    });
+    };
+    const nodeOptions = resolveTestNodeOptions(memory);
 
     expect(nodeOptions).toBe("--max-old-space-size=4352");
+    expect(readProcessMemoryCapacity(memory).capacityBytes).toBe(5 * 1024 * 1024 * 1024);
   });
 
   it("uses a resolved v1 memory limit when a hybrid host's v2 view is inherited", () => {
@@ -1162,6 +1208,12 @@ describe("resolveTsdownBuildInvocation", () => {
       fs: fsFixture,
     });
 
+    expect(readProcessMemoryCapacity({ fs: fsFixture })).toMatchObject({
+      capacityBytes: null,
+      limitBytes: null,
+      availableBytes: null,
+      unresolved: true,
+    });
     expect(result.maxOldSpaceMb).toBe(1);
     expect(result.heapShortfall?.fatal).toBe(true);
     expect(result.heapShortfall?.message).toContain(
@@ -1484,14 +1536,16 @@ describe("resolveTsdownBuildInvocation", () => {
       [`/sys/fs/cgroup${slicePath}/memory.limit_in_bytes`, "9223372036854771712\n"],
     ]);
 
-    const nodeOptions = resolveTestNodeOptions({
+    const memory = {
       platform: "linux",
       constrainedMemoryBytes: 5 * 1024 * 1024 * 1024,
       procMemTotalBytes: 16 * 1024 * 1024 * 1024,
       fs: createMemoryFileSystem(cgroupFiles),
-    });
+    };
+    const nodeOptions = resolveTestNodeOptions(memory);
 
     expect(nodeOptions).toBe("--max-old-space-size=3328");
+    expect(readProcessMemoryCapacity(memory).capacityBytes).toBe(4 * 1024 * 1024 * 1024);
   });
 
   it("ignores a cgroup-v1 parent limit when hierarchy accounting is disabled", () => {
@@ -1935,6 +1989,85 @@ describe("resolveTsdownBuildInvocation", () => {
       await expect(fsPromises.readFile(coreFile, "utf8")).resolves.toBe("keep\n");
     }));
 
+  it("sanitizes only the declaration roots selected by a direct AI build", () =>
+    fixture.run(async () => {
+      const rootDir = createTempDir("openclaw-tsdown-selected-sanitize-");
+      const aiDeclaration = path.join(rootDir, "packages", "ai", "dist", "index.d.ts");
+      const rootDeclaration = path.join(rootDir, "dist", "index.d.ts");
+      const malformed = "export { __exportAll, publicApi };\n";
+      await fsPromises.mkdir(path.dirname(aiDeclaration), { recursive: true });
+      await fsPromises.mkdir(path.dirname(rootDeclaration), { recursive: true });
+      await fsPromises.writeFile(aiDeclaration, malformed);
+      await fsPromises.writeFile(rootDeclaration, malformed);
+
+      sanitizeTsdownBuildOutputRoots(["--config", "tsdown.ai.config.ts"], rootDir);
+
+      await expect(fsPromises.readFile(aiDeclaration, "utf8")).resolves.toBe(
+        "export { publicApi };\n",
+      );
+      await expect(fsPromises.readFile(rootDeclaration, "utf8")).resolves.toBe(malformed);
+    }));
+
+  it("refuses to sanitize a symlinked direct-build output root", () =>
+    fixture.run(async () => {
+      const rootDir = createTempDir("openclaw-tsdown-sanitize-symlink-");
+      const targetDir = path.join(rootDir, "target");
+      const declaration = path.join(targetDir, "index.d.ts");
+      const malformed = "export { __exportAll, publicApi };\n";
+      await fsPromises.mkdir(targetDir);
+      await fsPromises.writeFile(declaration, malformed);
+      await fsPromises.mkdir(path.join(rootDir, "packages", "ai"), { recursive: true });
+      await fsPromises.symlink(targetDir, path.join(rootDir, "packages", "ai", "dist"), "dir");
+
+      expect(() =>
+        sanitizeTsdownBuildOutputRoots(["--config", "tsdown.ai.config.ts"], rootDir),
+      ).toThrow(/symbolic link/u);
+
+      await expect(fsPromises.readFile(declaration, "utf8")).resolves.toBe(malformed);
+    }));
+
+  it("refuses to sanitize a direct-build output root behind an intermediate symlink", () =>
+    fixture.run(async () => {
+      const rootDir = createTempDir("openclaw-tsdown-sanitize-parent-symlink-");
+      const targetPackages = path.join(rootDir, "target-packages");
+      const declaration = path.join(targetPackages, "ai", "dist", "index.d.ts");
+      const malformed = "export { __exportAll, publicApi };\n";
+      await fsPromises.mkdir(path.dirname(declaration), { recursive: true });
+      await fsPromises.writeFile(declaration, malformed);
+      await fsPromises.symlink(targetPackages, path.join(rootDir, "packages"), "dir");
+
+      expect(() =>
+        sanitizeTsdownBuildOutputRoots(["--config", "tsdown.ai.config.ts"], rootDir),
+      ).toThrow(/symbolic link/u);
+
+      await expect(fsPromises.readFile(declaration, "utf8")).resolves.toBe(malformed);
+    }));
+
+  it.each([
+    { code: 0, expectedAi: "export { publicApi };\n", label: "successful" },
+    { code: 1, expectedAi: "export { __exportAll, publicApi };\n", label: "failed" },
+  ])("sanitizes selected declarations only after a $label direct build", ({ code, expectedAi }) =>
+    fixture.run(async () => {
+      const rootDir = createTempDir(`openclaw-tsdown-runner-sanitize-${code}-`);
+      const aiDeclaration = path.join(rootDir, "packages", "ai", "dist", "index.d.ts");
+      const rootDeclaration = path.join(rootDir, "dist", "index.d.ts");
+      const malformed = "export { __exportAll, publicApi };\n";
+      await fsPromises.mkdir(path.dirname(aiDeclaration), { recursive: true });
+      await fsPromises.mkdir(path.dirname(rootDeclaration), { recursive: true });
+      await fsPromises.writeFile(aiDeclaration, malformed);
+      await fsPromises.writeFile(rootDeclaration, malformed);
+      const executeBuild = vi.fn(async () => code);
+
+      await expect(
+        runTsdownBuild(["--config", "tsdown.ai.config.ts"], { cwd: rootDir, executeBuild }),
+      ).resolves.toBe(code);
+
+      expect(executeBuild).toHaveBeenCalledWith(["--config", "tsdown.ai.config.ts"]);
+      await expect(fsPromises.readFile(aiDeclaration, "utf8")).resolves.toBe(expectedAi);
+      await expect(fsPromises.readFile(rootDeclaration, "utf8")).resolves.toBe(malformed);
+    }),
+  );
+
   it.each(["OpenClaw.app", "candidates/OpenClaw.app"])(
     "keeps the packaged Mac app intact at %s while rebuilding its replacement runtime",
     (appPath) =>
@@ -2352,10 +2485,10 @@ describe("runTsdownBuildInvocation", () => {
               clears.mockRestore();
               timers.mockRestore();
               clock.mockRestore();
-              if (abortFailure) {
-                throw abortFailure;
-              }
             }
+          }
+          if (abortFailure) {
+            throw abortFailure;
           }
         });
       },
@@ -2453,7 +2586,7 @@ describe("runTsdownBuildInvocation", () => {
           'import { build } from "tsdown";',
           ...(native
             ? [
-                'const nativePackage = import.meta.resolve("@typescript/native-preview/package.json");',
+                'const nativePackage = import.meta.resolve("typescript-native/package.json");',
                 'const { default: getExePath } = await import(new URL("lib/getExePath.js", nativePackage).href);',
               ]
             : []),
@@ -2793,4 +2926,198 @@ describe("runTsdownBuildInvocation", () => {
         }
       }),
   );
+});
+
+describe("staged declaration admission", () => {
+  const GiB = 1024 ** 3;
+  const groups = TSDOWN_PLUGIN_SDK_DTS_CONFIG_GROUPS.map((name) => ({
+    name,
+    maxOldSpaceMb: 12288,
+  }));
+  const unequalGroups = TSDOWN_NON_SDK_DTS_CONFIG_GROUPS.map((name, index) => ({
+    name,
+    maxOldSpaceMb: [2048, 3072, 4096, 12288, 6144, 10240][index]!,
+  }));
+  const capacity = {
+    platform: "linux",
+    availableParallelism: 2,
+    availableMemoryBytes: 32 * GiB,
+    physicalMemoryBytes: 32 * GiB,
+    procMemTotalBytes: 32 * GiB,
+    cgroupMemoryLimitPaths: ["/test/memory.max"],
+    constrainedMemoryBytes: 0,
+    processResidentMemoryBytes: 0,
+    fs: createMemoryFileSystem(
+      new Map([
+        ["/test/memory.max", `${32 * GiB}`],
+        ["/test/memory.current", "0"],
+      ]),
+    ),
+    env: { OPENCLAW_TSDOWN_MAX_OLD_SPACE_MB: "49152" },
+  };
+  it.each([
+    { name: "room for both unchanged heaps and headroom", facts: {}, expected: 2 },
+    { name: "exact aggregate boundary", facts: { availableMemoryBytes: 25.5 * GiB }, expected: 2 },
+    {
+      name: "one byte below aggregate boundary",
+      facts: { availableMemoryBytes: 25.5 * GiB - 1 },
+      expected: 1,
+    },
+    {
+      name: "six groups at the two largest heaps plus headroom",
+      selected: unequalGroups,
+      facts: { availableMemoryBytes: 23.5 * GiB },
+      expected: 2,
+    },
+    {
+      name: "six groups one byte below the two largest heaps plus headroom",
+      selected: unequalGroups,
+      facts: { availableMemoryBytes: 23.5 * GiB - 1 },
+      expected: 1,
+    },
+    {
+      name: "sixteen GiB cgroup despite explicit override",
+      facts: { cgroupMemoryLimitBytes: 16 * GiB },
+      expected: 1,
+    },
+    {
+      name: "sixteen GiB available despite large host",
+      facts: { availableMemoryBytes: 16 * GiB },
+      expected: 1,
+    },
+    {
+      name: "physical memory smaller than cgroup",
+      facts: { procMemTotalBytes: 16 * GiB },
+      expected: 1,
+    },
+    { name: "one delivered CPU", facts: { availableParallelism: 1 }, expected: 1 },
+    { name: "unknown available memory", facts: { availableMemoryBytes: Number.NaN }, expected: 1 },
+  ])("uses actual capacity for $name", ({ facts, expected, selected = groups }) => {
+    const before = structuredClone(selected);
+    expect(resolveStagedDeclarationConcurrency(selected, { ...capacity, ...facts })).toBe(expected);
+    expect(selected).toEqual(before);
+  });
+
+  it.each([
+    { name: "missing v2 usage", limit: "memory.max", usage: "memory.current", value: undefined },
+    { name: "invalid v2 usage", limit: "memory.high", usage: "memory.current", value: "invalid" },
+    {
+      name: "unreadable v2 usage",
+      limit: "memory.max",
+      usage: "memory.current",
+      value: Object.assign(new Error("EACCES: memory.current"), { code: "EACCES" }),
+    },
+    {
+      name: "missing v1 usage",
+      limit: "memory.limit_in_bytes",
+      usage: "memory.usage_in_bytes",
+      value: undefined,
+    },
+    {
+      name: "invalid v1 usage",
+      limit: "memory.limit_in_bytes",
+      usage: "memory.usage_in_bytes",
+      value: "max",
+    },
+    {
+      name: "readable v2 usage",
+      limit: "memory.max",
+      usage: "memory.current",
+      value: "0",
+      expected: 2,
+    },
+    { name: "charged v2 usage", limit: "memory.max", usage: "memory.current", value: `${8 * GiB}` },
+    {
+      name: "readable v1 usage",
+      limit: "memory.limit_in_bytes",
+      usage: "memory.usage_in_bytes",
+      value: "0",
+      expected: 2,
+    },
+    {
+      name: "unlimited v2",
+      limit: "memory.max",
+      usage: "memory.current",
+      value: undefined,
+      limitValue: "max",
+      expected: 2,
+    },
+    {
+      name: "unlimited v1",
+      limit: "memory.limit_in_bytes",
+      usage: "memory.usage_in_bytes",
+      value: undefined,
+      limitValue: "9223372036854771712",
+      expected: 2,
+    },
+  ])(
+    "requires observed remaining capacity for $name",
+    ({ limit, usage, value, limitValue = `${32 * GiB}`, expected = 1 }) => {
+      const files = new Map<string, string | Error>([[`/test/${limit}`, limitValue]]);
+      if (value !== undefined) {
+        files.set(`/test/${usage}`, value);
+      }
+      const facts = {
+        ...capacity,
+        cgroupMemoryLimitPaths: [`/test/${limit}`],
+        fs: createMemoryFileSystem(files),
+      };
+      expect(resolveStagedDeclarationConcurrency(groups, facts)).toBe(expected);
+      expect(resolveTsdownBuildPlan({ ...facts, env: {} }).maxOldSpaceMb).toBe(12288);
+      expect(resolveTsdownBuildPlan(facts).maxOldSpaceMb).toBe(49152);
+    },
+  );
+
+  it("does not let known leaf usage conceal unknown ancestor usage", () => {
+    const facts = {
+      ...capacity,
+      cgroupMemoryLimitPaths: ["/test/leaf/memory.max", "/test/memory.max"],
+      fs: createMemoryFileSystem(
+        new Map([
+          ["/test/leaf/memory.max", `${32 * GiB}`],
+          ["/test/leaf/memory.current", "0"],
+          ["/test/memory.max", `${64 * GiB}`],
+        ]),
+      ),
+    };
+    expect(resolveStagedDeclarationConcurrency(groups, facts)).toBe(1);
+    expect(resolveTsdownBuildPlan({ ...facts, env: {} }).maxOldSpaceMb).toBe(12288);
+  });
+
+  it.each([
+    { name: "all cache hits", selected: [] },
+    { name: "one miss", selected: groups.slice(0, 1) },
+    { name: "repeated partition", selected: [groups[0]!, groups[0]!] },
+    {
+      name: "mixed SDK and base groups",
+      selected: [groups[0]!, { name: "openclaw-dts-base", maxOldSpaceMb: 12288 }],
+      expected: 2,
+    },
+    {
+      name: "unknown declaration group",
+      selected: [groups[0]!, { name: "unknown-declaration", maxOldSpaceMb: 12288 }],
+    },
+    { name: "duplicate among three programs", selected: [...groups, groups[0]!] },
+  ])("bounds admission for $name", ({ selected, expected = 1 }) => {
+    expect(resolveStagedDeclarationConcurrency(selected, capacity)).toBe(expected);
+  });
+
+  it("does not use an explicit heap to conceal an unresolved cgroup", () => {
+    const memoryFs = createMemoryFileSystem(
+      new Map([
+        ["/proc/self/cgroup", "0::/hidden.slice/openclaw.service\n"],
+        [
+          "/proc/self/mountinfo",
+          "29 23 0:26 /different.slice /sys/fs/cgroup rw - cgroup2 cgroup rw\n",
+        ],
+      ]),
+    );
+    expect(
+      resolveStagedDeclarationConcurrency(groups, {
+        ...capacity,
+        cgroupMemoryLimitPaths: undefined,
+        fs: memoryFs,
+      }),
+    ).toBe(1);
+  });
 });

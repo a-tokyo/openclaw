@@ -67,6 +67,7 @@ function createTestRuntime(params: Parameters<CreateSessionMcpRuntime>[0]): Sess
       isError: false,
     }),
     dispose: async () => {},
+    joinCleanup: async () => {},
   };
 }
 
@@ -125,7 +126,9 @@ describe("requester MCP connect runtime", () => {
     expect(disconnected.tools.map((tool) => tool.name)).toEqual(["calendar__connect"]);
     expect(created.find((params) => params.requesterScope)?.includeServerNames).toEqual(new Set());
     expect(startAuthorization).not.toHaveBeenCalled();
-    await expect(disconnected.tools[0]!.execute("connect", {})).resolves.toMatchObject({
+    const connecting = disconnected.tools[0]!.execute("connect", {});
+    expect(startAuthorization).toHaveBeenCalledOnce();
+    await expect(connecting).resolves.toMatchObject({
       details: {
         mcpConnect: {
           serverName: "calendar",

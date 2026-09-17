@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { gunzipSync, gzipSync } from "node:zlib";
+import { expectDefined } from "@openclaw/normalization-core";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import { resolveSharedMainAuthAgentDir } from "../agents/auth-profiles/shared-main-dir.js";
@@ -39,17 +40,36 @@ import { writePersistedInstalledPluginIndex } from "../plugins/installed-plugin-
 import { readPersistedInstalledPluginIndex } from "../plugins/installed-plugin-index-store.js";
 import type { InstalledPluginInstallRecordInfo } from "../plugins/installed-plugin-index.js";
 import { EMPTY_LEGACY_SESSION_SURFACES } from "../plugins/legacy-session-surfaces.types.js";
-import { readConfigMachineState, writeConfigMachineState } from "../state/config-machine-state.js";
-import { closeOpenClawAgentDatabasesForTest } from "../state/openclaw-agent-db.js";
+import { writeConfigMachineState } from "../state/config-machine-state-write.js";
+import { readConfigMachineState } from "../state/config-machine-state.js";
+import {
+  closeOpenClawAgentDatabasesAsync,
+  closeOpenClawAgentDatabasesForTest,
+} from "../state/openclaw-agent-db.js";
 import { OPENCLAW_STATE_SCHEMA_VERSION } from "../state/openclaw-state-db-contract.js";
 import {
+  closeOpenClawStateDatabaseAsync,
   closeOpenClawStateDatabaseForTest,
   openOpenClawStateDatabase,
 } from "../state/openclaw-state-db.js";
+import { resolveOpenClawStateSqlitePath } from "../state/openclaw-state-db.paths.js";
 import { loadTaskFlowRegistryStateFromSqlite } from "../tasks/task-flow-registry.store.sqlite.js";
 import { loadTaskRegistryStateFromSqlite } from "../tasks/task-registry.store.sqlite.js";
 
-const tempDirs = useAutoCleanupTempDirTracker(afterEach);
+const tempDirs = useAutoCleanupTempDirTracker((cleanup) =>
+  afterEach(async () => {
+    await closeOpenClawAgentDatabasesAsync();
+    await closeOpenClawStateDatabaseAsync();
+    resetAutoMigrateLegacyStateDirForTest();
+    resetAutoMigrateLegacyTaskStateSidecarsForTest();
+    closeOpenClawAgentDatabasesForTest();
+    closeOpenClawStateDatabaseForTest();
+    setMaxPluginStateEntriesPerPluginForTests();
+    resetPluginStateStoreForTests();
+    mockedChannelMigrationPlans.plans = [];
+    cleanup();
+  }),
+);
 
 function makeDoctorStateDir(): string {
   return tempDirs.make("openclaw-doctor-");
@@ -201,6 +221,15 @@ vi.mock("../plugins/doctor-contract-registry.js", async (importOriginal) => {
     ...actual,
     collectRelevantDoctorPluginIds: vi.fn(() => []),
     listPluginDoctorSessionStoreAgentIds: vi.fn(() => []),
+    resolveLivePluginDoctorStateMigrationInventory: vi.fn(() => ({
+      knownPluginIds: mockedLegacyMigrationDetectors.entries.map(({ pluginId }) => pluginId),
+      sessionStoreOwnerPluginIds: [],
+      descriptors: mockedLegacyMigrationDetectors.entries.map(({ pluginId }) => ({
+        pluginId,
+        id: `${pluginId}-legacy-channel-state`,
+      })),
+      unresolvedPluginIds: [],
+    })),
     listPluginDoctorStateMigrationEntries: vi.fn(() =>
       mockedLegacyMigrationDetectors.entries.map(({ pluginId, detector }) => ({
         pluginId,
@@ -251,16 +280,6 @@ async function runTelegramAllowFromMigration(params: { root: string; cfg: OpenCl
   });
   return { oauthDir, env, detected, result };
 }
-
-afterEach(() => {
-  resetAutoMigrateLegacyStateDirForTest();
-  resetAutoMigrateLegacyTaskStateSidecarsForTest();
-  closeOpenClawStateDatabaseForTest();
-  closeOpenClawAgentDatabasesForTest();
-  setMaxPluginStateEntriesPerPluginForTests();
-  resetPluginStateStoreForTests();
-  mockedChannelMigrationPlans.plans = [];
-});
 
 function writeJson5(filePath: string, value: unknown) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
@@ -720,7 +739,7 @@ async function detectAndRunMigrations(params: {
     cfg: params.cfg,
     env: { OPENCLAW_STATE_DIR: params.root } as NodeJS.ProcessEnv,
   });
-  await runLegacyStateMigrations({ detected, now: params.now });
+  return runLegacyStateMigrations({ detected, now: params.now });
 }
 
 async function withStateDir<T>(root: string, run: () => Promise<T>): Promise<T> {
@@ -1416,7 +1435,7 @@ describe("doctor legacy state migrations", () => {
     expect(store["agent:main:unknown:group:abc"]?.sessionId).toBe("generic");
   });
 
-  it("migrates legacy agent dir with conflict fallback", async () => {
+  it("preserves conflicting agent files and records a recoverable quarantine", async () => {
     const { root, cfg } = await makeRootWithEmptyCfg();
     writeLegacyAgentFiles(root, {
       "foo.txt": "legacy",
@@ -1427,11 +1446,22 @@ describe("doctor legacy state migrations", () => {
     fs.mkdirSync(targetAgentDir, { recursive: true });
     fs.writeFileSync(path.join(targetAgentDir, "foo.txt"), "new", "utf-8");
 
-    await detectAndRunMigrations({ root, cfg, now: () => 123 });
+    const result = await detectAndRunMigrations({ root, cfg, now: () => 123 });
 
     expect(fs.readFileSync(path.join(targetAgentDir, "baz.txt"), "utf-8")).toBe("legacy2");
-    const backupDir = path.join(root, "agents", "main", "agent.legacy-123");
-    expect(fs.existsSync(path.join(backupDir, "foo.txt"))).toBe(true);
+    expect(fs.readFileSync(path.join(targetAgentDir, "foo.txt"), "utf-8")).toBe("new");
+    const backups = fs.readdirSync(root).filter((name) => name.startsWith("agent.legacy-"));
+    expect(backups).toHaveLength(1);
+    const backupDir = path.join(
+      fs.realpathSync(root),
+      expectDefined(backups[0], "conflict quarantine"),
+    );
+    expect(fs.readdirSync(backupDir)).toEqual(["foo.txt"]);
+    expect(fs.readFileSync(path.join(backupDir, "foo.txt"), "utf-8")).toBe("legacy");
+    expect(result.stepReceipts.find((receipt) => receipt.id === "agent-dir")).toMatchObject({
+      outcome: "warning",
+      warnings: [expect.stringContaining(path.join(backupDir, "foo.txt"))],
+    });
   });
 
   it("auto-migrates legacy agent dir on startup", async () => {
@@ -1665,6 +1695,7 @@ describe("doctor legacy state migrations", () => {
       await store.register("scope:existing", { body: "fresh" });
       await store.register("other:keep", { body: "other" });
     });
+    await closeOpenClawStateDatabaseAsync();
     resetPluginStateStoreForTests();
 
     const detected = await detectLegacyStateMigrations({
@@ -1828,6 +1859,7 @@ describe("doctor legacy state migrations", () => {
       });
       await store.register("existing", { offset: 10 });
     });
+    await closeOpenClawStateDatabaseAsync();
     resetPluginStateStoreForTests();
 
     const detected = await detectLegacyStateMigrations({
@@ -1959,6 +1991,7 @@ describe("doctor legacy state migrations", () => {
       });
       await store.register("current", { body: "current" });
     });
+    await closeOpenClawStateDatabaseAsync();
     resetPluginStateStoreForTests();
 
     const detected = await detectLegacyStateMigrations({
@@ -2016,6 +2049,7 @@ describe("doctor legacy state migrations", () => {
       });
       await store.register("current", { body: "current" });
     });
+    await closeOpenClawStateDatabaseAsync();
     resetPluginStateStoreForTests();
 
     const detected = await detectLegacyStateMigrations({
@@ -2071,6 +2105,7 @@ describe("doctor legacy state migrations", () => {
       });
       await store.register("current", { body: "current" });
     });
+    await closeOpenClawStateDatabaseAsync();
     resetPluginStateStoreForTests();
 
     const firstDetected = await detectLegacyStateMigrations({
@@ -2088,6 +2123,7 @@ describe("doctor legacy state migrations", () => {
       });
       await store.delete("current");
     });
+    await closeOpenClawStateDatabaseAsync();
     resetPluginStateStoreForTests();
 
     const secondDetected = await detectLegacyStateMigrations({
@@ -2140,6 +2176,7 @@ describe("doctor legacy state migrations", () => {
       });
       await store.register("current", { body: "current" });
     });
+    await closeOpenClawStateDatabaseAsync();
     resetPluginStateStoreForTests();
 
     const detected = await detectLegacyStateMigrations({
@@ -2191,6 +2228,7 @@ describe("doctor legacy state migrations", () => {
       });
       await store.register("covered", { body: "current" });
     });
+    await closeOpenClawStateDatabaseAsync();
     resetPluginStateStoreForTests();
 
     const detected = await detectLegacyStateMigrations({
@@ -2241,6 +2279,7 @@ describe("doctor legacy state migrations", () => {
         })),
       );
     });
+    await closeOpenClawStateDatabaseAsync();
     resetPluginStateStoreForTests();
 
     const detected = await detectLegacyStateMigrations({
@@ -2564,6 +2603,17 @@ describe("doctor legacy state migrations", () => {
     expect(fs.existsSync(`${journalPath}.migrated`)).toBe(true);
     expect(fs.existsSync(sourcePath)).toBe(false);
     expect(fs.existsSync(`${sourcePath}.migrated`)).toBe(true);
+    expect(
+      result.stepReceipts.find((receipt) => receipt.id === "plugin-state-sidecar"),
+    ).toMatchObject({
+      source: [{ kind: "sqlite", path: sourcePath }],
+      target: [
+        {
+          kind: "sqlite",
+          path: resolveOpenClawStateSqlitePath({ OPENCLAW_STATE_DIR: root }),
+        },
+      ],
+    });
   });
 
   it("retries plugin-state archival after a sidecar rename failure", async () => {
@@ -2593,6 +2643,39 @@ describe("doctor legacy state migrations", () => {
     expect(firstResult.warnings).toStrictEqual([
       `Failed archiving plugin-state sidecar ${walPath}: Error: forced archive failure`,
     ]);
+    expect(
+      firstResult.stepReceipts.find((receipt) => receipt.id === "plugin-state-sidecar"),
+    ).toMatchObject({
+      outcome: "refused",
+      source: [{ kind: "sqlite", path: sourcePath }],
+      target: [
+        {
+          kind: "sqlite",
+          path: resolveOpenClawStateSqlitePath({ OPENCLAW_STATE_DIR: root }),
+        },
+      ],
+      changes: ["Migrated 1 plugin-state sidecar entry → shared SQLite state"],
+      refusal: { code: "step-refused" },
+    });
+    expect(
+      firstResult.stepReceipts.find((receipt) => receipt.id === "debug-proxy-capture"),
+    ).toMatchObject({
+      outcome: "refused",
+      refusal: { code: "blocked-by-prior-refusal" },
+    });
+    expect(
+      firstResult.stepReceipts.findIndex((receipt) => receipt.id === "plugin-state-sidecar"),
+    ).toBeLessThan(
+      firstResult.stepReceipts.findIndex((receipt) => receipt.id === "debug-proxy-capture"),
+    );
+    expect(
+      firstResult.stepReceipts.find((receipt) => receipt.id === "plugin-install-index"),
+    ).toMatchObject({ outcome: "skipped" });
+    expect(
+      firstResult.stepReceipts.findIndex((receipt) => receipt.id === "plugin-install-index"),
+    ).toBeLessThan(
+      firstResult.stepReceipts.findIndex((receipt) => receipt.id === "plugin-state-sidecar"),
+    );
     expect(fs.existsSync(sourcePath)).toBe(false);
     expect(fs.existsSync(`${sourcePath}.migrated`)).toBe(true);
     expect(fs.existsSync(walPath)).toBe(true);
@@ -2843,41 +2926,60 @@ describe("doctor legacy state migrations", () => {
     });
   });
 
-  it("archives conflicting legacy npm metadata when SQLite has the plugin install record", async () => {
-    const root = makeDoctorStateDir();
-    await writeExistingPluginInstallIndex(root, {
-      demo: {
-        source: "npm",
-        spec: "demo@latest",
-        version: "1.0.0",
-      },
-    });
-    const sourcePath = writeLegacyPluginInstallIndex(root, {
-      demo: {
-        source: "npm",
-        spec: "demo@1.0.0",
-        version: "1.0.0",
-      },
-    });
+  it.each(["direct", "automatic", "doctor", "doctor-config-refusal"] as const)(
+    "archives conflicting legacy npm metadata when SQLite has the plugin install record (%s)",
+    async (caller) => {
+      const root = makeDoctorStateDir();
+      await writeExistingPluginInstallIndex(root, {
+        demo: {
+          source: "npm",
+          spec: "demo@latest",
+          version: "1.0.0",
+        },
+      });
+      const sourcePath = writeLegacyPluginInstallIndex(root, {
+        demo: {
+          source: "npm",
+          spec: "demo@1.0.0",
+          version: "1.0.0",
+        },
+      });
 
-    const result = await runLegacyStateMigrationsForRoot(root);
+      const result =
+        caller === "direct"
+          ? await runLegacyStateMigrationsForRoot(root)
+          : await autoMigrateLegacyState({
+              cfg:
+                caller === "doctor-config-refusal"
+                  ? Object.defineProperty({}, "meta", {
+                      get() {
+                        throw new Error("config repair refused");
+                      },
+                    })
+                  : {},
+              env: { ...process.env, OPENCLAW_STATE_DIR: root },
+              doctorOnlyStateMigrations: caller !== "automatic",
+            });
 
-    expect(result.warnings).toStrictEqual([]);
-    expect(result.notices).toStrictEqual([
-      "Kept canonical shared SQLite plugin install metadata despite differing legacy records for: demo",
-    ]);
-    expect(fs.existsSync(sourcePath)).toBe(false);
-    expect(fs.existsSync(`${sourcePath}.migrated`)).toBe(true);
+      expect(result.warnings).toStrictEqual(
+        caller === "doctor-config-refusal" ? ["config repair refused"] : [],
+      );
+      expect(result.notices).toStrictEqual([
+        "Kept canonical shared SQLite plugin install metadata despite differing legacy records for: demo",
+      ]);
+      expect(fs.existsSync(sourcePath)).toBe(false);
+      expect(fs.existsSync(`${sourcePath}.migrated`)).toBe(true);
 
-    const retry = await runLegacyStateMigrationsForRoot(root);
-    expect(retry.warnings).toStrictEqual([]);
-    expect(retry.notices).toBeUndefined();
-    await expect(readPersistedInstalledPluginIndex({ stateDir: root })).resolves.toMatchObject({
-      installRecords: {
-        demo: { source: "npm", spec: "demo@latest", version: "1.0.0" },
-      },
-    });
-  });
+      const retry = await runLegacyStateMigrationsForRoot(root);
+      expect(retry.warnings).toStrictEqual([]);
+      expect(retry.notices).toBeUndefined();
+      await expect(readPersistedInstalledPluginIndex({ stateDir: root })).resolves.toMatchObject({
+        installRecords: {
+          demo: { source: "npm", spec: "demo@latest", version: "1.0.0" },
+        },
+      });
+    },
+  );
 
   it("converges the reported plugin, update-check, and config-health conflicts", async () => {
     const root = makeDoctorStateDir();
@@ -2977,44 +3079,54 @@ describe("doctor legacy state migrations", () => {
     expect(retry.notices).toBeUndefined();
   });
 
-  it("keeps plugin install archive failures blocking after choosing SQLite metadata", async () => {
-    const root = makeDoctorStateDir();
-    await writeExistingPluginInstallIndex(root, {
-      demo: {
-        source: "npm",
-        spec: "demo@latest",
-        version: "1.0.0",
-      },
-    });
-    const sourcePath = writeLegacyPluginInstallIndex(root, {
-      demo: {
-        source: "npm",
-        spec: "demo@1.0.0",
-        version: "1.0.0",
-      },
-    });
-    const rename = failRenameOnce(sourcePath);
+  it.each(["direct", "automatic", "doctor"] as const)(
+    "keeps plugin install archive failures blocking after choosing SQLite metadata (%s)",
+    async (caller) => {
+      const root = makeDoctorStateDir();
+      await writeExistingPluginInstallIndex(root, {
+        demo: {
+          source: "npm",
+          spec: "demo@latest",
+          version: "1.0.0",
+        },
+      });
+      const sourcePath = writeLegacyPluginInstallIndex(root, {
+        demo: {
+          source: "npm",
+          spec: "demo@1.0.0",
+          version: "1.0.0",
+        },
+      });
+      const rename = failRenameOnce(sourcePath);
 
-    const result = await runLegacyStateMigrationsForRoot(root);
-    rename.mockRestore();
+      const result =
+        caller === "direct"
+          ? await runLegacyStateMigrationsForRoot(root)
+          : await autoMigrateLegacyState({
+              cfg: {},
+              env: { ...process.env, OPENCLAW_STATE_DIR: root },
+              doctorOnlyStateMigrations: caller === "doctor",
+            });
+      rename.mockRestore();
 
-    expect(result.warnings).toStrictEqual([
-      `Failed archiving plugin install index ${sourcePath}: Error: forced archive failure`,
-    ]);
-    expect(result.notices).toStrictEqual([
-      "Kept canonical shared SQLite plugin install metadata despite differing legacy records for: demo",
-    ]);
-    expect(fs.existsSync(sourcePath)).toBe(true);
-    expect(fs.existsSync(`${sourcePath}.migrated`)).toBe(false);
+      expect(result.warnings).toStrictEqual([
+        `Failed archiving plugin install index ${sourcePath}: Error: forced archive failure`,
+      ]);
+      expect(result.notices).toStrictEqual([
+        "Kept canonical shared SQLite plugin install metadata despite differing legacy records for: demo",
+      ]);
+      expect(fs.existsSync(sourcePath)).toBe(true);
+      expect(fs.existsSync(`${sourcePath}.migrated`)).toBe(false);
 
-    const retry = await runLegacyStateMigrationsForRoot(root);
-    expect(retry.warnings).toStrictEqual([]);
-    expect(retry.notices).toStrictEqual([
-      "Kept canonical shared SQLite plugin install metadata despite differing legacy records for: demo",
-    ]);
-    expect(fs.existsSync(sourcePath)).toBe(false);
-    expect(fs.existsSync(`${sourcePath}.migrated`)).toBe(true);
-  });
+      const retry = await runLegacyStateMigrationsForRoot(root);
+      expect(retry.warnings).toStrictEqual([]);
+      expect(retry.notices).toStrictEqual([
+        "Kept canonical shared SQLite plugin install metadata despite differing legacy records for: demo",
+      ]);
+      expect(fs.existsSync(sourcePath)).toBe(false);
+      expect(fs.existsSync(`${sourcePath}.migrated`)).toBe(true);
+    },
+  );
 
   for (const fixture of [
     {
@@ -3352,6 +3464,7 @@ describe("doctor legacy state migrations", () => {
       });
       await store.register("interaction:1", { ok: false });
     });
+    await closeOpenClawStateDatabaseAsync();
     resetPluginStateStoreForTests();
 
     const detected = await detectLegacyStateMigrations({
@@ -3420,6 +3533,7 @@ describe("doctor legacy state migrations", () => {
         },
       ]);
     });
+    await closeOpenClawStateDatabaseAsync();
     resetPluginStateStoreForTests();
 
     const detected = await detectLegacyStateMigrations({
@@ -3497,6 +3611,7 @@ describe("doctor legacy state migrations", () => {
         },
       ]);
     });
+    await closeOpenClawStateDatabaseAsync();
     resetPluginStateStoreForTests();
 
     const detected = await detectLegacyStateMigrations({
@@ -3510,7 +3625,13 @@ describe("doctor legacy state migrations", () => {
     expect(fs.existsSync(`${sourcePath}.migrated`)).toBe(true);
   });
 
-  it("keeps the plugin-state sidecar when the sidecar has a newer row than canonical state", async () => {
+  it.each<[name: string, sidecarCreatedAt: number]>([
+    ["keeps the plugin-state sidecar when the sidecar has a newer row than canonical state", 3000],
+    [
+      "keeps the plugin-state sidecar when sidecar and canonical rows have equal timestamps but different values",
+      1000,
+    ],
+  ])("%s", async (_name, sidecarCreatedAt) => {
     const root = makeDoctorStateDir();
     const sourcePath = path.join(root, "plugin-state", "state.sqlite");
     fs.mkdirSync(path.dirname(sourcePath), { recursive: true });
@@ -3533,7 +3654,7 @@ describe("doctor legacy state migrations", () => {
           plugin_id, namespace, entry_key, value_json, created_at, expires_at
         ) VALUES (?, ?, ?, ?, ?, ?)
       `);
-      insert.run("discord", "components", "interaction:1", '{"ok":true}', 3000, null);
+      insert.run("discord", "components", "interaction:1", '{"ok":true}', sidecarCreatedAt, null);
     } finally {
       db.close();
     }
@@ -3549,60 +3670,7 @@ describe("doctor legacy state migrations", () => {
         },
       ]);
     });
-    resetPluginStateStoreForTests();
-
-    const detected = await detectLegacyStateMigrations({
-      cfg: {},
-      env: { OPENCLAW_STATE_DIR: root } as NodeJS.ProcessEnv,
-    });
-    const result = await runLegacyStateMigrations({ detected });
-
-    expect(result.warnings).toStrictEqual([
-      "Left plugin-state sidecar in place because 1 row differs from shared state without a newer canonical timestamp. First key: discord/components/interaction:1",
-    ]);
-    expect(fs.existsSync(sourcePath)).toBe(true);
-    expect(fs.existsSync(`${sourcePath}.migrated`)).toBe(false);
-  });
-
-  it("keeps the plugin-state sidecar when sidecar and canonical rows have equal timestamps but different values", async () => {
-    const root = makeDoctorStateDir();
-    const sourcePath = path.join(root, "plugin-state", "state.sqlite");
-    fs.mkdirSync(path.dirname(sourcePath), { recursive: true });
-    const sqlite = requireNodeSqlite();
-    const db = new sqlite.DatabaseSync(sourcePath);
-    try {
-      db.exec(`
-        CREATE TABLE plugin_state_entries (
-          plugin_id TEXT NOT NULL,
-          namespace TEXT NOT NULL,
-          entry_key TEXT NOT NULL,
-          value_json TEXT NOT NULL,
-          created_at INTEGER NOT NULL,
-          expires_at INTEGER,
-          PRIMARY KEY (plugin_id, namespace, entry_key)
-        );
-      `);
-      const insert = db.prepare(`
-        INSERT INTO plugin_state_entries (
-          plugin_id, namespace, entry_key, value_json, created_at, expires_at
-        ) VALUES (?, ?, ?, ?, ?, ?)
-      `);
-      insert.run("discord", "components", "interaction:1", '{"ok":true}', 1000, null);
-    } finally {
-      db.close();
-    }
-    await withStateDir(root, async () => {
-      seedPluginStateEntriesForTests([
-        {
-          pluginId: "discord",
-          namespace: "components",
-          key: "interaction:1",
-          value: { ok: false },
-          createdAt: 1000,
-          expiresAt: null,
-        },
-      ]);
-    });
+    await closeOpenClawStateDatabaseAsync();
     resetPluginStateStoreForTests();
 
     const detected = await detectLegacyStateMigrations({
@@ -3633,6 +3701,7 @@ describe("doctor legacy state migrations", () => {
         },
       ]);
     });
+    await closeOpenClawStateDatabaseAsync();
     resetPluginStateStoreForTests();
 
     const detected = await detectLegacyStateMigrations({
@@ -3660,6 +3729,7 @@ describe("doctor legacy state migrations", () => {
         },
       ]);
     });
+    await closeOpenClawStateDatabaseAsync();
     resetPluginStateStoreForTests();
 
     const detected = await detectLegacyStateMigrations({
@@ -3708,6 +3778,21 @@ describe("doctor legacy state migrations", () => {
     expect(result.changes).toContain("Migrated 1 task registry sidecar row → shared SQLite state");
     expect(result.changes).toContain("Migrated 1 task delivery sidecar row → shared SQLite state");
     expect(result.changes).toContain("Migrated 1 task flow sidecar row → shared SQLite state");
+    expect(
+      result.stepReceipts.find((receipt) => receipt.id === "task-state-sidecars"),
+    ).toMatchObject({
+      source: [
+        { kind: "sqlite", path: taskRunsPath },
+        { kind: "sqlite", path: flowRunsPath },
+      ],
+      target: [
+        {
+          kind: "sqlite",
+          path: resolveOpenClawStateSqlitePath({ OPENCLAW_STATE_DIR: root }),
+        },
+      ],
+      outcome: "completed",
+    });
     expect(fs.existsSync(taskRunsPath)).toBe(false);
     expect(fs.existsSync(`${taskRunsPath}.migrated`)).toBe(true);
     expect(fs.existsSync(flowRunsPath)).toBe(false);
@@ -4261,6 +4346,13 @@ describe("doctor legacy state migrations", () => {
       "profile workspace",
     );
     expect(result.changes).toContain(`Profile workspace: ${paths.legacyDir} → ${paths.targetDir}`);
+    expect(result.stepReceipts.find((receipt) => receipt.id === "profile-workspace")).toMatchObject(
+      {
+        source: [{ kind: "path", path: paths.legacyDir }],
+        target: [{ kind: "path", path: paths.targetDir }],
+        outcome: "completed",
+      },
+    );
     expect(log.info).toHaveBeenCalledWith(expect.stringContaining(paths.targetDir));
   });
 
@@ -4276,6 +4368,12 @@ describe("doctor legacy state migrations", () => {
 
     const warning = `Profile workspace migration skipped: target already exists (${paths.targetDir}). Kept legacy workspace at ${paths.legacyDir}; merge manually.`;
     expect(result.warnings).toContain(warning);
+    expect(result.stepReceipts.find((receipt) => receipt.id === "profile-workspace")).toMatchObject(
+      {
+        outcome: "refused",
+        refusal: { code: "step-refused", message: warning },
+      },
+    );
     expect(log.warn).toHaveBeenCalledWith(expect.stringContaining(warning));
     expect(fs.readFileSync(path.join(paths.legacyDir, "legacy.txt"), "utf8")).toBe("legacy");
     expect(fs.readFileSync(path.join(paths.targetDir, "current.txt"), "utf8")).toBe("current");
@@ -4290,6 +4388,14 @@ describe("doctor legacy state migrations", () => {
     expect(fs.existsSync(paths.targetDir)).toBe(false);
     expect(result.changes.some((entry) => entry.startsWith("Profile workspace:"))).toBe(false);
     expect(result.warnings.some((entry) => entry.includes("Profile workspace"))).toBe(false);
+    expect(result.stepReceipts.find((receipt) => receipt.id === "profile-workspace")).toMatchObject(
+      {
+        source: [],
+        target: [],
+        requiredness: "not-required",
+        outcome: "skipped",
+      },
+    );
     expect(log.warn).not.toHaveBeenCalledWith(expect.stringContaining("Profile workspace"));
   });
 

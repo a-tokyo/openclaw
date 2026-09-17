@@ -105,7 +105,7 @@ export function prepareCrabboxSourceCapsule(options: {
   repoRoot: string;
   syncRoot: string;
   base: string;
-  binary: string;
+  syncPlan: { command: string; args: string[]; windowsVerbatimArguments?: boolean };
 }): CrabboxSourceCapsule {
   const repoRoot = realpathSync(options.repoRoot);
   const sourceEnv = sourceGitEnvironment();
@@ -242,15 +242,34 @@ export function prepareCrabboxSourceCapsule(options: {
     mkdirSync(linkBlobs);
     function writeFrozen(path: string, bytes: Buffer, mode: string) {
       const destination = join(directory, path);
-      mkdirSync(dirname(destination), { recursive: true });
       let blobPath = destination;
-      if (mode === "120000") {
-        symlinkSync(bytes, destination);
-        blobPath = join(linkBlobs, String(frozen.size));
-        writeFileSync(blobPath, bytes);
-      } else {
-        writeFileSync(destination, bytes);
-        chmodSync(destination, mode === "100755" ? 0o755 : 0o644);
+      let operation = "mkdir";
+      try {
+        mkdirSync(dirname(destination), { recursive: true });
+        if (mode === "120000") {
+          operation = "symlink";
+          symlinkSync(bytes, destination);
+          blobPath = join(linkBlobs, String(frozen.size));
+          operation = "write symlink blob";
+          writeFileSync(blobPath, bytes);
+        } else {
+          operation = "write file";
+          writeFileSync(destination, bytes);
+          operation = "chmod";
+          chmodSync(destination, mode === "100755" ? 0o755 : 0o644);
+        }
+      } catch (error) {
+        const failure = error as NodeJS.ErrnoException;
+        const details = [
+          failure?.code === undefined ? undefined : `code=${JSON.stringify(failure.code)}`,
+          failure?.errno === undefined ? undefined : `errno=${JSON.stringify(failure.errno)}`,
+        ]
+          .filter(Boolean)
+          .join(", ");
+        throw new Error(
+          `source capsule: ${operation} failed for ${JSON.stringify(path)}${details ? ` (${details})` : ""}; source was not uploaded`,
+          { cause: error },
+        );
       }
       frozen.set(path, { mode, blobPath });
     }
@@ -410,12 +429,11 @@ export function prepareCrabboxSourceCapsule(options: {
     // Policy files may be Git-ignored. They affect selection but never become
     // transport candidates merely because selection needs to read them.
     for (const path of [...runtimePolicies, ".crabboxignore"]) {
-      if (!frozen.has(path)) {
-        copySource(path);
-      }
-      if (frozen.get(path)?.mode === "120000") {
+      const kind = frozen.has(path) ? "present" : copySource(path);
+      // A replaced policy must not become an absent file and lose its exclusions.
+      if (kind !== "missing" && !["100644", "100755"].includes(frozen.get(path)?.mode ?? "")) {
         throw new Error(
-          `source capsule cannot relocate symlinked repository policy ${JSON.stringify(path)}`,
+          `source capsule cannot relocate non-regular repository policy ${JSON.stringify(path)}; use a regular policy file before uploading`,
         );
       }
     }
@@ -432,15 +450,18 @@ export function prepareCrabboxSourceCapsule(options: {
     function selectSource() {
       let planValue: unknown;
       try {
-        planValue = JSON.parse(
-          execFileSync(options.binary, ["sync-plan", "--json", "--limit", "2147483647"], {
-            cwd: directory,
-            env: selectionEnv,
-            encoding: "utf8",
-            maxBuffer: 64 * 1024 * 1024,
-            stdio: ["ignore", "pipe", "pipe"],
-          }),
-        );
+        const result = spawnSync(options.syncPlan.command, options.syncPlan.args, {
+          cwd: directory,
+          env: selectionEnv,
+          windowsVerbatimArguments: options.syncPlan.windowsVerbatimArguments,
+          encoding: "utf8",
+          maxBuffer: 64 * 1024 * 1024,
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+        if (result.error || result.status !== 0) {
+          throw new Error("Crabbox sync-plan failed");
+        }
+        planValue = JSON.parse(result.stdout);
       } catch {
         throw new Error(
           "source capsule requires a successful Crabbox sync-plan; inspect source exclusions before retrying",

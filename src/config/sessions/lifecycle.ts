@@ -2,7 +2,7 @@
 import { asDateTimestampMs } from "@openclaw/normalization-core/number-coercion";
 import { resolveAgentIdFromSessionKey } from "../../routing/session-key.js";
 import { canonicalizeMainSessionAlias } from "./main-session.js";
-import { loadTranscriptHeaderSync, readTranscriptStatsSync } from "./session-accessor.js";
+import { loadTranscriptHeaderSync, readTranscriptMutationStateSync } from "./session-accessor.js";
 import {
   isTerminalSessionStatus,
   type InternalSessionEntry,
@@ -10,6 +10,7 @@ import {
   type SessionScope,
 } from "./types.js";
 import {
+  SESSION_RESTART_RECOVERY_TOMBSTONE_ERROR_CODE,
   SESSION_WORK_START_CHANGED_ERROR_CODE,
   SESSION_WORK_START_INVALIDATED_ERROR_CODE,
 } from "./work-start-error.js";
@@ -45,7 +46,7 @@ export function isRestartRecoveryTombstone(
 
 /** Stable Gateway error detail for stale session lifecycle requests. */
 export const SESSION_LIFECYCLE_CHANGED_ERROR_REASON = "session-changed";
-export const SESSION_RESTART_RECOVERY_TOMBSTONE_ERROR_CODE = "SESSION_RESTART_RECOVERY_TOMBSTONE";
+export { SESSION_RESTART_RECOVERY_TOMBSTONE_ERROR_CODE };
 
 export class SessionWorkStartInvalidatedError extends Error {
   readonly code = SESSION_WORK_START_INVALIDATED_ERROR_CODE;
@@ -218,7 +219,7 @@ export function resolveSessionLifecycleTimestamps(params: {
   };
 }
 
-export function resolveTerminalMainSessionTranscriptRegistryCheck(
+function resolveTerminalMainSessionTranscriptRegistryCheck(
   params: TerminalMainSessionTranscriptRegistryParams,
 ): TerminalMainSessionTranscriptRegistryCheck | undefined {
   if (!params.entry || !params.sessionKey) {
@@ -235,6 +236,13 @@ export function resolveTerminalMainSessionTranscriptRegistryCheck(
     sessionKey: params.sessionKey,
   });
   if (candidateSessionKey !== configuredMainSessionKey) {
+    return undefined;
+  }
+  if (params.entry.status === "running") {
+    // A yielded parent keeps status "running" next to the settled run's endedAt
+    // (see deriveGatewaySessionLifecycleSnapshot). That timestamp records run
+    // timing, not a terminal session: sibling completions must keep reusing the
+    // same session generation instead of rotating the parent mid-preparation.
     return undefined;
   }
   const hasTerminalLifecycle =
@@ -285,17 +293,17 @@ export function hasTerminalMainSessionTranscriptNewerThanRegistrySync(
   try {
     // Runtime transcripts are SQLite-only. Legacy-looking sessionFile values still
     // resolve through agent/session/store scope, so a file stat would read stale state.
-    const stats = readTranscriptStatsSync({
+    const mutation = readTranscriptMutationStateSync({
       agentId: params.agentId,
       sessionId: check.sessionId,
       storePath: params.storePath,
     });
-    if (stats.lastMutationAtMs === undefined) {
+    if (mutation.updatedAt === null) {
       return false;
     }
     return isTranscriptMutationNewerThanRegistry({
-      transcriptMutationAtMs: stats.lastMutationAtMs,
-      registryTimestampMs: stats.lastObservedMutationAtMs ?? check.registryTimestampMs,
+      transcriptMutationAtMs: mutation.updatedAt,
+      registryTimestampMs: mutation.observedAt ?? check.registryTimestampMs,
     });
   } catch {
     return false;

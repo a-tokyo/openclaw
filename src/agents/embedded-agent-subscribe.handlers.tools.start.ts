@@ -6,25 +6,15 @@ import {
 import { truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
 import { emitAgentActivityEvent, type AgentItemEventData } from "../infra/agent-activity-events.js";
 import { emitAgentEvent } from "../infra/agent-events.js";
+import { isAgentPlanProgressToolName } from "../session-cards/progress-card-channel-summary.js";
 import { isDeliverableMessageChannel } from "../utils/message-channel-normalize.js";
 import { REQUIRED_PARAM_GROUPS, type RequiredParamGroup } from "./agent-tools.params.js";
 import { sanitizeForConsole } from "./console-sanitize.js";
-import { extractMessagingToolSend } from "./embedded-agent-messaging-extraction.js";
-import {
-  isMessagingTool,
-  isMessagingToolSendAction,
-  isMessagingToolTargetEvidenceAction,
-} from "./embedded-agent-messaging.js";
 import { runBestEffortCallback } from "./embedded-agent-subscribe.callback.js";
-import {
-  applyCurrentMessageProvider,
-  readMessagingText,
-} from "./embedded-agent-subscribe.handlers.tools.results.js";
 import type {
   ToolCallSummary,
   ToolHandlerContext,
 } from "./embedded-agent-subscribe.handlers.types.js";
-import { collectMessagingMediaUrlsFromRecord } from "./embedded-agent-tool-media.js";
 import { sanitizeToolArgs } from "./embedded-agent-tool-results.js";
 import type { AgentEvent } from "./runtime/index.js";
 import { inferToolMetaFromArgsCore, isCommandBearingToolCall } from "./tool-display.js";
@@ -168,6 +158,7 @@ function buildToolStartWarningArgsPreview(rawArgsPreview: string | undefined): s
 type ToolStartRecord = {
   startTime: number;
   args: unknown;
+  parentToolCallId?: string;
   hasRepliedRef?: { value: boolean };
 };
 
@@ -249,7 +240,11 @@ export function buildPatchItemTitle(meta?: string): string {
   return meta ? `patch ${meta}` : "apply patch";
 }
 
-export function emitTrackedItemEvent(ctx: ToolHandlerContext, itemData: AgentItemEventData): void {
+export function emitTrackedItemEvent(
+  ctx: ToolHandlerContext,
+  itemData: AgentItemEventData,
+  emitLiveUpdate = true,
+): void {
   if (itemData.phase === "start") {
     ctx.state.itemActiveIds.add(itemData.itemId);
     ctx.state.itemStartedCount += 1;
@@ -257,12 +252,15 @@ export function emitTrackedItemEvent(ctx: ToolHandlerContext, itemData: AgentIte
     ctx.state.itemActiveIds.delete(itemData.itemId);
     ctx.state.itemCompletedCount += 1;
   }
-  emitAgentActivityEvent({
-    runId: ctx.params.runId,
-    ...(ctx.params.sessionKey ? { sessionKey: ctx.params.sessionKey } : {}),
-    stream: "item",
-    data: itemData,
-  });
+  if (itemData.phase !== "update" || emitLiveUpdate) {
+    emitAgentActivityEvent({
+      runId: ctx.params.runId,
+      ...(ctx.params.sessionKey ? { sessionKey: ctx.params.sessionKey } : {}),
+      stream: "item",
+      data: itemData,
+    });
+  }
+  // Reply liveness and channel delivery still consume every original callback.
   emitAgentEventCallbackBestEffort(ctx, {
     stream: "item",
     data: itemData,
@@ -324,6 +322,7 @@ export function handleToolExecutionStart(
     replaySafe?: boolean;
     hideFromChannelProgress?: boolean;
     lifecycleProvenance?: "nested";
+    parentToolCallId?: string;
   },
 ): void | Promise<void> {
   const startToolName = normalizeToolPolicyName(evt.toolName);
@@ -401,6 +400,7 @@ export function handleToolExecutionStart(
     toolStartData.set(buildToolStartKey(runId, toolCallId), {
       startTime: startedAt,
       args,
+      parentToolCallId: evt.parentToolCallId,
       ...(ctx.params.hasRepliedRef
         ? { hasRepliedRef: { value: ctx.params.hasRepliedRef.value } }
         : {}),
@@ -493,6 +493,7 @@ export function handleToolExecutionStart(
         phase: "start",
         name: toolName,
         toolCallId,
+        ...(evt.parentToolCallId ? { parentToolCallId: evt.parentToolCallId } : {}),
         args: sanitizeToolArgs(args) as Record<string, unknown>,
         ...(hideFromChannelProgress ? { hideFromChannelProgress: true } : {}),
       },
@@ -521,6 +522,7 @@ export function handleToolExecutionStart(
         phase: "start",
         name: toolName,
         toolCallId,
+        ...(evt.parentToolCallId ? { parentToolCallId: evt.parentToolCallId } : {}),
         args: sanitizeToolArgs(args) as Record<string, unknown>,
         ...(hideFromChannelProgress ? { hideFromChannelProgress: true } : {}),
       },
@@ -555,47 +557,11 @@ export function handleToolExecutionStart(
     if (
       ctx.params.onToolResult &&
       shouldEmitToolEvents &&
+      !isAgentPlanProgressToolName(toolName) &&
       !ctx.state.toolSummaryById.has(toolCallId)
     ) {
       ctx.state.toolSummaryById.add(toolCallId);
       ctx.emitToolSummary(toolName, meta, callSummary.commandBearing);
-    }
-
-    // Track messaging tool sends (pending until confirmed in tool_execution_end).
-    if (isMessagingTool(toolName)) {
-      const argsRecord = args && typeof args === "object" ? (args as Record<string, unknown>) : {};
-      const isMessagingSend = isMessagingToolSendAction(toolName, argsRecord);
-      if (isMessagingToolTargetEvidenceAction(toolName, argsRecord)) {
-        const telemetryArgs = applyCurrentMessageProvider(
-          toolName,
-          argsRecord,
-          ctx.params.messageChannel,
-        );
-        const sendTarget = extractMessagingToolSend(toolName, telemetryArgs, {
-          config: ctx.params.config,
-          currentChannelId: ctx.params.currentChannelId,
-          currentMessagingTarget: ctx.params.currentMessagingTarget,
-          currentThreadId: ctx.params.currentThreadId,
-          currentMessageId: ctx.params.currentMessageId,
-          replyToMode: ctx.params.replyToMode,
-          hasRepliedRef: ctx.params.hasRepliedRef,
-        });
-        if (sendTarget) {
-          ctx.state.pendingMessagingTargets.set(toolCallId, sendTarget);
-        }
-      }
-      if (isMessagingSend) {
-        const text = readMessagingText(argsRecord);
-        if (text) {
-          ctx.state.pendingMessagingTexts.set(toolCallId, text);
-          ctx.log.debug(`Tracking pending messaging text: tool=${toolName} len=${text.length}`);
-        }
-        // Track media URLs from messaging tool args (pending until tool_execution_end).
-        const mediaUrls = collectMessagingMediaUrlsFromRecord(argsRecord);
-        if (mediaUrls.length > 0) {
-          ctx.state.pendingMessagingMediaUrls.set(toolCallId, mediaUrls);
-        }
-      }
     }
 
     const publishPrompt = ctx.params.onToolResult;

@@ -50,6 +50,7 @@ describe("full release metadata checkouts", () => {
       job: "resolve_target",
       checkout: "Checkout trusted workflow helper",
       entrypoint: "release-tooling-identity.mjs",
+      fullCheckout: true,
     },
     {
       job: "evidence_reuse",
@@ -79,13 +80,25 @@ describe("full release metadata checkouts", () => {
     },
   ])(
     "runs $job tooling from the complete scripts tree",
-    ({ job, checkout, entrypoint, extraPath }) => {
+    ({ job, checkout, entrypoint, extraPath, fullCheckout }) => {
       const root = mkdtempSync(join(tmpdir(), "openclaw-release-sparse-"));
       try {
         const toolingCheckout = step(job, checkout).with as Record<string, unknown>;
-        expect(toolingCheckout["sparse-checkout-cone-mode"]).toBe(false);
-        const paths = sparsePaths(toolingCheckout);
-        expect(paths).toEqual(extraPath ? ["scripts", extraPath] : ["scripts"]);
+        if (fullCheckout) {
+          expect(toolingCheckout).not.toHaveProperty("sparse-checkout");
+          expect(toolingCheckout).not.toHaveProperty("sparse-checkout-cone-mode");
+          expect(toolingCheckout).toMatchObject({
+            ref: "${{ github.sha }}",
+            path: "workflow",
+            "fetch-depth": 1,
+            "persist-credentials": false,
+            submodules: false,
+          });
+        } else {
+          expect(toolingCheckout["sparse-checkout-cone-mode"]).toBe(false);
+          const paths = sparsePaths(toolingCheckout);
+          expect(paths).toEqual(extraPath ? ["scripts", extraPath] : ["scripts"]);
+        }
 
         const checkoutRoot = join(root, checkoutPath(toolingCheckout));
         cpSync("scripts", join(checkoutRoot, "scripts"), { recursive: true });
@@ -146,6 +159,12 @@ describe("full release metadata checkouts", () => {
         steps.indexOf(step("evidence_reuse", "Find reusable validation evidence")),
       );
       expect(setup.env).toMatchObject({ REQUESTED_NODE_VERSION: "24.x" });
+      const setupPath = `${dirname(process.execPath)}${delimiter}${process.env.PATH ?? ""}`;
+      const activeNodeVersion = execFileSync("node", ["-p", "process.versions.node"], {
+        cwd: root,
+        encoding: "utf8",
+        env: { ...process.env, PATH: setupPath, NODE_OPTIONS: "", NODE_PATH: "" },
+      }).trim();
       execFileSync("bash", ["-c", String(setup.run)], {
         cwd: root,
         encoding: "utf8",
@@ -154,8 +173,8 @@ describe("full release metadata checkouts", () => {
           ...process.env,
           ...(setup.env as Record<string, string>),
           // Keep this sparse-checkout proof offline on every supported test runtime.
-          REQUESTED_NODE_VERSION: process.versions.node,
-          PATH: `${dirname(process.execPath)}${delimiter}${process.env.PATH ?? ""}`,
+          REQUESTED_NODE_VERSION: activeNodeVersion,
+          PATH: setupPath,
           NODE_OPTIONS: "",
           GITHUB_PATH: join(root, "github-path"),
         },
@@ -232,9 +251,12 @@ describe("full release same-parent recovery workflow", () => {
         "run-id": "${{ github.run_id }}",
       },
     });
-    expect(upload.with).toMatchObject({
-      name: "full-release-execution-plan-${{ github.run_id }}",
-      overwrite: true,
+    expect(upload).toMatchObject({
+      if: "${{ always() && github.run_attempt == 1 && steps.plan.outputs.sha256 != '' && steps.plan.outputs.source_parent_attempt == '1' }}",
+      with: {
+        name: "full-release-execution-plan-${{ github.run_id }}",
+        overwrite: false,
+      },
     });
     for (const job of ["release_decision", "diagnostic_drain", "summary"]) {
       expect(step(job, "Download immutable release execution plan").with).toMatchObject({

@@ -207,6 +207,63 @@ describe("cached file integrity", () => {
 });
 
 describe("downloadVerifiedFile", () => {
+  it.each([
+    { label: "shared clock ticks", times: [1000, 1000, 1010], rates: [0, 0, 300_000_000] },
+    {
+      label: "shared clock ticks after an established sample",
+      times: [1010, 1010, 1030],
+      rates: [100_000_000, 100_000_000, 100_000_000],
+    },
+    {
+      label: "distinct clock ticks",
+      times: [1010, 1020, 1030],
+      rates: [100_000_000, 100_000_000, 100_000_000],
+    },
+  ])("counts every persisted byte in the rate across $label", async ({ times, rates }) => {
+    const { destination } = await createDestination();
+    const chunks = [1, 2, 3].map((value) => Buffer.alloc(1_000_000, value));
+    const payload = Buffer.concat(chunks);
+    const release = vi.fn();
+    mocks.fetchWithSsrFGuard.mockResolvedValue({
+      response: new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            for (const chunk of chunks) {
+              controller.enqueue(chunk);
+            }
+            controller.close();
+          },
+        }),
+      ),
+      release,
+    });
+    const clock = vi.spyOn(Date, "now").mockReturnValue(1000);
+    let written = 0;
+    injectFileHandle((handle) => {
+      const writeFile = handle.writeFile.bind(handle);
+      handle.writeFile = async (...args) => {
+        await writeFile(...args);
+        clock.mockReturnValue(times[written++]!);
+      };
+    });
+    const onProgress = vi.fn();
+
+    await downloadVerifiedFile({
+      url: "https://downloads.example/model.gguf",
+      destination,
+      expectedSize: payload.byteLength,
+      expectedSha256: createHash("sha256").update(payload).digest("hex"),
+      onProgress,
+    });
+
+    expect(onProgress.mock.calls.map(([progress]) => progress.bytesPerSecond)).toEqual(rates);
+    expect(onProgress.mock.calls.map(([progress]) => progress.downloadedSize)).toEqual([
+      1_000_000, 2_000_000, 3_000_000,
+    ]);
+    expect(await fs.readFile(destination)).toEqual(payload);
+    expect(release).toHaveBeenCalledOnce();
+  });
+
   it("persists complete chunks before reporting progress under positive short writes", async () => {
     const payload = Buffer.from("short writes must not truncate verified downloads");
     const { destination, root } = await createDestination();
@@ -335,6 +392,94 @@ describe("ensureLlamaServerInstalled", () => {
     );
   });
 
+  it("uses the wider version timeout only for a freshly extracted CPU ZIP", async () => {
+    const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "llama-cpu-install-")));
+    tempRoots.push(root);
+    mocks.resolveLlamaCppDataDir.mockReturnValue(root);
+    const source = selectLlamaServerAsset("win32", "arm64", { kind: "cpu" });
+    const serverBytes = await new JSZip()
+      .file(source.executable, "server")
+      .generateAsync({ type: "nodebuffer" });
+    const asset: LlamaServerAsset = {
+      ...source,
+      sha256: createHash("sha256").update(serverBytes).digest("hex"),
+    };
+    mockDownload(serverBytes);
+    const calls: Array<{ command: string; args: string[]; timeout?: number }> = [];
+    mocks.execFile.mockImplementation(
+      (
+        command: string,
+        args: string[],
+        options: { timeout?: number },
+        callback: (error: ExecFileException | null, stdout: string, stderr: string) => void,
+      ) => {
+        calls.push({ command, args, timeout: options.timeout });
+        callback(
+          null,
+          `version: 0.1.0-dev (build ${LLAMA_SERVER_BUILD}, commit ${LLAMA_SERVER_COMMIT.slice(0, 9)})`,
+          "",
+        );
+      },
+    );
+
+    const { command } = resolveManagedLlamaServerPaths(asset);
+    await expect(ensureLlamaServerInstalled({ asset })).resolves.toMatchObject({ command });
+    await expect(ensureLlamaServerInstalled({ asset })).resolves.toMatchObject({ command });
+
+    expect(
+      calls.map((call) => ({
+        published: call.command === command,
+        args: call.args,
+        timeout: call.timeout,
+      })),
+    ).toEqual([
+      { published: false, args: ["--version"], timeout: 120_000 },
+      { published: true, args: ["--version"], timeout: 15_000 },
+      { published: true, args: ["--version"], timeout: 15_000 },
+    ]);
+    expect(await fs.readFile(command, "utf8")).toBe("server");
+    expect((await fs.readdir(root)).every((entry) => !entry.startsWith("."))).toBe(true);
+  });
+
+  it("aborts fresh validation and removes the unpublished CPU ZIP files", async () => {
+    const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "llama-cpu-abort-")));
+    tempRoots.push(root);
+    mocks.resolveLlamaCppDataDir.mockReturnValue(root);
+    const source = selectLlamaServerAsset("win32", "arm64", { kind: "cpu" });
+    const serverBytes = await new JSZip()
+      .file(source.executable, "server")
+      .generateAsync({ type: "nodebuffer" });
+    const asset: LlamaServerAsset = {
+      ...source,
+      sha256: createHash("sha256").update(serverBytes).digest("hex"),
+    };
+    mockDownload(serverBytes);
+    const controller = new AbortController();
+    const timeouts: Array<number | undefined> = [];
+    mocks.execFile.mockImplementation(
+      (
+        command: string,
+        _args: string[],
+        options: { timeout?: number },
+        callback: (error: ExecFileException | null, stdout: string, stderr: string) => void,
+      ) => {
+        timeouts.push(options.timeout);
+        controller.abort();
+        const error = new Error("The operation was aborted") as ExecFileException;
+        error.cmd = `${command} --version`;
+        callback(error, "", "");
+      },
+    );
+
+    const { command } = resolveManagedLlamaServerPaths(asset);
+    await expect(
+      ensureLlamaServerInstalled({ asset, signal: controller.signal }),
+    ).rejects.toMatchObject({ name: "AbortError" });
+    expect(timeouts).toEqual([120_000]);
+    await expect(fs.stat(command)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await fs.readdir(root)).toEqual([]);
+  });
+
   it.each(["ready", "corrupt-runtime", "missing-runtime", "no-device", "cancelled"] as const)(
     "publishes the complete CUDA installation only after verification: %s",
     async (outcome) => {
@@ -379,13 +524,15 @@ describe("ensureLlamaServerInstalled", () => {
         return { response: new Response(new Uint8Array(payload)), release };
       });
       const validatedFiles: string[][] = [];
+      const commandCalls: Array<{ args: string[]; timeout?: number }> = [];
       mocks.execFile.mockImplementation(
         (
           command: string,
           args: string[],
-          _options: unknown,
+          options: { timeout?: number },
           callback: (error: ExecFileException | null, stdout: string, stderr: string) => void,
         ) => {
+          commandCalls.push({ args, timeout: options.timeout });
           void fs.readdir(path.dirname(command)).then((files) => {
             validatedFiles.push(files);
             const stdout =
@@ -417,6 +564,12 @@ describe("ensureLlamaServerInstalled", () => {
         expect(
           validatedFiles.every((files) => runtime.files.every((file) => files.includes(file))),
         ).toBe(true);
+        expect(commandCalls).toEqual([
+          { args: ["--version"], timeout: 120_000 },
+          { args: ["--list-devices"], timeout: 15_000 },
+          { args: ["--version"], timeout: 15_000 },
+          { args: ["--list-devices"], timeout: 15_000 },
+        ]);
       } else {
         const expected = {
           "corrupt-runtime": /SHA-256 mismatch/u,
@@ -426,6 +579,14 @@ describe("ensureLlamaServerInstalled", () => {
         }[outcome];
         await expect(result).rejects.toThrow(expected);
         await expect(fs.stat(command)).rejects.toMatchObject({ code: "ENOENT" });
+        if (outcome === "no-device") {
+          expect(commandCalls).toEqual([
+            { args: ["--version"], timeout: 120_000 },
+            { args: ["--list-devices"], timeout: 15_000 },
+          ]);
+        } else {
+          expect(commandCalls).toEqual([]);
+        }
       }
       expect((await fs.readdir(root)).every((entry) => !entry.startsWith("."))).toBe(true);
       expect(
@@ -436,6 +597,31 @@ describe("ensureLlamaServerInstalled", () => {
 });
 
 describe("CUDA runtime selection", () => {
+  it("pins the verified archives and extraction limit", () => {
+    const asset = selectLlamaServerAsset("win32", "x64", {
+      kind: "cuda",
+      devices: [{ driverVersion: "551.78", computeCapability: 8.6 }],
+    });
+    const mebibyte = 1024 * 1024;
+
+    expect(asset).toMatchObject({
+      name: "llama-b10809-bin-win-cuda-12.4-x64.zip",
+      sha256: "c77bfcd9ed8d91e8721a2d6a290b907fddd4fa5412a47b21c6fa1709116b85f9",
+      limits: {
+        maxArchiveBytes: 400 * mebibyte,
+        maxExtractedBytes: 600 * mebibyte,
+        maxEntryBytes: 521 * mebibyte,
+      },
+      dependencies: [
+        {
+          name: "cudart-llama-bin-win-cuda-12.4-x64.zip",
+          sha256: "8c79a9b226de4b3cacfd1f83d24f962d0773be79f1e7b75c6af4ded7e32ae1d6",
+          limits: { maxEntries: 3, maxEntryBytes: 521 * mebibyte },
+        },
+      ],
+    });
+  });
+
   it.each([
     ["551.78", 5, true],
     ["580.1", 8.9, true],

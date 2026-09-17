@@ -132,6 +132,7 @@ function sessionResolveCandidate(
     agentId: normalizeAgentId(agentId),
     ...(displayName ? { displayName } : {}),
     ...(entry.boardFace ? { boardFace: entry.boardFace } : {}),
+    ...(entry.boardPresentation ? { boardPresentation: entry.boardPresentation } : {}),
   };
 }
 
@@ -146,16 +147,19 @@ function findVisibleShortIdMatches(params: {
   const entries = filterAndSortSessionEntries({
     cfg: params.cfg,
     store: params.store,
+    entryFilter: (key, entry) => {
+      const uuid = parseAgentSessionKey(key)?.rest.match(SESSION_UUID_SUFFIX_RE)?.[1];
+      return Boolean(
+        uuid?.toLowerCase().replaceAll("-", "").startsWith(params.shortId) &&
+        (params.entryFilter?.(key, entry) ?? true),
+      );
+    },
     now,
     opts: { ...resolveSessionVisibilityFilterOptions(params.p), archived: "all" },
   });
   return entries.flatMap(([key, entry]) => {
-    if (params.entryFilter && !params.entryFilter(key, entry)) {
-      return [];
-    }
     const parsed = parseAgentSessionKey(key);
-    const uuid = parsed?.rest.match(SESSION_UUID_SUFFIX_RE)?.[1];
-    if (!parsed || !uuid?.toLowerCase().replaceAll("-", "").startsWith(params.shortId)) {
+    if (!parsed) {
       return [];
     }
     if (resolveDeletedAgentIdFromSessionKey(params.cfg, key, entry) !== null) {
@@ -277,6 +281,7 @@ export async function resolveSessionKeyFromResolveParams(params: {
       cfg,
       key,
       clone: false,
+      projection: "list",
       ...(requestedAgent.agentId ? { agentId: requestedAgent.agentId } : {}),
     });
     const store = target.store;
@@ -311,7 +316,10 @@ export async function resolveSessionKeyFromResolveParams(params: {
         { agentId: string; entry: SessionEntry; key: string }
       >();
       for (const agentId of listAgentIds(cfg)) {
-        const loaded = loadCombinedSessionStoreForGatewayCore(cfg, { agentId });
+        const loaded = loadCombinedSessionStoreForGatewayCore(cfg, {
+          agentId,
+          projection: "list",
+        });
         const agentMatches = findVisibleSessionIdMatches({
           cfg,
           store: loaded.store,
@@ -370,7 +378,10 @@ export async function resolveSessionKeyFromResolveParams(params: {
         );
       }
     }
-    const { store } = loadCombinedSessionStoreForGatewayCore(cfg, { agentId: p.agentId });
+    const { store } = loadCombinedSessionStoreForGatewayCore(cfg, {
+      agentId: p.agentId,
+      projection: "list",
+    });
     const matches = findVisibleSessionIdMatches({ cfg, store, p, sessionId, entryFilter });
     const selection = resolveSessionIdMatchSelection(matches, sessionId);
     if (selection.kind === "none") {
@@ -454,6 +465,7 @@ export async function resolveSessionKeyFromResolveParams(params: {
 
   const { store, targetsBySessionKey } = loadCombinedSessionStoreForGatewayCore(cfg, {
     agentId: p.agentId,
+    projection: "list",
   });
   const now = Date.now();
   // Keep list-discovery snapshot semantics without hydrating display rows.

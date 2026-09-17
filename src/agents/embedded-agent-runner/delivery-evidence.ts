@@ -20,6 +20,7 @@ export type AgentDeliveryEvidence = {
   payloadsTruncated?: unknown;
   deliveryStatus?: {
     status?: unknown;
+    resultCount?: unknown;
     errorMessage?: unknown;
     reason?: unknown;
     payloadOutcomes?: unknown;
@@ -36,8 +37,13 @@ export type AgentDeliveryEvidence = {
   /** Durable recovery evidence sets this when its bounded target projection omitted entries. */
   messagingToolSentTargetsTruncated?: unknown;
   acceptedSessionSpawns?: unknown;
+  requesterContinuationSettled?: unknown;
   successfulCronAdds?: unknown;
   meta?: {
+    yielded?: unknown;
+    error?: unknown;
+    aborted?: unknown;
+    finalAssistantVisibleText?: unknown;
     toolSummary?: {
       calls?: unknown;
     };

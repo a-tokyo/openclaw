@@ -1,4 +1,3 @@
-import { asOptionalRecord } from "@openclaw/normalization-core/record-coerce";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { ErrorCodes, type AgentWaitParams } from "../../../packages/gateway-protocol/src/index.js";
 import { MAIN_SESSION_RECOVERY_WORK_ADMISSION_OWNER } from "../../agents/main-session-recovery/main-session-recovery-admission.js";
@@ -25,7 +24,7 @@ import { prepareSkillLibrarySessionCreation } from "../skill-library-session.js"
 import { createAgentAdmissionController } from "./agent-admission-controller.js";
 import { prepareAgentContentPhase } from "./agent-content-phase.js";
 import { createAgentDedupeLifecycle } from "./agent-dedupe-lifecycle.js";
-import { isAcceptedAgentDedupePayload, readGatewayDedupeEntry } from "./agent-dedupe.js";
+import { replayAgentTurnIfCached } from "./agent-dedupe.js";
 import { resolveAgentDeliveryPhase } from "./agent-delivery-phase.js";
 import type { RestoredCronContinuation } from "./agent-handler-helpers.js";
 import { waitForAgentJob } from "./agent-job.js";
@@ -37,6 +36,7 @@ import { persistAgentSessionPhase } from "./agent-session-persist.js";
 import type { AgentTurnIo, AgentTurnPrincipal } from "./types.js";
 
 type AgentTurnStartRequest = {
+  privateCompletion?: true;
   assertAdmissionCurrent?: () => void;
   preflight: AgentRequestPreflight;
   principal: AgentTurnPrincipal | null;
@@ -44,51 +44,12 @@ type AgentTurnStartRequest = {
   onRunObserved?: (runId: string) => void;
 };
 
-function replayAgentTurnIfCached(params: {
-  preflight: AgentRequestPreflight;
-  context: GatewayRequestHandlerOptions["context"];
-  io: AgentTurnIo;
-}): boolean {
-  const { agentDedupeKeys, runId } = params.preflight;
-  const cached = readGatewayDedupeEntry({
-    dedupe: params.context.dedupe,
-    keys: agentDedupeKeys,
-  });
-  if (!cached) {
-    return false;
-  }
-  if (cached.ok && isAcceptedAgentDedupePayload(cached.payload)) {
-    const cachedRunId = normalizeOptionalString(cached.payload.runId) ?? runId;
-    const cachedSessionKey = normalizeOptionalString(cached.payload.sessionKey);
-    const cachedAgentId = normalizeOptionalString(cached.payload.agentId);
-    const cachedRuntime = asOptionalRecord(cached.payload.runtime);
-    const admissionPending = typeof cached.payload.reservationId === "string";
-    params.io.emitAcceptance(
-      [
-        true,
-        {
-          runId: cachedRunId,
-          status: "in_flight" as const,
-          ...(cachedSessionKey ? { sessionKey: cachedSessionKey } : {}),
-          ...(cachedAgentId ? { agentId: cachedAgentId } : {}),
-          ...(cachedRuntime ? { runtime: cachedRuntime } : {}),
-          ...(admissionPending ? { admissionPending: true } : {}),
-        },
-        undefined,
-      ],
-      { cached: true, runId: cachedRunId },
-    );
-  } else {
-    params.io.emitAcceptance([cached.ok, cached.payload, cached.error], { cached: true });
-  }
-  return true;
-}
-
 export function createAgentTurnService(
   { context, isWebchatConnect }: Pick<GatewayRequestHandlerOptions, "context" | "isWebchatConnect">,
   assertContextCurrent?: () => void,
 ) {
   const startTurn = async ({
+    privateCompletion,
     assertAdmissionCurrent,
     preflight,
     principal,
@@ -97,7 +58,7 @@ export function createAgentTurnService(
   }: AgentTurnStartRequest): Promise<void> => {
     const promptedAt = Date.now();
     assertAdmissionCurrent?.();
-    if (replayAgentTurnIfCached({ preflight, context, io })) {
+    if (replayAgentTurnIfCached({ preflight, context, io, acceptedOnly: privateCompletion })) {
       return;
     }
     const respond: RespondFn = (ok, payload, error, meta) =>
@@ -136,6 +97,8 @@ export function createAgentTurnService(
     const ownerDeviceId =
       typeof principal?.connect?.device?.id === "string" ? principal.connect.device.id : undefined;
     const dedupeLifecycle = createAgentDedupeLifecycle({
+      privateCompletion,
+      inputProvenance,
       cfg,
       request,
       runId,
@@ -560,6 +523,7 @@ export function createAgentTurnService(
           preparedOffloadedRefs = [];
         },
         requestedPromptPersistenceSuppression,
+        privateCompletion,
         runId,
         agentDedupeKeys,
         context,

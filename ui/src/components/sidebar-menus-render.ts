@@ -1,7 +1,9 @@
 import { html, nothing } from "lit";
 import { keyed } from "lit/directives/keyed.js";
 import { DEFAULT_SIDEBAR_ENTRIES, serializeSidebarEntry } from "../app-navigation.ts";
+import { pathForRoute } from "../app-route-paths.ts";
 import { isMobileNavLayout } from "../app/mobile-nav-layout.ts";
+import { patchSettings } from "../app/settings.ts";
 import { isUpdateActionable } from "../app/update-schedule-projection.ts";
 import { readPresenceEntries, resolveCurrentSelfUser } from "../app/user-profile.ts";
 import { t } from "../i18n/index.ts";
@@ -22,6 +24,7 @@ import {
   runSessionNavigationAction,
 } from "../lib/sessions/session-menu-navigation.ts";
 import { showToast } from "../lib/toast.ts";
+import { SETTINGS_ROUTE_TARGETS } from "../pages/config/route-data.ts";
 import {
   pluginSessionMenuActions,
   runControlUiPluginAction,
@@ -109,7 +112,19 @@ export function renderSidebarAgentMenuForController(controller: SidebarMenusCont
     agents,
     identities,
     pinnedAgentIds: host.pinnedAgentIds,
+    rosterMode: host.sidebarAgentsMode === "roster",
+    onToggleRoster: () => {
+      host.sidebarAgentsMode = host.sidebarAgentsMode === "roster" ? "chip" : "roster";
+      patchSettings({ sidebarAgentsMode: host.sidebarAgentsMode });
+      void host.updateComplete.then(() => {
+        host
+          .querySelector<HTMLElement>(".sidebar-workspace-header__main, .sidebar-agent-card__main")
+          ?.focus();
+      });
+    },
     connected: host.connected,
+    resolveAvatarUrl: (url) => controller.agentMenuAvatars.resolve(url),
+    avatarErrorHandler: (url) => controller.agentMenuAvatars.imageErrorHandler(url),
     openMode: controller.agentMenuInteractionState === "open-hover" ? "hover" : "click",
     agentUnreadCount: (agentId) => host.agentUnreadCount(agentId),
     onPointerEnter: () => controller.handleAgentMenuPointerEnter(),
@@ -255,8 +270,10 @@ export function renderSidebarSessionMenuForController(controller: SidebarMenusCo
           sessionId: session.sessionId ?? null,
           isChild: session.isChild,
           pinned: session.pinned,
+          pinnable: session.pinnable,
           unread: batchRows ? allUnread : session.unread,
           archived: allArchived,
+          archiving: rows.some((row) => context?.sessions.archiveVisibility(row.key) === "pending"),
           category: batchRows ? sharedCategory : (session.category ?? null),
           icon: batchRows ? null : (session.icon ?? null),
           color: batchRows ? null : (session.color ?? null),
@@ -306,6 +323,7 @@ export function renderSidebarSessionMenuForController(controller: SidebarMenusCo
               break;
             case "copy-session-id":
             case "copy-session-link":
+            case "copy-session-preview-link":
             case "copy-markdown":
             case "open-new-tab":
             case "open-new-window":
@@ -472,17 +490,23 @@ export function renderSidebarSessionSortMenuForController(controller: SidebarMen
   if (!position) {
     return nothing;
   }
+  const sessionSources = SETTINGS_ROUTE_TARGETS.sessionSources;
   return renderSidebarSessionSortMenu({
     position,
     trigger: controller.sessionSortMenuTrigger,
+    sessionSourcesHref:
+      pathForRoute(sessionSources.routeId, host.basePath) +
+      sessionSources.search +
+      sessionSources.hash,
     grouping: host.effectiveSessionsGrouping(),
+    rosterMode: host.sidebarAgentsMode === "roster",
     sortMode: host.effectiveSessionSortMode(),
     peopleSortAvailable: host.sessionPeopleSortAvailable(),
     statusFilter: host.sessionsStatusFilter,
     showCron: host.sessionsShowCron,
     showPreview: host.sessionsShowPreview,
     showSystem: host.sessionsShowSystem,
-    hideEmptyGroups: host.sessionsHideEmptyGroups,
+    emptyGroupsMode: host.sessionsEmptyGroupsMode,
     owners: host.sessionOwnershipVisible ? host.sessionOwnerOptions : [],
     ownerFilterId: host.sessionOwnerFilterActive ? host.sessionOwnerFilterId : null,
     involvingMe: host.sessionInvolvingMeFilterActive,
@@ -518,9 +542,19 @@ export function renderSidebarSessionSortMenuForController(controller: SidebarMen
       host.sessionOrganizer.setSessionsShowSystem(show);
       controller.closeSessionSortMenu({ restoreFocus: true });
     },
-    onHideEmptyGroupsChange: (hide) => {
-      host.sessionOrganizer.setSessionsHideEmptyGroups(hide);
+    onEmptyGroupsModeChange: (mode) => {
+      if (controller.sessionSortMenuPosition !== position) {
+        return;
+      }
+      host.setSessionsEmptyGroupsMode(mode);
       controller.closeSessionSortMenu({ restoreFocus: true });
+    },
+    onOpenSessionSources: () => {
+      controller.closeSessionSortMenu();
+      host.onNavigate?.(sessionSources.routeId, {
+        search: sessionSources.search,
+        hash: sessionSources.hash,
+      });
     },
     onClose: (restoreFocus) => {
       if (controller.sessionSortMenuPosition !== position) {

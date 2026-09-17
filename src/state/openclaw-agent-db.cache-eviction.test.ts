@@ -6,26 +6,28 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vites
 import { requireNodeSqlite } from "../infra/node-sqlite.js";
 import { createDeferredCore } from "../shared/deferred.js";
 import { releaseOpenClawAgentDatabaseLease } from "./openclaw-agent-db-lease.js";
+import { retainOpenClawAgentDatabaseReadOnly } from "./openclaw-agent-db-readonly.js";
 import {
   borrowOpenClawAgentDatabase,
   closeOpenClawAgentDatabaseByPath,
   closeOpenClawAgentDatabasesForTest,
   disposeOpenClawAgentDatabaseByPath,
   isOpenClawAgentDatabaseOpen,
-  listOpenClawAgentDatabasesForTest,
   listOpenClawRegisteredAgentDatabases,
-  OPENCLAW_AGENT_DB_OPEN_HANDLE_CAP,
   openOpenClawAgentDatabase,
   runOpenClawAgentWriteTransaction,
   withOpenClawAgentDatabaseAsync,
 } from "./openclaw-agent-db.js";
+import { listOpenClawAgentDatabasesForTest } from "./openclaw-agent-db.test-support.js";
 import {
   closeOpenClawStateDatabaseForTest,
   openOpenClawStateDatabase,
 } from "./openclaw-state-db.js";
 
+const EXPECTED_OPEN_HANDLE_CAP = 64;
+
 const BASE_AGENT_IDS = Array.from(
-  { length: OPENCLAW_AGENT_DB_OPEN_HANDLE_CAP },
+  { length: EXPECTED_OPEN_HANDLE_CAP },
   (_, index) => `fixture-${index}`,
 );
 const BASE_AGENT_ID_SET = new Set(BASE_AGENT_IDS);
@@ -97,7 +99,7 @@ describe("openclaw agent database handle cache", () => {
       ),
     );
     expect(opened.every((database) => database.db.isOpen)).toBe(true);
-    expect(listOpenClawAgentDatabasesForTest()).toHaveLength(OPENCLAW_AGENT_DB_OPEN_HANDLE_CAP);
+    expect(listOpenClawAgentDatabasesForTest()).toHaveLength(EXPECTED_OPEN_HANDLE_CAP);
   });
 
   it("retains concurrent admissions through adoption and the transaction's borrower handoff", async () => {
@@ -132,9 +134,7 @@ describe("openclaw agent database handle cache", () => {
       proceed.resolve();
       const databases = await finished;
       expect(databases.every((database) => database.db.isOpen)).toBe(true);
-      expect(listOpenClawAgentDatabasesForTest()).toHaveLength(
-        OPENCLAW_AGENT_DB_OPEN_HANDLE_CAP + 2,
-      );
+      expect(listOpenClawAgentDatabasesForTest()).toHaveLength(EXPECTED_OPEN_HANDLE_CAP + 2);
       for (const borrowed of transferred) {
         borrowed.release();
       }
@@ -212,7 +212,7 @@ describe("openclaw agent database handle cache", () => {
     const leastRecentlyUsed = databases[0]!;
 
     expect(databases.filter((database) => database.db.isOpen)).toHaveLength(
-      OPENCLAW_AGENT_DB_OPEN_HANDLE_CAP,
+      EXPECTED_OPEN_HANDLE_CAP,
     );
     expect(isOpenClawAgentDatabaseOpen(leastRecentlyUsed.path)).toBe(false);
     expect(leastRecentlyUsed.db.isOpen).toBe(false);
@@ -280,6 +280,27 @@ describe("openclaw agent database handle cache", () => {
     }
   });
 
+  it("pins a completion's exact database until its claim is released", () => {
+    const env = requireFixtureEnv();
+    const first = baseDatabases[0]!;
+    const retained = retainOpenClawAgentDatabaseReadOnly({ agentId: first.agentId, env });
+    if (!retained.found) {
+      throw new Error("expected the cached database");
+    }
+    const { claim } = retained;
+    try {
+      evictAfterRefreshingBaseHandles("completion-pinned", env);
+      expect(claim.isCurrent()).toBe(true);
+      expect(first.db.isOpen).toBe(true);
+      claim.release();
+      evictAfterRefreshingBaseHandles("completion-released", env);
+      expect(first.db.isOpen).toBe(false);
+      expect(claim.isCurrent()).toBe(false);
+    } finally {
+      claim.release();
+    }
+  });
+
   it("retries lease cleanup for a closed retained handle before evicting unrelated agents", () => {
     const env = requireFixtureEnv();
     const first = baseDatabases[0]!;
@@ -293,7 +314,7 @@ describe("openclaw agent database handle cache", () => {
       state.exec("DROP TRIGGER fail_agent_lease_release");
 
       evictAfterRefreshingBaseHandles("lease-recovery", env);
-      expect(listOpenClawAgentDatabasesForTest()).toHaveLength(OPENCLAW_AGENT_DB_OPEN_HANDLE_CAP);
+      expect(listOpenClawAgentDatabasesForTest()).toHaveLength(EXPECTED_OPEN_HANDLE_CAP);
       expect(
         state
           .prepare("SELECT lease_id FROM agent_database_leases WHERE agent_id = ?")

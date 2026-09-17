@@ -422,7 +422,7 @@ async function registerDeliveredSignalApprovalPayloadForReactions(
   });
   const { registerSignalApprovalReactionTargetForDeliveredPayload } =
     await loadSignalApprovalReactionsModule();
-  registerSignalApprovalReactionTargetForDeliveredPayload({
+  await registerSignalApprovalReactionTargetForDeliveredPayload({
     cfg: params.cfg,
     target: { ...params.target, accountId: account.accountId },
     payload: params.payload,
@@ -616,11 +616,12 @@ export const signalPlugin: ChannelPlugin<ResolvedSignalAccount, SignalProbe> =
         idLabel: "signalNumber",
         message: PAIRING_APPROVED_MESSAGE,
         normalizeAllowEntry: createPairingPrefixStripper(/^signal:/i),
-        notify: async ({ cfg, id, message }) => {
+        notify: async ({ cfg, id, message, accountId }) => {
           await (
             await loadSignalSendRuntime()
           ).sendMessageSignal(id, message, {
             cfg,
+            accountId,
           });
         },
       },

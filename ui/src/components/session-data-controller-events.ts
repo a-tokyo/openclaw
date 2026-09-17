@@ -3,6 +3,7 @@ import type { RouteId } from "../app-route-paths.ts";
 import type { ApplicationContext } from "../app/context.ts";
 import { readPresenceEntries, type PresencePayload } from "../app/user-profile.ts";
 import type { AgentCapability } from "../lib/agents/index.ts";
+import { CATALOG_SESSION_CONTINUED_EVENT } from "../lib/sessions/catalog-key.ts";
 import type {
   SessionCapability,
   SessionListOptions,
@@ -13,6 +14,19 @@ import type {
   SidebarSessionOwnerFilter,
   SidebarSessionStatusFilter,
 } from "./app-sidebar-session-types.ts";
+
+// Chat panes announce catalog adoptions so rows bind immediately.
+export function subscribeSessionCatalogBrowserEvents(
+  onContinued: EventListener,
+  onPageActivation: EventListener,
+): () => void {
+  document.addEventListener(CATALOG_SESSION_CONTINUED_EVENT, onContinued);
+  document.addEventListener("visibilitychange", onPageActivation);
+  return () => {
+    document.removeEventListener(CATALOG_SESSION_CONTINUED_EVENT, onContinued);
+    document.removeEventListener("visibilitychange", onPageActivation);
+  };
+}
 
 type SidebarSessionListOwner = {
   readonly context: ApplicationContext<RouteId> | undefined;
@@ -143,6 +157,33 @@ export function subscribeFilteredSidebarSessions(
   };
 }
 
+export function scheduleFilteredSidebarSessions(
+  owner: Pick<SidebarSessionListOwner, "context"> & {
+    readonly isSessionDataHostConnected: boolean;
+    refreshSidebarSessions(): Promise<void>;
+  },
+  readSubscription: () => (() => void) | null,
+): Promise<void> {
+  const context = owner.context;
+  const subscription = readSubscription();
+  if (!context || !subscription) {
+    return Promise.resolve();
+  }
+  return context.connectionBootstrap.run(
+    subscription,
+    async () => {
+      if (
+        owner.context === context &&
+        readSubscription() === subscription &&
+        owner.isSessionDataHostConnected
+      ) {
+        await owner.refreshSidebarSessions();
+      }
+    },
+    { background: true },
+  );
+}
+
 export function refreshSidebarSessionList(
   owner: SidebarSessionListOwner,
   agentId: string | null,
@@ -172,7 +213,7 @@ export function refreshSidebarSessionList(
 type SessionGatewayEventOwner = {
   presencePayload: PresencePayload | undefined;
   handleSessionCatalogHostEvent(payload: unknown): void;
-  handleSessionCatalogPresence(payload: unknown): void;
+  handleSessionCatalogChanged(payload: unknown): void;
   requestSessionDataUpdate(): void;
 };
 
@@ -185,11 +226,14 @@ export function subscribeSessionDataGatewayEvents(
       owner.handleSessionCatalogHostEvent(event.payload);
       return;
     }
+    if (event.event === "sessions.catalog.changed") {
+      owner.handleSessionCatalogChanged(event.payload);
+      return;
+    }
     if (event.event === "presence") {
       const presence = readPresenceEntries(event.payload);
       owner.presencePayload = presence ? { presence } : undefined;
       owner.requestSessionDataUpdate();
-      owner.handleSessionCatalogPresence(event.payload);
     }
   });
 }

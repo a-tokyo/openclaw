@@ -1,5 +1,5 @@
-import { isSettingsNavigationRoute } from "../app-navigation.ts";
-import { isSessionRouteId, routeIdFromPath, type RouteId } from "../app-route-paths.ts";
+import { isSettingsTakeover } from "../app-navigation.ts";
+import { isSessionRouteId, routeIdFromPath } from "../app-route-paths.ts";
 import {
   applyCommandPaletteTargetEvent,
   COMMAND_PALETTE_OPEN_EVENT,
@@ -23,17 +23,24 @@ import {
 } from "../components/panel-toggle-contract.ts";
 import { focusWithoutTooltip } from "../components/tooltip.ts";
 import type { BoardFace } from "../lib/board/settings.ts";
+import { canCallGatewayMethod } from "../lib/gateway-methods.ts";
 import {
   KEYBOARD_SHORTCUT_COMBOS,
   matchesShortcutCombo,
 } from "../lib/keyboard-shortcut-contract.ts";
 import { readSessionMethodAccess } from "../lib/session-method-access.ts";
 import { isTerminalAvailable } from "../lib/terminal-availability.ts";
+import {
+  readDebugOverlayMode,
+  shouldCloseDebugOverlay,
+  type DebugOverlayElement,
+  type DebugOverlayMode,
+} from "../pages/debug/debug-overlay-frame.ts";
 import { ShellPanelOwner, type ShellPanelHost } from "./app-shell-panels.ts";
 import type { ApplicationNavigationOptions } from "./context.ts";
 import {
-  DEBUG_OVERLAY_ELEMENT,
   isOptionalElementDefined,
+  DEBUG_OVERLAY_ELEMENT,
   KEYBOARD_SHORTCUTS_ELEMENT,
   type OptionalCustomElement,
 } from "./lazy-custom-element.ts";
@@ -63,20 +70,12 @@ import { isHomePanelAvailable } from "./panel-availability.ts";
 import { NAV_WIDTH_MAX, NAV_WIDTH_MIN } from "./settings.ts";
 import { retryStaleChunkReloadWhenReachable } from "./stale-chunk-reload.ts";
 
-type DebugOverlayElement = HTMLElement & {
-  toggle: () => void;
-};
-
 type KeyboardShortcutsDialogElement = HTMLElement & {
   isOpen: boolean;
   toggle: () => void;
 };
 
 let nativeCommandsOwner: AbortController | undefined;
-
-function isSettingsTakeover(routeId: RouteId | undefined): boolean {
-  return routeId !== undefined && isSettingsNavigationRoute(routeId);
-}
 
 export interface ShellChromeHost extends HTMLElement, ShellPanelHost {
   readonly activeSessionKey: string;
@@ -146,8 +145,8 @@ export class ShellChromeOwner {
       [TERMINAL_PANEL_TOGGLE_EVENT, this.panels.handleDeferredTerminalToggle],
       [BROWSER_PANEL_TOGGLE_EVENT, this.panels.handleDeferredBrowserToggle],
       [DESKTOP_PANEL_TOGGLE_EVENT, this.panels.handleDeferredDesktopToggle],
-      [CUSTODIAN_PANEL_TOGGLE_EVENT, this.panels.handleDeferredAssistantToggle],
-      [HOME_PANEL_TOGGLE_EVENT, this.panels.handleDeferredAssistantToggle],
+      [CUSTODIAN_PANEL_TOGGLE_EVENT, this.handleAssistantToggleBeforeMount],
+      [HOME_PANEL_TOGGLE_EVENT, this.handleAssistantToggleBeforeMount],
       [SHELL_APPROVALS_OPEN_EVENT, this.handleApprovalsOpen],
     ] as const) {
       window.addEventListener(type, listener, options);
@@ -389,6 +388,18 @@ export class ShellChromeOwner {
 
   readonly handleDocumentKeydown = (event: KeyboardEvent): void => {
     const host = this.host;
+    if (
+      host.lazyCustomElements.visibleState?.element === DEBUG_OVERLAY_ELEMENT &&
+      shouldCloseDebugOverlay(
+        event,
+        this.pendingDebugOverlayMode,
+        host.querySelector(".debug-overlay"),
+      )
+    ) {
+      event.preventDefault();
+      host.lazyCustomElements.close();
+      return;
+    }
     if (document.openClawModalLayers?.size) {
       return;
     }
@@ -469,18 +480,89 @@ export class ShellChromeOwner {
     }
   };
 
+  get pendingDebugOverlayMode(): DebugOverlayMode {
+    return readDebugOverlayMode(this.pendingLazyAction);
+  }
+
+  togglePendingDebugOverlayMode(): void {
+    const event = this.pendingLazyAction;
+    if (
+      event?.eventType !== DEBUG_OVERLAY_REQUEST_EVENT ||
+      this.host.lazyCustomElements.visibleState?.element !== DEBUG_OVERLAY_ELEMENT
+    ) {
+      return;
+    }
+    event.detail = {
+      mode: this.pendingDebugOverlayMode === "minimized" ? "expanded" : "minimized",
+    };
+    persistLazyShellAction(event);
+    this.host.requestUpdate();
+  }
+
   private readonly handleDebugOverlayRequest = (event: Event): void => {
     const host = this.host;
     if (host.navDrawerOpen && isMobileNavLayout()) {
       host.closeNavDrawer({ restoreFocus: false });
     }
-    const descriptor = lazyShellEvent(DEBUG_OVERLAY_REQUEST_EVENT, event);
-    if (isOptionalElementDefined(DEBUG_OVERLAY_ELEMENT)) {
-      host.querySelector<DebugOverlayElement>(DEBUG_OVERLAY_ELEMENT.tagName)?.toggle();
-      this.clearPendingLazyAction(descriptor);
+    if (host.lazyCustomElements.visibleState?.element === DEBUG_OVERLAY_ELEMENT) {
+      if (this.pendingDebugOverlayMode === "minimized") {
+        this.togglePendingDebugOverlayMode();
+      } else {
+        host.lazyCustomElements.close();
+      }
       return;
     }
-    this.requestLazyElement(DEBUG_OVERLAY_ELEMENT, descriptor);
+    const descriptor = lazyShellEvent(DEBUG_OVERLAY_REQUEST_EVENT, event);
+    const overlay = isOptionalElementDefined(DEBUG_OVERLAY_ELEMENT)
+      ? host.querySelector<DebugOverlayElement>(DEBUG_OVERLAY_ELEMENT.tagName)
+      : null;
+    if (overlay) {
+      this.clearPendingLazyAction(descriptor);
+      if (descriptor.detail && "mode" in descriptor.detail) {
+        overlay.open(readDebugOverlayMode(descriptor));
+      } else {
+        overlay.toggle();
+      }
+      return;
+    }
+    this.requestLazyElement(DEBUG_OVERLAY_ELEMENT, descriptor, () => {
+      if (this.pendingLazyAction !== descriptor) {
+        return;
+      }
+      const mounted = host.querySelector<DebugOverlayElement>(DEBUG_OVERLAY_ELEMENT.tagName);
+      if (!mounted) {
+        return;
+      }
+      const mode = this.pendingDebugOverlayMode;
+      // Opening starts inner-content recovery. Retire only the outer intent first,
+      // or the shell would erase the new reload action recorded by the overlay.
+      this.clearPendingLazyAction(descriptor);
+      mounted.open(mode);
+    });
+  };
+
+  private readonly handleAssistantToggleBeforeMount = (event: Event): void => {
+    const host = this.host;
+    if (host.querySelector("openclaw-assistant-panel")) {
+      return;
+    }
+    const home = event.type === HOME_PANEL_TOGGLE_EVENT;
+    if (
+      home
+        ? !isHomePanelAvailable(host.context?.gateway)
+        : !canCallGatewayMethod(host.context?.gateway.snapshot, "openclaw.chat", "operator.admin")
+    ) {
+      event.preventDefault();
+      return;
+    }
+    // Native commands can arrive before the eager frame's first render.
+    const descriptor = lazyShellEvent(
+      home ? HOME_PANEL_TOGGLE_EVENT : CUSTODIAN_PANEL_TOGGLE_EVENT,
+      event,
+    );
+    this.pendingLazyAction = descriptor;
+    persistLazyShellAction(descriptor);
+    host.requestUpdate();
   };
 
   private readonly handleKeyboardShortcutsRequest = (event: Event): void => {
@@ -495,8 +577,8 @@ export class ShellChromeOwner {
     this.requestLazyElement(KEYBOARD_SHORTCUTS_ELEMENT, descriptor);
   };
 
-  // Open controls own Escape. Slotted options hide their listbox in shadow DOM,
-  // so recognize the open select host before Settings can consume the key.
+  // Open controls own Escape. Slotted items hide their menu/listbox in shadow DOM,
+  // so recognize the open control host before Settings can consume the key.
   shouldIgnoreSettingsEscape(event: KeyboardEvent): boolean {
     const host = this.host;
     const overlaySnapshot = host.context?.overlays.snapshot;
@@ -514,7 +596,7 @@ export class ShellChromeOwner {
     return (
       target instanceof Element &&
       target.closest(
-        "input, textarea, select, wa-select[open], [contenteditable], dialog, [role='dialog'], [role='menu'], [role='listbox']",
+        "input, textarea, select, wa-select[open], wa-dropdown[open], [contenteditable], dialog, [role='dialog'], [role='menu'], [role='listbox']",
       ) !== null
     );
   }
@@ -561,18 +643,18 @@ export class ShellChromeOwner {
     this.requestLazyElement(host.execApprovalElement, descriptor);
   };
 
-  private lazyElementForShellEvent(eventType: LazyShellEvent["eventType"]): OptionalCustomElement {
+  private shellEventElementTag(eventType: LazyShellEvent["eventType"]): string {
     const host = this.host;
-    const elements: Record<LazyShellEvent["eventType"], OptionalCustomElement> = {
-      [COMMAND_PALETTE_OPEN_EVENT]: host.commandPaletteElement,
-      [DEBUG_OVERLAY_REQUEST_EVENT]: DEBUG_OVERLAY_ELEMENT,
-      [KEYBOARD_SHORTCUTS_REQUEST_EVENT]: KEYBOARD_SHORTCUTS_ELEMENT,
-      [TERMINAL_PANEL_TOGGLE_EVENT]: host.terminalPanelElement,
-      [BROWSER_PANEL_TOGGLE_EVENT]: host.browserPanelElement,
-      [DESKTOP_PANEL_TOGGLE_EVENT]: host.desktopPanelElement,
-      [CUSTODIAN_PANEL_TOGGLE_EVENT]: host.assistantPanelElement,
-      [HOME_PANEL_TOGGLE_EVENT]: host.assistantPanelElement,
-      [SHELL_APPROVALS_OPEN_EVENT]: host.execApprovalElement,
+    const elements: Record<LazyShellEvent["eventType"], string> = {
+      [COMMAND_PALETTE_OPEN_EVENT]: host.commandPaletteElement.tagName,
+      [DEBUG_OVERLAY_REQUEST_EVENT]: DEBUG_OVERLAY_ELEMENT.tagName,
+      [KEYBOARD_SHORTCUTS_REQUEST_EVENT]: KEYBOARD_SHORTCUTS_ELEMENT.tagName,
+      [TERMINAL_PANEL_TOGGLE_EVENT]: host.terminalPanelElement.tagName,
+      [BROWSER_PANEL_TOGGLE_EVENT]: host.browserPanelElement.tagName,
+      [DESKTOP_PANEL_TOGGLE_EVENT]: host.desktopPanelElement.tagName,
+      [CUSTODIAN_PANEL_TOGGLE_EVENT]: "openclaw-assistant-panel",
+      [HOME_PANEL_TOGGLE_EVENT]: "openclaw-assistant-panel",
+      [SHELL_APPROVALS_OPEN_EVENT]: host.execApprovalElement.tagName,
     };
     return elements[eventType];
   }
@@ -582,8 +664,8 @@ export class ShellChromeOwner {
     if (!event || this.host.lazyCustomElements.visibleState) {
       return;
     }
-    const element = this.lazyElementForShellEvent(event.eventType);
-    if (isOptionalElementDefined(element) && !this.host.querySelector(element.tagName)) {
+    const tagName = this.shellEventElementTag(event.eventType);
+    if (customElements.get(tagName) && !this.host.querySelector(tagName)) {
       // Loaded but render-gated (e.g. the shell is still booting): nothing can
       // consume the dispatch yet, and re-dispatching re-arms a request/update
       // cycle whose microtasks starve the boot (Gateway socket included).

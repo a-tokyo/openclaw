@@ -5,7 +5,6 @@ import { normalizeOptionalString } from "@openclaw/normalization-core/string-coe
 import { resolveStateDir } from "../config/paths.js";
 import { createAbortError } from "../infra/abort-signal.js";
 import {
-  type ExecHost,
   loadExecApprovals,
   maxAsk,
   minSecurity,
@@ -29,6 +28,7 @@ import {
 import type { SecretStoreExecEnvironment } from "../secrets/store/secret-store.js";
 import { createDeferredCore } from "../shared/deferred.js";
 import { normalizeDeliveryContext } from "../utils/delivery-context.shared.js";
+import { captureAgentToolSourceExecutionGuard } from "./agent-tool-source-execution-guard.js";
 import { markBackgrounded } from "./bash-process-registry.js";
 import { describeExecTool } from "./bash-tools.descriptions.js";
 import { processGatewayAllowlist } from "./bash-tools.exec-host-gateway.js";
@@ -46,7 +46,6 @@ import {
   DEFAULT_PENDING_MAX_OUTPUT,
   ExecProcessPreflightError,
   type ExecProcessHandle,
-  type ExecProcessOutcome,
   normalizePathPrepend,
   resolveExecTarget,
   resolveApprovalRunningNoticeMs,
@@ -62,14 +61,11 @@ import {
   attachExecApprovalReview,
   buildExecForegroundResult,
   createExecHostResolver,
+  createExecProcessSettlement,
   resolveExecElevatedMode,
   resolveExecReviewerDefaults,
 } from "./bash-tools.exec-support.js";
-import {
-  type BackgroundExecTaskHandle,
-  createBackgroundExecTask,
-  finalizeBackgroundExecTask,
-} from "./bash-tools.exec-task-tracking.js";
+import { createBackgroundExecTask } from "./bash-tools.exec-task-tracking.js";
 import type {
   ExecToolApprovalReview,
   ExecToolDefaults,
@@ -77,6 +73,11 @@ import type {
 } from "./bash-tools.exec-types.js";
 import { formatUnavailableWorkdirFailure, resolveExecWorkdir } from "./bash-tools.exec-workdir.js";
 import { clampWithDefault, readEnvInt, truncateMiddle } from "./bash-tools.shared.js";
+import {
+  createExecToolExecutionTimeoutResolver,
+  resolveExecDefaultTimeoutSec,
+} from "./exec-tool-timeout.js";
+import { resolveStoredSubagentCapabilities } from "./subagents/spawn/subagent-capabilities.js";
 import { EXEC_TOOL_DISPLAY_SUMMARY } from "./tool-description-presets.js";
 import type { AgentToolWithMeta } from "./tools/common.js";
 import { withoutGatewayToolCallerIdentity } from "./tools/gateway-caller-context.js";
@@ -86,28 +87,17 @@ type GatewayApprovalResult = Awaited<ReturnType<typeof processGatewayAllowlist>>
 const BACKGROUND_EXEC_FOLLOW_UP =
   "Use process (list/poll/log/write/send-keys/submit/paste/kill/clear/remove) for follow-up.";
 
-function createExecProcessSettlement() {
-  const settlement: {
-    outcome: ExecProcessOutcome | null;
-    backgroundTask: BackgroundExecTaskHandle | null;
-    settle: (outcome: ExecProcessOutcome) => void;
-  } = {
-    outcome: null,
-    backgroundTask: null,
-    settle(outcome: ExecProcessOutcome) {
-      settlement.outcome = outcome;
-      finalizeBackgroundExecTask({ handle: settlement.backgroundTask, outcome });
-    },
-  };
-  return settlement;
-}
-
 /** Creates an exec tool instance with runtime defaults and approval policy wiring. */
 export function createExecTool(
   defaults?: ExecToolDefaults,
 ): AgentToolWithMeta<typeof execSchema, ExecToolDetails> {
   const secretEgressEnabled = isSecretEgressProxyActive();
+  const cleanupMs = defaults?.cleanupMs;
   const preparedRunEnvironment = resolveExecPreparedRunEnvironment(defaults);
+  const subagentExecution =
+    resolveStoredSubagentCapabilities(defaults?.runSessionKey ?? defaults?.sessionKey, {
+      cfg: defaults?.config,
+    }).depth > 0;
   // Agent runs own one tool instance, so the store is read on first exec and reused for that run.
   // A new run constructs a new instance and observes later store mutations.
   let storeEnvPromise: Promise<SecretStoreExecEnvironment>;
@@ -126,8 +116,7 @@ export function createExecTool(
   );
   const allowBackground =
     defaults?.processToolAvailabilityRef?.value ?? defaults?.allowBackground ?? true;
-  const defaultTimeoutSec =
-    defaults?.timeoutSec && defaults.timeoutSec > 0 ? defaults.timeoutSec : 1800;
+  const defaultTimeoutSec = resolveExecDefaultTimeoutSec(defaults?.timeoutSec);
   const defaultPathPrepend = normalizePathPrepend(defaults?.pathPrepend);
   const {
     safeBins,
@@ -156,7 +145,7 @@ export function createExecTool(
   const notifyOnExit = defaults?.notifyOnExit !== false;
   const notifyOnExitEmptySuccess = resolveNotifyOnExitEmptySuccess(defaults);
   const notifySessionKey = normalizeOptionalString(
-    defaults?.notifySessionKey ?? defaults?.sessionKey,
+    defaults?.notifySessionKey ?? defaults?.runSessionKey ?? defaults?.sessionKey,
   );
   const notifyDeliveryContext = normalizeDeliveryContext({
     channel: defaults?.messageProvider,
@@ -195,13 +184,18 @@ export function createExecTool(
     label: "exec",
     displaySummary: EXEC_TOOL_DISPLAY_SUMMARY,
     get description() {
-      return describeExecTool({ agentId, hasCronTool: defaults?.hasCronTool === true });
+      return describeExecTool({
+        hasCronTool: defaults?.hasCronTool === true,
+        autoReview: defaults?.mode === "auto",
+      });
     },
     parameters: execSchema,
+    getExecutionTimeoutMs: createExecToolExecutionTimeoutResolver(defaults),
     prepareBeforeToolCallParams: requestPreparation.prepareBeforeToolCallParams,
     finalizeBeforeToolCallParams: requestPreparation.finalizeBeforeToolCallParams,
     execute: async (toolCallId, args, signal, onUpdate) => {
       signal?.throwIfAborted();
+      const assertSourceActive = captureAgentToolSourceExecutionGuard(signal);
       assertSupportedExecParams(args);
       // Capture settings and cancellation per execution; unused reviewers must not load model runtime.
       let autoReviewer: ExecAutoReviewer | undefined = defaults?.autoReviewer;
@@ -217,6 +211,11 @@ export function createExecTool(
           return createModelExecAutoReviewer(reviewerParams)(input);
         };
       }
+      const reviewCommand = autoReviewer;
+      autoReviewer = (input) => {
+        const transcript = defaults?.reviewTranscript?.();
+        return reviewCommand(transcript ? { ...input, transcript } : input);
+      };
       let params = requestPreparation.normalizeParams(args);
       const resolveExecEnvPrepared = requestPreparation.isResolveExecEnvPrepared(
         args as ExecToolArgs,
@@ -224,8 +223,6 @@ export function createExecTool(
       const hookContext = requestPreparation.getExecHookContext(params);
       const preparedWorkdirState = requestPreparation.getResolvedExecWorkdirPreparedState(params);
 
-      const maxOutput = DEFAULT_MAX_OUTPUT;
-      const pendingMaxOutput = DEFAULT_PENDING_MAX_OUTPUT;
       const warnings: string[] = [];
       const getWarningText = () => (warnings.length ? `${warnings.join("\n")}\n\n` : "");
       const approvalWarningText = normalizeOptionalString(defaults?.approvalWarningText);
@@ -234,7 +231,7 @@ export function createExecTool(
       }
       const startedAt = Date.now();
       let execCommandOverride: string | undefined;
-      let revalidateGatewayApproval: GatewayApprovalResult["revalidateBeforeExecution"];
+      let gatewayApproval: GatewayApprovalResult | undefined;
       let approvalReview: ExecToolApprovalReview | undefined;
       const foregroundFallbackWarning =
         !allowBackground && (params.background === true || typeof params.yieldMs === "number")
@@ -299,7 +296,7 @@ export function createExecTool(
         sandboxAvailable: Boolean(defaults?.sandbox),
         sandboxRequired: defaults?.sandboxRequired,
       });
-      const host: ExecHost = target.effectiveHost;
+      const host = target.effectiveHost;
 
       const explicitSecurity = defaults?.security;
       const configuredSecurity = explicitSecurity ?? (host === "sandbox" ? "deny" : "full");
@@ -427,6 +424,7 @@ export function createExecTool(
           if (!defaults?.operationalRunInstance) {
             throw new Error("Secret egress proxy requires an admitted agent run instance");
           }
+          assertSourceActive();
           secretEgressEnv = registerSecretEgressProxyRun(
             defaults.operationalRunInstance,
             storeEnv.secretEgressBindings ?? [],
@@ -438,6 +436,7 @@ export function createExecTool(
           sandbox,
           containerWorkdir,
           channelContext: defaults?.channelContext,
+          subagentExecution,
           defaultPathPrepend,
           pluginEnv: resolvedExecEnvState?.pluginEnv,
           storeEnv: host === "gateway" ? storeEnv.env : undefined,
@@ -542,8 +541,9 @@ export function createExecTool(
             warnings,
             notifySessionKey,
             approvalRunningNoticeMs,
-            maxOutput,
-            pendingMaxOutput,
+            maxOutput: DEFAULT_MAX_OUTPUT,
+            pendingMaxOutput: DEFAULT_PENDING_MAX_OUTPUT,
+            cleanupMs,
             processContinuationAvailable: allowBackground,
             trustedSafeBinDirs,
           });
@@ -552,7 +552,7 @@ export function createExecTool(
             return attachExecApprovalReview(immediateResult, approvalReview);
           }
           signal?.throwIfAborted();
-          revalidateGatewayApproval = gatewayResult.revalidateBeforeExecution;
+          gatewayApproval = gatewayResult;
           execCommandOverride = gatewayResult.allowWithoutEnforcedCommand
             ? undefined
             : gatewayResult.execCommandOverride;
@@ -587,8 +587,9 @@ export function createExecTool(
           containerWorkdir,
           usePty,
           warnings,
-          maxOutput,
-          pendingMaxOutput,
+          maxOutput: DEFAULT_MAX_OUTPUT,
+          pendingMaxOutput: DEFAULT_PENDING_MAX_OUTPUT,
+          cleanupMs,
           notifyOnExit,
           notifyOnExitEmptySuccess,
           scopeKey: defaults?.scopeKey,
@@ -600,7 +601,8 @@ export function createExecTool(
           processContinuationAvailable: allowBackground,
           startupSignal: signal,
           onUpdate,
-          beforeSpawn: revalidateGatewayApproval,
+          beforeSpawn: gatewayApproval?.revalidateBeforeExecution,
+          assertCurrent: gatewayApproval?.assertCurrent,
           onSettledBeforeNotify: settlement.settle,
         });
         discardPreparedSandboxWorkdir = null;
@@ -676,6 +678,7 @@ export function createExecTool(
         // that settles before this timer fires must stay out of the task ledger.
         settlement.backgroundTask = createBackgroundExecTask({
           processSessionId: run.session.id,
+          command: run.session.command,
           sessionKey: notifySessionKey,
           agentId,
           startedAt: run.startedAt,

@@ -8,9 +8,18 @@ import {
   normalizePluginsConfig,
   resolveEffectiveEnableState,
 } from "../../../plugins/config-state.js";
-import { writePersistedInstalledPluginIndexInstallRecords } from "../../../plugins/installed-plugin-index-records.js";
+import { formatSourceBundledPluginNotice } from "../../../plugins/dev-source-root.js";
+import {
+  copyPluginInstallTransactionRequest,
+  withPluginInstallTransactions,
+} from "../../../plugins/install-transaction.js";
+import { PLUGIN_INSTALL_ERROR_CODE } from "../../../plugins/install-types.js";
+import { writePersistedInstalledPluginIndexInstallRecordsWithLease } from "../../../plugins/installed-plugin-index-records.js";
 import { isPayloadMissing } from "../../../plugins/payload-verification.js";
-import { withPluginLifecycleLease } from "../../../plugins/plugin-lifecycle-lease.js";
+import {
+  withPluginLifecycleLease,
+  type PluginLifecycleLeaseContext,
+} from "../../../plugins/plugin-lifecycle-lease.js";
 import { updateNpmInstalledPlugins, type PluginUpdateOutcome } from "../../../plugins/update.js";
 import { resolveUserPath } from "../../../utils.js";
 import { resolveCompatibilityHostVersion } from "../../../version.js";
@@ -31,15 +40,20 @@ import {
 } from "./missing-configured-plugin-install.install.js";
 import {
   forceNpmInstallRecordRepair,
-  isTrustedOfficialInstallRecordForCandidate,
   installPathsEqual,
   recordMatchesBundledPackage,
   resolveSafeBrokenOfficialInstallRemovalPath,
 } from "./missing-configured-plugin-install.records.js";
+import { resolveConfiguredPluginCandidateRepair } from "./missing-configured-plugin-install.targets.js";
 import {
   isLegacyPackageUpdateDoctorPass,
   shouldDeferConfiguredPluginInstallRepair,
 } from "./update-phase.js";
+
+type PluginInstallRepairWarning = {
+  message: string;
+  pluginId?: string;
+};
 
 type RepairMissingPluginInstallsResult = {
   /** User-facing repair notes for installed or recovered plugin records. */
@@ -75,6 +89,8 @@ export async function repairMissingConfiguredPluginInstalls(params: {
   cfg: OpenClawConfig;
   env?: NodeJS.ProcessEnv;
   onCapabilityConsent?: PluginCapabilityConsentHandler;
+  onWarning?: (warning: PluginInstallRepairWarning) => void;
+  beforePersistentEffect?: () => void | Promise<void>;
   /**
    * Optional pre-seeded records. When provided, this map is used instead of
    * the disk-loaded install-record snapshot. Pass the in-memory records
@@ -90,7 +106,9 @@ export async function repairMissingConfiguredPluginInstalls(params: {
     pluginIds: collectConfiguredPluginIds(params.cfg, params.env),
     channelIds: collectConfiguredChannelIds(params.cfg, params.env),
     blockedPluginIds: collectBlockedPluginIds(params.cfg),
+    onWarning: params.onWarning,
     ...(params.onCapabilityConsent ? { onCapabilityConsent: params.onCapabilityConsent } : {}),
+    beforePersistentEffect: params.beforePersistentEffect,
     ...(params.baselineRecords ? { baselineRecords: params.baselineRecords } : {}),
   });
 }
@@ -104,6 +122,7 @@ export async function repairMissingPluginInstallsForIds(params: {
   env?: NodeJS.ProcessEnv;
   baselineRecords?: Record<string, PluginInstallRecord>;
   onCapabilityConsent?: PluginCapabilityConsentHandler;
+  onWarning?: (warning: PluginInstallRepairWarning) => void;
   beforePersistentEffect?: () => void | Promise<void>;
 }): Promise<RepairMissingPluginInstallsResult> {
   return repairMissingPluginInstalls({
@@ -123,6 +142,7 @@ export async function repairMissingPluginInstallsForIds(params: {
         .filter((pluginId) => pluginId),
     ),
     ...(params.onCapabilityConsent ? { onCapabilityConsent: params.onCapabilityConsent } : {}),
+    onWarning: params.onWarning,
     beforePersistentEffect: params.beforePersistentEffect,
     ...(params.baselineRecords ? { baselineRecords: params.baselineRecords } : {}),
   });
@@ -136,16 +156,22 @@ async function repairMissingPluginInstalls(params: {
   env?: NodeJS.ProcessEnv;
   baselineRecords?: Record<string, PluginInstallRecord>;
   onCapabilityConsent?: PluginCapabilityConsentHandler;
+  onWarning?: (warning: PluginInstallRepairWarning) => void;
   beforePersistentEffect?: () => void | Promise<void>;
 }): Promise<RepairMissingPluginInstallsResult> {
   // Baseline, awaited review, package publication, and the index write share one generation.
-  return await withPluginLifecycleLease({ env: params.env }, () =>
-    repairMissingPluginInstallsWithLease(params),
+  return await withPluginLifecycleLease({ env: params.env }, (lease) =>
+    withPluginInstallTransactions(
+      params,
+      () => lease.assertOwned(),
+      (owned) => repairMissingPluginInstallsWithLease(owned, lease),
+    ),
   );
 }
 
 async function repairMissingPluginInstallsWithLease(
   params: Parameters<typeof repairMissingPluginInstalls>[0],
+  lease: PluginLifecycleLeaseContext,
 ): Promise<RepairMissingPluginInstallsResult> {
   const env = params.env ?? process.env;
   const {
@@ -172,6 +198,11 @@ async function repairMissingPluginInstallsWithLease(
   const changes: string[] = [];
   const notices: string[] = [];
   const warnings: string[] = [];
+  const warn = (message: string, pluginId?: string) => {
+    warnings.push(message);
+    params.onWarning?.({ message, ...(pluginId ? { pluginId } : {}) });
+  };
+  const sourceOutcomes: PluginUpdateOutcome[] = [];
   const deferredRepairDetails: string[] = [];
   const failedPlugins = new Map<string, PluginUpdateOutcome | undefined>();
   const repairedPluginIds = new Set<string>();
@@ -183,7 +214,8 @@ async function repairMissingPluginInstallsWithLease(
     // A later failed attempt does not resolve an earlier consent refusal.
     let outcome = failedPlugins.get(pluginId);
     const retainedEnabledInstall =
-      code === PLUGIN_CAPABILITY_CONSENT_REQUIRED &&
+      (code === PLUGIN_CAPABILITY_CONSENT_REQUIRED ||
+        code === PLUGIN_INSTALL_ERROR_CODE.NPM_METADATA_FAILURE) &&
       knownIds.has(pluginId) &&
       !isPayloadMissing(env, records[pluginId]?.installPath) &&
       !installedPluginIdsWithRepairablePackageDiagnostics.has(pluginId) &&
@@ -194,14 +226,15 @@ async function repairMissingPluginInstallsWithLease(
         config: normalizedPluginConfig,
         rootConfig: params.cfg,
       }).enabled;
-    // Consent refusal rolls back the replacement; a retained enabled artifact is
-    // still subject to the caller's payload smoke check, not a failed activation.
+    // Deferred replacements leave the installed artifact for the caller's payload smoke check.
     if (retainedEnabledInstall) {
       notices.push(
         `Kept installed plugin "${pluginId}"; replacement deferred. ${messages.join(" ")}`,
       );
     } else {
-      warnings.push(...messages);
+      for (const message of messages) {
+        warn(message, pluginId);
+      }
       if (code === PLUGIN_CAPABILITY_CONSENT_REQUIRED) {
         outcome = { pluginId, status: "error", code, message: messages.join(" ") };
       }
@@ -212,6 +245,17 @@ async function repairMissingPluginInstallsWithLease(
   for (const [pluginId, record] of Object.entries(records)) {
     const bundled = bundledPluginsById.get(pluginId);
     if (!bundled || !recordMatchesBundledPackage(record, bundled)) {
+      continue;
+    }
+    if (bundled.preserveExternalInstallRecord) {
+      const message = formatSourceBundledPluginNotice(pluginId);
+      notices.push(message);
+      sourceOutcomes.push({
+        pluginId,
+        status: "unchanged",
+        code: "source-bundled-plugin",
+        message,
+      });
       continue;
     }
     if (nextRecords === records) {
@@ -265,36 +309,51 @@ async function repairMissingPluginInstallsWithLease(
     // Dropping resolved fields forces an installer attempt, not a record mutation.
     const repairRecords = { ...nextRecords };
     for (const [pluginId, record] of missingRecordedPlugins) {
-      repairRecords[pluginId] = forceNpmInstallRecordRepair(record);
+      if (
+        !installedPluginIdsWithStaleVersionBoundRuntimePackages.has(pluginId) ||
+        installedPluginIdsWithRepairablePackageDiagnostics.has(pluginId) ||
+        configuredPluginIdsWithStaleDescriptors.has(pluginId) ||
+        isPayloadMissing(env, record.installPath)
+      ) {
+        repairRecords[pluginId] = forceNpmInstallRecordRepair(record);
+      }
     }
-    const updateResult = await updateNpmInstalledPlugins({
-      config: {
-        ...params.cfg,
-        plugins: {
-          ...params.cfg.plugins,
-          installs: repairRecords,
+    const updateResult = await updateNpmInstalledPlugins(
+      copyPluginInstallTransactionRequest(params, {
+        config: {
+          ...params.cfg,
+          plugins: {
+            ...params.cfg.plugins,
+            installs: repairRecords,
+          },
         },
-      },
-      pluginIds: missingRecordedPluginIds,
-      skipDisabledPlugins: true,
-      updateChannel,
-      coreVersion: resolveCompatibilityHostVersion(env),
-      logger: {
-        terminalLinks: false,
-        warn: (message) => {
-          if (isClawHubReviewNotice(message)) {
-            notices.push(stripAnsi(message));
-            return;
-          }
-          warnings.push(message);
+        pluginIds: missingRecordedPluginIds,
+        skipDisabledPlugins: true,
+        updateChannel,
+        coreVersion: resolveCompatibilityHostVersion(env),
+        logger: {
+          terminalLinks: false,
+          warn: (message) => {
+            if (isClawHubReviewNotice(message)) {
+              notices.push(stripAnsi(message));
+              return;
+            }
+            warn(message);
+          },
+          error: (message) => warn(message),
         },
-        error: (message) => warnings.push(message),
-      },
-      ...(params.onCapabilityConsent ? { onCapabilityConsent: params.onCapabilityConsent } : {}),
-      beforePersistentEffect: params.beforePersistentEffect,
-    });
+        ...(params.onCapabilityConsent ? { onCapabilityConsent: params.onCapabilityConsent } : {}),
+        beforePersistentEffect: params.beforePersistentEffect,
+      }),
+    );
     for (const outcome of updateResult.outcomes) {
-      if (outcome.status === "updated" || outcome.status === "unchanged") {
+      if (
+        outcome.status === "unchanged" &&
+        updateResult.config.plugins?.installs?.[outcome.pluginId] ===
+          repairRecords[outcome.pluginId]
+      ) {
+        notices.push(outcome.message);
+      } else if (outcome.status === "updated" || outcome.status === "unchanged") {
         repairedPluginIds.add(outcome.pluginId);
         failedPlugins.delete(outcome.pluginId);
         changes.push(
@@ -345,29 +404,24 @@ async function repairMissingPluginInstallsWithLease(
         ? new Set([...(params.blockedPluginIds ?? []), ...deferredPluginIds])
         : params.blockedPluginIds,
   })) {
-    if (bundledPluginsById.has(candidate.pluginId)) {
+    const repair = resolveConfiguredPluginCandidateRepair({
+      candidate,
+      records: nextRecords,
+      env,
+      context: {
+        bundledPluginsById,
+        officialReplacementPluginIds,
+        knownIds,
+        installedPluginIdsWithStaleVersionBoundRuntimePackages,
+        installedPluginIdsWithRepairablePackageDiagnostics,
+        configuredPluginIdsWithStaleDescriptors,
+      },
+    });
+    if (!repair) {
       continue;
     }
-    const shouldReplaceBrokenOfficialInstall = officialReplacementPluginIds.has(candidate.pluginId);
-    if (shouldReplaceBrokenOfficialInstall && !candidate.trustedSourceLinkedOfficialInstall) {
-      continue;
-    }
+    const { shouldReplaceBrokenOfficialInstall, repairReason } = repair;
     const record = nextRecords[candidate.pluginId];
-    if (
-      shouldReplaceBrokenOfficialInstall &&
-      !isTrustedOfficialInstallRecordForCandidate({ record, candidate })
-    ) {
-      continue;
-    }
-    const hasRecord = Object.hasOwn(nextRecords, candidate.pluginId);
-    const hasUsableRecord =
-      hasRecord && !isPayloadMissing(env, nextRecords[candidate.pluginId]?.installPath);
-    if (
-      !shouldReplaceBrokenOfficialInstall &&
-      (hasUsableRecord || (knownIds.has(candidate.pluginId) && !hasRecord))
-    ) {
-      continue;
-    }
     const removalPath = shouldReplaceBrokenOfficialInstall
       ? resolveSafeBrokenOfficialInstallRemovalPath({
           pluginId: candidate.pluginId,
@@ -377,20 +431,20 @@ async function repairMissingPluginInstallsWithLease(
         })
       : null;
     const previousRecords = nextRecords;
-    const installed = await installCandidate({
-      candidate,
-      config: params.cfg,
-      records: nextRecords,
-      env,
-      updateChannel,
-      mode: shouldReplaceBrokenOfficialInstall ? "update" : "install",
-      preferNpm: preferNpmInstalls,
-      ...(installedPluginIdsWithStaleVersionBoundRuntimePackages.has(candidate.pluginId)
-        ? { repairReason: "stale-version-bound-runtime" as const }
-        : {}),
-      ...(params.onCapabilityConsent ? { onCapabilityConsent: params.onCapabilityConsent } : {}),
-      beforePersistentEffect: params.beforePersistentEffect,
-    });
+    const installed = await installCandidate(
+      copyPluginInstallTransactionRequest(params, {
+        candidate,
+        config: params.cfg,
+        records: nextRecords,
+        env,
+        updateChannel,
+        mode: shouldReplaceBrokenOfficialInstall ? "update" : "install",
+        preferNpm: preferNpmInstalls,
+        repairReason,
+        ...(params.onCapabilityConsent ? { onCapabilityConsent: params.onCapabilityConsent } : {}),
+        beforePersistentEffect: params.beforePersistentEffect,
+      }),
+    );
     if (shouldReplaceBrokenOfficialInstall) {
       const installedRecord = installed.records[candidate.pluginId];
       const replacementSucceeded = installed.records !== previousRecords;
@@ -400,10 +454,16 @@ async function repairMissingPluginInstallsWithLease(
         (!installedRecord?.installPath ||
           !installPathsEqual(resolveUserPath(installedRecord.installPath, env), removalPath))
       ) {
+        await params.beforePersistentEffect?.();
+        // Authority refusal is not a package-cleanup warning. Planning may
+        // yield, so both owners must still hold at dispatch without another await.
+        lease.assertOwned();
         try {
           await rm(removalPath, { recursive: true, force: true });
         } catch (error) {
-          warnings.push(
+          await params.beforePersistentEffect?.();
+          lease.assertOwned();
+          warn(
             `Failed to remove broken installed plugin "${candidate.pluginId}" at ${removalPath}: ${String(error)}`,
           );
         }
@@ -412,26 +472,39 @@ async function repairMissingPluginInstallsWithLease(
     nextRecords = installed.records;
     changes.push(...installed.changes);
     notices.push(...installed.notices);
-    if (!installed.failedPluginId && installed.records[candidate.pluginId]) {
+    if (
+      !installed.failedPluginId &&
+      installed.records !== previousRecords &&
+      installed.records[candidate.pluginId]
+    ) {
       repairedPluginIds.add(candidate.pluginId);
       failedPlugins.delete(candidate.pluginId);
     }
     if (installed.failedPluginId) {
       recordFailure(installed.failedPluginId, installed.warnings, installed.code);
     } else {
-      warnings.push(...installed.warnings);
+      for (const message of installed.warnings) {
+        warn(message);
+      }
     }
   }
 
-  const persistedIndexOptions = { config: params.cfg, env };
+  const persistedIndexOptions = { config: params.cfg, env, filePath: lease.databasePath, lease };
   // An explicit baseline may include earlier unpersisted sync/npm changes;
   // commit it even when this repair made no further changes.
   if (nextRecords !== persistedRecords || params.baselineRecords) {
     await params.beforePersistentEffect?.();
-    await writePersistedInstalledPluginIndexInstallRecords(nextRecords, persistedIndexOptions);
+    lease.assertOwned();
+    await writePersistedInstalledPluginIndexInstallRecordsWithLease(
+      nextRecords,
+      persistedIndexOptions,
+    );
   }
   const pluginInventoryChanged = nextRecords !== persistedRecords || repairedPluginIds.size > 0;
-  const outcomes = [...failedPlugins.values()].filter((outcome) => outcome !== undefined);
+  const outcomes = [
+    ...sourceOutcomes,
+    ...[...failedPlugins.values()].filter((outcome) => outcome !== undefined),
+  ];
   return {
     changes,
     warnings,

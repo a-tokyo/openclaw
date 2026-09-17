@@ -5,7 +5,10 @@ import type { TtsAutoMode } from "../../config/types.tts.js";
 import type { WorkerSessionPlacementRecord } from "../../gateway/worker-environments/placement-record.js";
 import type { SessionWorkerPlacementContext } from "../../gateway/worker-environments/session-placement-lifecycle.js";
 import type { SessionBindingRecord } from "../../infra/outbound/session-binding-service.js";
-import { isPluginOwnedBindingMetadata } from "../../plugins/conversation-binding-metadata.js";
+import {
+  isPluginOwnedBindingMetadata,
+  type PluginBindingMetadata,
+} from "../../plugins/conversation-binding-metadata.js";
 import type {
   PluginHookBeforeDispatchResult,
   PluginHookReplyDispatchEvent,
@@ -41,21 +44,11 @@ type PluginTargetedInboundClaimOutcome = Awaited<
 
 const mocks = vi.hoisted(() => ({
   isRoutableChannel: vi.fn((_channel: string | undefined) => true),
-  routeReply: vi.fn(
-    async (
-      _params: unknown,
-    ): Promise<{
-      ok: boolean;
-      delivered: boolean;
-      messageId?: string;
-      suppressed?: boolean;
-      error?: string;
-    }> => ({
-      ok: true,
-      delivered: true,
-      messageId: "mock",
-    }),
-  ),
+  routeReply: vi.fn<typeof import("./route-reply.js").routeReply>(async () => ({
+    ok: true,
+    delivered: true,
+    messageId: "mock",
+  })),
   tryFastAbortFromMessage: vi.fn<() => Promise<AbortResult>>(async () => ({
     handled: false,
     aborted: false,
@@ -77,6 +70,8 @@ const diagnosticMocks = vi.hoisted(() => ({
   logMessageProcessed: vi.fn(),
   logSessionStateChange: vi.fn(),
   markDiagnosticSessionProgress: vi.fn(),
+  // Opt in when a boundary test also observes the public diagnostic bus.
+  forwardToRealPipeline: false,
 }));
 const messageAuditMocks = vi.hoisted(() => ({
   enabled: true,
@@ -152,10 +147,58 @@ const sessionBindingMocks = vi.hoisted(() => ({
   >(() => null),
   touch: vi.fn(),
 }));
+
+export function createPluginBindingRecord({
+  bindingId,
+  targetSessionKey,
+  conversation,
+  boundAt = 1710000000000,
+  pluginId = "openclaw-codex-app-server",
+  ...metadata
+}: Pick<SessionBindingRecord, "bindingId" | "targetSessionKey" | "conversation"> &
+  Partial<Pick<SessionBindingRecord, "boundAt">> &
+  Omit<PluginBindingMetadata, "pluginBindingOwner" | "pluginId"> & {
+    pluginId?: string;
+  }): SessionBindingRecord {
+  return {
+    bindingId,
+    targetSessionKey,
+    targetKind: "session",
+    conversation,
+    status: "active",
+    boundAt,
+    metadata: { pluginBindingOwner: "plugin", pluginId, ...metadata },
+  };
+}
+
+export function mockPluginBindingClaim(
+  outcome: PluginTargetedInboundClaimOutcome = { status: "handled", result: { handled: true } },
+  options: { pluginId?: string; pluginLoaded?: boolean; receiveMessages?: boolean } = {},
+) {
+  hookMocks.runner.hasHooks.mockImplementation(
+    (hookName) =>
+      hookName === "inbound_claim" ||
+      (options.receiveMessages !== false && hookName === "message_received"),
+  );
+  if (options.pluginLoaded !== false) {
+    hookMocks.registry.plugins = [
+      { id: options.pluginId ?? "openclaw-codex-app-server", status: "loaded" },
+    ];
+  }
+  hookMocks.runner.runInboundClaimForPluginOutcome.mockResolvedValue(outcome);
+}
+
+export function mockPluginBinding(params: Parameters<typeof createPluginBindingRecord>[0]) {
+  sessionBindingMocks.resolveByConversation.mockReturnValue(createPluginBindingRecord(params));
+}
+
 const pluginConversationBindingMocks = vi.hoisted(() => ({
   shownFallbackNoticeBindingIds: new Set<string>(),
 }));
 const sessionStoreMocks = vi.hoisted(() => ({
+  databaseEntryLoader: undefined as
+    | typeof import("../../config/sessions/session-accessor.sqlite-entry.js").loadSessionEntryForAdmission
+    | undefined,
   currentEntry: undefined as Record<string, unknown> | undefined,
   entriesBySessionKey: new Map<string, Record<string, unknown>>(),
   loadSessionEntry: vi.fn((..._args: unknown[]) => sessionStoreMocks.currentEntry),
@@ -512,16 +555,24 @@ vi.mock("../../agents/tools/ask-user-tool.js", () => ({
   isAskUserPromptPending: askUserMocks.isAskUserPromptPending,
 }));
 
-vi.mock("../../logging/diagnostic.js", () => ({
-  diagnosticLogger: { debug: vi.fn(), error: vi.fn(), warn: vi.fn() },
-  logMessageDispatchCompleted: diagnosticMocks.logMessageDispatchCompleted,
-  logMessageDispatchStarted: diagnosticMocks.logMessageDispatchStarted,
-  logMessageQueued: diagnosticMocks.logMessageQueued,
-  logMessageProcessed: diagnosticMocks.logMessageProcessed,
-  logSessionStateChange: diagnosticMocks.logSessionStateChange,
-  logSessionTurnCreated: vi.fn(),
-  markDiagnosticSessionProgress: diagnosticMocks.markDiagnosticSessionProgress,
-}));
+vi.mock("../../logging/diagnostic.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../logging/diagnostic.js")>();
+  return {
+    diagnosticLogger: { debug: vi.fn(), error: vi.fn(), warn: vi.fn() },
+    logMessageDispatchCompleted: diagnosticMocks.logMessageDispatchCompleted,
+    logMessageDispatchStarted: diagnosticMocks.logMessageDispatchStarted,
+    logMessageQueued: diagnosticMocks.logMessageQueued,
+    logMessageProcessed: (params: Parameters<typeof actual.logMessageProcessed>[0]) => {
+      diagnosticMocks.logMessageProcessed(params);
+      if (diagnosticMocks.forwardToRealPipeline) {
+        actual.logMessageProcessed(params);
+      }
+    },
+    logSessionStateChange: diagnosticMocks.logSessionStateChange,
+    logSessionTurnCreated: vi.fn(),
+    markDiagnosticSessionProgress: diagnosticMocks.markDiagnosticSessionProgress,
+  };
+});
 vi.mock("../../audit/message-audit-events.js", () => ({
   emitTrustedMessageAuditEvent: messageAuditMocks.emitTrustedMessageAuditEvent,
   hasTrustedMessageAuditListeners: () => messageAuditMocks.enabled,
@@ -541,6 +592,20 @@ vi.mock("./dispatch-from-config.runtime.js", () => ({
   resolveSessionStorePathCore: sessionStoreMocks.resolveSessionStorePathCore,
   triggerInternalHook: internalHookMocks.triggerInternalHook,
   updateSessionStoreEntry: sessionStoreMocks.updateSessionStoreEntry,
+}));
+vi.mock("../../config/sessions/session-accessor.sqlite-entry.js", async (importOriginal) => ({
+  ...(await importOriginal<
+    typeof import("../../config/sessions/session-accessor.sqlite-entry.js")
+  >()),
+  loadSessionEntryForAdmission: (
+    ...args: Parameters<NonNullable<typeof sessionStoreMocks.databaseEntryLoader>>
+  ) =>
+    sessionStoreMocks.databaseEntryLoader
+      ? sessionStoreMocks.databaseEntryLoader(...args)
+      : {
+          entry: sessionStoreMocks.loadSessionEntry(...args),
+          databaseClaim: undefined,
+        },
 }));
 vi.mock("../../config/sessions/session-accessor.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../config/sessions/session-accessor.js")>();

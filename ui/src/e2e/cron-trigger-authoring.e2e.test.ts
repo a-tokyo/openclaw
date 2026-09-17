@@ -89,9 +89,7 @@ async function captureTriggerCapabilityProof(page: Page, name: string) {
 }
 
 async function selectSeconds(page: Page) {
-  const unit = page.locator("wa-select").filter({
-    has: page.locator('[slot="label"]', { hasText: "Unit" }),
-  });
+  const unit = page.getByRole("button", { name: /^Unit: /u });
   await unit.click();
   await page.getByRole("option", { name: "Seconds", exact: true }).click();
 }
@@ -344,6 +342,16 @@ suite.define(() => {
         expect(await gateway.getRequests("cron.list")).toHaveLength(listsBeforeSave);
         await errorBanner.scrollIntoViewIfNeeded();
         await captureProof(page, "05-malformed-trigger-rejected");
+
+        // A rejected save must release the fieldset's inherited disabled state.
+        const once = page.locator('[data-test-id="cron-schedule-kind-at"]');
+        await once.scrollIntoViewIfNeeded();
+        await captureProof(page, "06-repeat-after-rejection");
+        await expect.poll(() => once.getAttribute("aria-disabled")).toBe("false");
+        await once.click();
+        await page.locator("#cron-schedule-at").waitFor();
+        expect(await page.locator("#cron-name").inputValue()).toBe("Malformed condition");
+        expect(await gateway.getRequests("cron.add")).toHaveLength(1);
 
         await page.locator('[data-test-id="cron-back"]').click();
         await existingRow.waitFor();

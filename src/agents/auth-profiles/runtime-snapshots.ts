@@ -10,7 +10,7 @@ import {
   resolveRuntimeStoreKey,
 } from "./mutation-lineage.js";
 import { captureAuthProfileOwnerScope } from "./path-resolve.js";
-import { mergeAuthProfileStores } from "./persisted.js";
+import { buildPersistedAuthProfileSecretsStore, mergeAuthProfileStores } from "./persisted.js";
 import { removePersonalAuthProfileReferences } from "./runtime-external-profile-references.js";
 import {
   clearAllRuntimeAuthMaterializations,
@@ -29,6 +29,7 @@ import {
   type RuntimeAuthProfileLegacyCandidates,
   type OwnedRuntimeAuthProfileStoreSnapshotEntry,
 } from "./runtime-snapshot-owner.js";
+import { registerFreshSharedAuthStoreHandoff } from "./shared-store-bootstrap.js";
 import {
   closeAuthProfileReadPool,
   type AuthProfileStoreOwner,
@@ -57,6 +58,30 @@ let runtimeAuthStoreSnapshotsRevision = 0;
 // Per-store generations isolate rollback ownership; the global counter remains
 // the deletion generation for keys no longer present in this map.
 const runtimeAuthStoreSnapshotRevisions = new Map<string, number>();
+
+registerFreshSharedAuthStoreHandoff(({ previousSharedDatabasePath, sharedDatabasePath, env }) => {
+  let rebound = false;
+  const entries = listOwnedRuntimeAuthProfileStoreSnapshots();
+  for (const entry of entries) {
+    if (
+      (entry.owner.kind === "resolved" && entry.owner.location !== "legacy-main") ||
+      !runtimeAuthProfileSnapshotSharesOwner(entry.owner, {
+        sharedDatabasePath: previousSharedDatabasePath,
+        location: "legacy-main",
+      })
+    ) {
+      continue;
+    }
+    rebound = true;
+    entry.owner = { kind: "resolved", sharedDatabasePath, location: "state-db" };
+    entry.legacyCandidates = captureRuntimeAuthProfileLegacyCandidates(entry.agentDir, env);
+  }
+  if (rebound) {
+    // Keep each published view and its overlays; the following credential commit rebuilds
+    // these now-derived views from the same owner that secrets activation will observe.
+    replaceOwnedRuntimeAuthProfileStoreSnapshots(entries);
+  }
+});
 
 type RuntimeAuthProfileStoreSnapshotEntry = {
   databasePath?: string;
@@ -214,9 +239,10 @@ export function getOwnedRuntimeAuthProfileStoreSnapshotAtDatabasePath(
 export function getPreparedRuntimeAuthProfileStoreSnapshotCore(
   agentDir?: string,
   inheritedAuthDir?: string,
-): AuthProfileStore | undefined {
-  const inheritedKey = resolveRuntimeStoreKey(inheritedAuthDir);
-  const requestedKey = resolveRuntimeStoreKey(agentDir);
+  env?: NodeJS.ProcessEnv,
+): RuntimeAuthProfileStore | undefined {
+  const inheritedKey = resolveRuntimeStoreKey(inheritedAuthDir, env);
+  const requestedKey = resolveRuntimeStoreKey(agentDir, env);
   const inherited = getRuntimeAuthProfileStoreSnapshotAtDatabasePath(inheritedKey);
   if (requestedKey === inheritedKey) {
     return inherited;
@@ -228,7 +254,79 @@ export function getPreparedRuntimeAuthProfileStoreSnapshotCore(
       preserveBaseRuntimeExternalProfiles: true,
     });
   }
+  if (agentDir && !requested && inherited) {
+    // The shared snapshot owns its order; this agent has no local override to reset.
+    return { ...inherited, runtimeLocalOrderProviderIds: [] };
+  }
   return requested ?? inherited;
+}
+
+/** Captures the published owners once; catalog reads refresh usage without opening storage. */
+export function createPreparedRuntimeAuthProfileUsageReader(
+  agentDir: string,
+  inheritedAuthDir?: string,
+): (store: AuthProfileStore) => AuthProfileStore {
+  const requestedKey = resolveRuntimeStoreKey(agentDir);
+  const requestedOwner = runtimeAuthStoreSnapshots.get(requestedKey)?.owner;
+  const inheritedKey = inheritedAuthDir
+    ? resolveRuntimeStoreKey(inheritedAuthDir)
+    : requestedOwner?.kind === "resolved"
+      ? requestedOwner.sharedDatabasePath
+      : requestedKey;
+  const owners = [...new Set([inheritedKey, requestedKey])].flatMap((key) => {
+    const entry = runtimeAuthStoreSnapshots.get(key);
+    return entry ? [{ key, owner: entry.owner }] : [];
+  });
+  return (store) => {
+    const current = new Map<string, RuntimeAuthProfileStore>();
+    for (const { key, owner } of owners) {
+      const entry = runtimeAuthStoreSnapshots.get(key);
+      if (!entry || runtimeAuthSharedOwnerRebound(owner, entry.owner)) {
+        return store;
+      }
+      current.set(key, entry.store);
+    }
+    const inherited = current.get(inheritedKey);
+    const requested = current.get(requestedKey);
+    const published =
+      inherited && requested && inheritedKey !== requestedKey
+        ? mergeAuthProfileStores(inherited, requested, {
+            preserveBaseRuntimeExternalProfiles: true,
+          })
+        : (requested ?? inherited);
+    if (!published) {
+      return store;
+    }
+    // Compare existing descriptor identities without replacing worker-resolved secret literals.
+    const workerProfiles = buildPersistedAuthProfileSecretsStore(store).profiles;
+    const publishedProfiles = buildPersistedAuthProfileSecretsStore(published).profiles;
+    let usageStats: AuthProfileStore["usageStats"];
+    for (const [profileId, credential] of Object.entries(workerProfiles)) {
+      if (!isDeepStrictEqual(credential, publishedProfiles[profileId])) {
+        continue;
+      }
+      // A cleared local profile must not inherit a different owner's same-id block.
+      const usageOwner =
+        published.profiles[profileId] === requested?.profiles[profileId] ? requested : inherited;
+      const usage = usageOwner?.usageStats?.[profileId];
+      if (isDeepStrictEqual(store.usageStats?.[profileId], usage)) {
+        continue;
+      }
+      usageStats ??= { ...store.usageStats };
+      if (usage === undefined) {
+        delete usageStats[profileId];
+      } else {
+        usageStats[profileId] = usage;
+      }
+    }
+    return usageStats
+      ? {
+          ...store,
+          usageStats: cloneAuthProfileStore({ version: store.version, profiles: {}, usageStats })
+            .usageStats,
+        }
+      : store;
+  };
 }
 
 /** Lists cloned snapshots with their canonical database identity and producer ownership. */
@@ -553,20 +651,19 @@ export function noteRuntimeAuthProfileStorePersistedMutation(
   }
   recordRuntimeAuthProfileStorePersistedMutation(ownerKey, mutation);
   const mainKey = owner?.sharedDatabasePath ?? resolveRuntimeStoreKey(undefined);
-  if (ownerKey !== mainKey || (!mutation.credentialsChanged && !mutation.profileSetChanged)) {
-    return;
-  }
-  let deletedDerivedSnapshot = false;
-  const sharedOwner = owner ?? captureRuntimeAuthSharedOwner();
-  for (const [key, entry] of runtimeAuthStoreSnapshots) {
-    if (key !== mainKey && runtimeAuthProfileSnapshotSharesOwner(entry.owner, sharedOwner)) {
-      runtimeAuthStoreSnapshots.delete(key);
-      runtimeAuthStoreSnapshotRevisions.delete(key);
-      deletedDerivedSnapshot = true;
+  if (ownerKey === mainKey && (mutation.credentialsChanged || mutation.profileSetChanged)) {
+    let deletedDerivedSnapshot = false;
+    const sharedOwner = owner ?? captureRuntimeAuthSharedOwner();
+    for (const [key, entry] of runtimeAuthStoreSnapshots) {
+      if (key !== mainKey && runtimeAuthProfileSnapshotSharesOwner(entry.owner, sharedOwner)) {
+        runtimeAuthStoreSnapshots.delete(key);
+        runtimeAuthStoreSnapshotRevisions.delete(key);
+        deletedDerivedSnapshot = true;
+      }
     }
-  }
-  if (deletedDerivedSnapshot) {
-    advanceRuntimeAuthStoreSnapshotsRevision();
+    if (deletedDerivedSnapshot) {
+      advanceRuntimeAuthStoreSnapshotsRevision();
+    }
   }
   if (mutation.credentialsChanged || mutation.profileSetChanged) {
     notifyRuntimeAuthStoreMutation(agentDir, mutation.profileSetChanged === true);

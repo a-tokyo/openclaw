@@ -1,10 +1,10 @@
-/**
- * Gateway session store RPC tests.
- */
 import fs from "node:fs/promises";
 import path from "node:path";
 import { expectDefined } from "@openclaw/normalization-core";
 import { expect, test, vi } from "vitest";
+/**
+ * Gateway session store RPC tests.
+ */
 import * as sessionDirs from "../agents/session-dirs.js";
 import {
   loadSessionEntry,
@@ -55,12 +55,7 @@ async function loadTranscriptRows(params: {
   sessionKey: string;
   storePath: string;
 }): Promise<unknown[]> {
-  return await loadTranscriptEvents({
-    agentId: "main",
-    sessionId: params.sessionId,
-    sessionKey: params.sessionKey,
-    storePath: params.storePath,
-  });
+  return await loadTranscriptEvents({ agentId: "main", ...params });
 }
 
 test("sessions.patch validates persistent session icons", async () => {
@@ -70,7 +65,8 @@ test("sessions.patch validates persistent session icons", async () => {
   });
   expect(invalid.error).toEqual({
     code: "INVALID_REQUEST",
-    message: "icon must be a single emoji or one of: braces, book, monitor, bot, kanban, coins",
+    message:
+      "icon must be a single emoji, a named icon (braces, book, monitor, bot, kanban, coins), or self-contained SVG markup/data URL up to 16 KiB",
   });
 });
 
@@ -157,6 +153,10 @@ test("lists and patches session store via sessions.* RPC", async () => {
     getSessionEventSubscriberConnIds: () => new Set<string>(),
     logGateway: { debug: vi.fn() },
     loadGatewayModelCatalog: async () => agentDiscoveryMock.models,
+    loadGatewayModelCatalogSnapshot: async () => ({
+      entries: agentDiscoveryMock.models,
+      routeVariants: agentDiscoveryMock.models,
+    }),
     getRuntimeConfig,
   };
   async function directSessionReq<TPayload = unknown>(
@@ -349,7 +349,7 @@ test("lists and patches session store via sessions.* RPC", async () => {
   const pinned = await directSessionReq<{
     entry: { pinnedAt?: number };
   }>("sessions.patch", {
-    key: "agent:main:subagent:one",
+    key: "agent:main:discord:group:dev",
     pinned: true,
   });
   expect(pinned.ok).toBe(true);
@@ -359,16 +359,16 @@ test("lists and patches session store via sessions.* RPC", async () => {
     sessions: Array<{ key: string; pinned?: boolean }>;
   }>("sessions.list", {});
   expect(pinnedList.payload?.sessions[0]).toMatchObject({
-    key: "agent:main:subagent:one",
+    key: "agent:main:discord:group:dev",
     pinned: true,
   });
 
   const archived = await directSessionReq<{
     entry: { archivedAt?: number; pinnedAt?: number };
   }>("sessions.patch", {
-    key: "agent:main:subagent:one",
+    key: "agent:main:discord:group:dev",
     archived: true,
-    expectedSessionId: "sess-subagent",
+    expectedSessionId: "sess-group",
   });
   expect(archived.ok).toBe(true);
   expect(archived.payload?.entry.archivedAt).toEqual(expect.any(Number));
@@ -378,24 +378,24 @@ test("lists and patches session store via sessions.* RPC", async () => {
     sessions: Array<{ key: string }>;
   }>("sessions.list", {});
   expect(activeAfterArchive.payload?.sessions.map((session) => session.key)).not.toContain(
-    "agent:main:subagent:one",
+    "agent:main:discord:group:dev",
   );
   const archivedList = await directSessionReq<{
     sessions: Array<{ key: string; archived?: boolean }>;
   }>("sessions.list", { archived: true });
   expect(archivedList.payload?.sessions).toMatchObject([
-    { key: "agent:main:subagent:one", archived: true },
+    { key: "agent:main:discord:group:dev", archived: true },
   ]);
 
   const archivedSend = await directSessionReq("sessions.send", {
-    key: "agent:main:subagent:one",
+    key: "agent:main:discord:group:dev",
     message: "blocked while archived",
   });
   expect(archivedSend).toMatchObject({
     ok: false,
     error: {
       message:
-        'Session "agent:main:subagent:one" is archived. Restore it before starting new work.',
+        'Session "agent:main:discord:group:dev" is archived. Restore it before starting new work.',
     },
   });
 
@@ -406,7 +406,7 @@ test("lists and patches session store via sessions.* RPC", async () => {
     payload: { runId: cachedArchivedRunId, status: "ok" },
   });
   const cachedArchivedSend = await directSessionReq("sessions.send", {
-    key: "agent:main:subagent:one",
+    key: "agent:main:discord:group:dev",
     message: "already completed before archive",
     idempotencyKey: cachedArchivedRunId,
   });
@@ -416,22 +416,22 @@ test("lists and patches session store via sessions.* RPC", async () => {
   });
 
   const archivedReset = await directSessionReq("sessions.reset", {
-    key: "agent:main:subagent:one",
+    key: "agent:main:discord:group:dev",
   });
   expect(archivedReset).toMatchObject({
     ok: false,
     error: {
       message:
-        'Session "agent:main:subagent:one" is archived. Restore it before starting new work.',
+        'Session "agent:main:discord:group:dev" is archived. Restore it before starting new work.',
     },
   });
 
   const restored = await directSessionReq<{
     entry: { archivedAt?: number };
   }>("sessions.patch", {
-    key: "agent:main:subagent:one",
+    key: "agent:main:discord:group:dev",
     archived: false,
-    expectedSessionId: "sess-subagent",
+    expectedSessionId: "sess-group",
   });
   expect(restored.ok).toBe(true);
   expect(restored.payload?.entry.archivedAt).toBeUndefined();
@@ -951,7 +951,7 @@ test("write-scoped operators manage chat organization but not admin session sett
       key: "agent:main:topic-a",
       label: "Sneaky",
       model: null,
-      thinkingLevel: "high",
+      verboseLevel: "full",
     });
     expect(mixedFieldsDenied.ok).toBe(false);
     expect(mixedFieldsDenied.error?.message).toContain("missing scope: operator.admin");

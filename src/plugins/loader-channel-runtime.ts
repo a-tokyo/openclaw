@@ -14,8 +14,9 @@ import { runPluginRegisterSyncInRegistry } from "./loader-module-runtime.js";
 import { recordPluginError } from "./loader-records.js";
 import type { PluginRegistrationPlan } from "./loader-registration-plan.js";
 import type { PluginManifestRecord } from "./manifest-registry.js";
+import { getPluginInstance } from "./plugin-instance-scope.js";
 import { withProfile } from "./plugin-load-profile.js";
-import { resolveCanonicalDistRuntimeSource } from "./plugin-runtime-artifact-resolution.js";
+import { resolvePluginRuntimeExecutionArtifact } from "./plugin-runtime-artifact-selection.js";
 import type { createPluginRegistry, PluginRecord } from "./registry.js";
 import type { OpenClawPluginModule, PluginLogger } from "./types.js";
 
@@ -38,7 +39,6 @@ export function loadSetupRuntimeChannelCandidate(params: {
   cfg: OpenClawConfig;
   entry: NormalizedPluginsConfig["entries"][string] | undefined;
   seenIds: Map<string, PluginRecord["origin"]>;
-  candidateOrigin: PluginRecord["origin"];
   logger: PluginLogger;
   pushPluginLoadError: (message: string) => void;
 }): boolean {
@@ -54,8 +54,6 @@ export function loadSetupRuntimeChannelCandidate(params: {
       registry: registryBuilder.registry,
       record,
       seenIds: params.seenIds,
-      pluginId: record.id,
-      origin: params.candidateOrigin,
       phase,
       error,
       logPrefix: `[plugins] ${record.id} ${message} from ${record.source}: `,
@@ -89,15 +87,30 @@ export function loadSetupRuntimeChannelCandidate(params: {
     hookPolicy: params.entry?.hooks,
     registrationMode: registrationPlan.mode,
   });
+  const instance = getPluginInstance(record);
+  const applyChannelRuntime = (setter: ((runtime: typeof api.runtime) => void) | undefined) => {
+    if (!setter) {
+      return;
+    }
+    if (!instance) {
+      setter(api.runtime);
+      return;
+    }
+    instance.run(() => setter(api.runtime));
+  };
   let mergedSetupRegistration = setupRegistration;
-  let runtimeSetterApplied = false;
-  if (
-    registrationPlan.loadSetupRuntimeEntry &&
-    setupRegistration.usesBundledSetupContract &&
-    resolveCanonicalDistRuntimeSource(runtimeCandidateEntry.source) !== params.safeSource
-  ) {
-    const runtimeModuleSource = resolveCanonicalDistRuntimeSource(runtimeCandidateEntry.source);
-    const runtimeModuleRoot = resolveCanonicalDistRuntimeSource(runtimeCandidateEntry.rootDir);
+  try {
+    applyChannelRuntime(setupRegistration.setChannelRuntime);
+  } catch (error) {
+    recordSetupFailure(error, "load", "failed to apply setup channel runtime");
+    return true;
+  }
+  const runtimeEntry =
+    registrationPlan.loadSetupRuntimeEntry && setupRegistration.usesBundledSetupContract
+      ? resolvePluginRuntimeExecutionArtifact(runtimeCandidateEntry)
+      : undefined;
+  if (runtimeEntry && runtimeEntry.source !== params.safeSource) {
+    const { source: runtimeModuleSource, rootDir: runtimeModuleRoot } = runtimeEntry;
     const runtimeOpened = openRootFileSync({
       absolutePath: runtimeModuleSource,
       rootPath: runtimeModuleRoot,
@@ -138,8 +151,9 @@ export function loadSetupRuntimeChannelCandidate(params: {
     }
     if (runtimeRegistration.setChannelRuntime) {
       try {
-        runtimeRegistration.setChannelRuntime(api.runtime);
-        runtimeSetterApplied = true;
+        if (runtimeRegistration.setChannelRuntime !== setupRegistration.setChannelRuntime) {
+          applyChannelRuntime(runtimeRegistration.setChannelRuntime);
+        }
       } catch (error) {
         recordSetupFailure(error, "load", "failed to apply setup-runtime channel runtime");
         return true;
@@ -193,14 +207,6 @@ export function loadSetupRuntimeChannelCandidate(params: {
     );
     return true;
   }
-  if (!runtimeSetterApplied) {
-    try {
-      mergedSetupRegistration.setChannelRuntime?.(api.runtime);
-    } catch (error) {
-      recordSetupFailure(error, "load", "failed to apply setup channel runtime");
-      return true;
-    }
-  }
   if (registrationPlan.mode === "setup-runtime" && mergedSetupRegistration.registerSetupRuntime) {
     try {
       runPluginRegisterSyncInRegistry(
@@ -229,6 +235,6 @@ export function loadSetupRuntimeChannelCandidate(params: {
     return true;
   }
   registryBuilder.registry.plugins.push(record);
-  params.seenIds.set(record.id, params.candidateOrigin);
+  params.seenIds.set(record.id, record.origin);
   return true;
 }

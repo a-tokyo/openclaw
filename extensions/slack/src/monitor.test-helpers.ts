@@ -1,3 +1,4 @@
+import { EventEmitter } from "node:events";
 import fs from "node:fs";
 import path from "node:path";
 import type { ChannelRuntimeSurface } from "openclaw/plugin-sdk/channel-contract";
@@ -8,6 +9,10 @@ import {
 // Slack helper module supports monitor helpers behavior.
 import type { PluginRuntime } from "openclaw/plugin-sdk/core";
 import type { RuntimeEnv } from "openclaw/plugin-sdk/runtime-env";
+import {
+  closeOpenClawAgentDatabasesAsync,
+  closeOpenClawStateDatabaseAsync,
+} from "openclaw/plugin-sdk/sqlite-runtime-testing";
 import { resolvePreferredOpenClawTmpDir } from "openclaw/plugin-sdk/temp-path";
 import { vi } from "vitest";
 import type { Mock } from "vitest";
@@ -63,6 +68,7 @@ type SlackTestState = {
   appConstructorArgs?: Record<string, unknown>;
   appStartMock: Mock<(...args: unknown[]) => Promise<unknown>>;
   appStopMock: Mock<(...args: unknown[]) => Promise<unknown>>;
+  httpRequestListenerMock: Mock<(...args: unknown[]) => unknown>;
   interactionRegistrations: string[];
   sendMock: Mock<(...args: unknown[]) => Promise<unknown>>;
   replyMock: Mock<(...args: unknown[]) => unknown>;
@@ -91,6 +97,7 @@ const slackTestState: SlackTestState = vi.hoisted(() => {
     appConstructorArgs: undefined,
     appStartMock: vi.fn(),
     appStopMock: vi.fn(),
+    httpRequestListenerMock: vi.fn(),
     interactionRegistrations: [],
     sendMock: vi.fn(),
     replyMock: vi.fn(),
@@ -307,11 +314,15 @@ export const defaultSlackTestConfig = () => ({
 
 let lastSlackTestStateDir: string | undefined;
 
-export function resetSlackTestState(config: Record<string, unknown> = defaultSlackTestConfig()) {
+export async function resetSlackTestState(
+  config: Record<string, unknown> = defaultSlackTestConfig(),
+) {
   // Fresh persistent state per test: the dispatch-dedupe guard writes logical
   // message keys to the state DB, and fixture ts values repeat across tests,
   // so a carried-over DB would dedupe unrelated test messages. realpath keeps
   // macOS /var vs /private/var symlinks out of resolver assertions.
+  await closeOpenClawAgentDatabasesAsync();
+  await closeOpenClawStateDatabaseAsync();
   closeOpenClawStateDatabaseForTest();
   // Clear worker-global Bolt handler registrations from previous test files:
   // with isolate=false a stale "message" handler makes waitForSlackEvent
@@ -344,6 +355,7 @@ export function resetSlackTestState(config: Record<string, unknown> = defaultSla
   slackTestState.socketModeLogger = undefined;
   slackTestState.appStartMock.mockReset().mockResolvedValue(undefined);
   slackTestState.appStopMock.mockReset().mockResolvedValue(undefined);
+  slackTestState.httpRequestListenerMock.mockReset();
   slackTestState.interactionRegistrations.length = 0;
   slackTestState.sendMock.mockReset().mockResolvedValue(undefined);
   slackTestState.replyMock.mockReset();
@@ -500,14 +512,12 @@ vi.mock("@slack/bolt", () => {
     stop = (...args: unknown[]) => slackTestState.appStopMock(...args);
   }
   class HTTPReceiver {
-    requestListener = vi.fn();
+    requestListener = (...args: unknown[]) => slackTestState.httpRequestListenerMock(...args);
   }
   class SocketModeReceiver {
-    client = {
-      ...slackClient,
-      on: vi.fn(),
-      off: vi.fn(),
-    };
+    client = Object.assign(new EventEmitter(), slackClient, {
+      send: vi.fn<(envelopeId: string) => Promise<void>>().mockResolvedValue(undefined),
+    });
 
     constructor(args: { logger?: { error: (...args: unknown[]) => void } }) {
       slackTestState.socketModeLogger = args.logger;

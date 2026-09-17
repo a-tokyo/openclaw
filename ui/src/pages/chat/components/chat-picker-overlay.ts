@@ -1,5 +1,6 @@
 import { syncAnchoredOverlay } from "../../../components/anchored-overlay.ts";
 import { consumeTooltipEscape } from "../../../components/tooltip.ts";
+import { clearChatModelSearchOnEscape } from "./chat-model-picker-search.ts";
 
 const MOBILE_COMPOSER_OVERLAY_QUERY =
   "(max-width: 640px), (max-width: 932px) and (max-height: 500px) and (orientation: landscape)";
@@ -45,6 +46,13 @@ function pickerTrigger(picker: HTMLElement): HTMLElement | null {
     : picker.querySelector<HTMLElement>("[slot=trigger]");
 }
 
+function clearPointerFocus(this: HTMLElement): void {
+  // Blur and keyboard takeover complete the same pointer-focus lifetime.
+  this.removeEventListener("blur", clearPointerFocus);
+  this.removeEventListener("keydown", clearPointerFocus);
+  this.removeAttribute(POINTER_RESTORED_FOCUS_ATTRIBUTE);
+}
+
 function dismissChatComposerPickersOutside(event: PointerEvent): void {
   const path = event.composedPath();
   for (const picker of openChatComposerPickers()) {
@@ -53,7 +61,7 @@ function dismissChatComposerPickersOutside(event: PointerEvent): void {
     }
   }
   for (const menu of document.querySelectorAll<HTMLElement>(
-    ".agent-chat__input > :is(.slash-menu, .skill-menu)",
+    ".agent-chat__input > :is(.slash-menu, .skill-menu, .emoji-menu-popup)",
   )) {
     if (!path.includes(menu)) {
       menu
@@ -65,6 +73,8 @@ function dismissChatComposerPickersOutside(event: PointerEvent): void {
 
 function dismissChatComposerPickersOnEscape(event: KeyboardEvent): void {
   if (
+    event.isComposing ||
+    event.keyCode === 229 ||
     event.defaultPrevented ||
     consumeTooltipEscape(event, document) ||
     event.key !== "Escape" ||
@@ -72,9 +82,14 @@ function dismissChatComposerPickersOnEscape(event: KeyboardEvent): void {
   ) {
     return;
   }
+  if (clearChatModelSearchOnEscape(event)) {
+    return;
+  }
   const pickers = openChatComposerPickers();
   const invocationComposer = document
-    .querySelector<HTMLElement>(".agent-chat__input > :is(.slash-menu, .skill-menu)")
+    .querySelector<HTMLElement>(
+      ".agent-chat__input > :is(.slash-menu, .skill-menu, .emoji-menu-popup)",
+    )
     ?.closest<HTMLElement>(".agent-chat__input");
   if (pickers.length === 0 && !invocationComposer) {
     return;
@@ -182,7 +197,6 @@ export function restorePointerOpenedChatComposerTrigger(event: Event): void {
       return;
     }
     trigger.setAttribute(POINTER_RESTORED_FOCUS_ATTRIBUTE, "");
-    const clearPointerFocus = () => trigger.removeAttribute(POINTER_RESTORED_FOCUS_ATTRIBUTE);
     trigger.addEventListener("blur", clearPointerFocus, { once: true });
     trigger.addEventListener("keydown", clearPointerFocus, { once: true });
     trigger.focus({ preventScroll: true });

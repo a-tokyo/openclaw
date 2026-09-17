@@ -50,7 +50,10 @@ function messagesMatchForIdempotentReplay(stored: unknown, candidate: unknown): 
 export function appendTranscriptMessageInTransaction<TMessage>(
   database: OpenClawAgentDatabase,
   resolved: ResolvedTranscriptScope,
-  options: TranscriptMessageAppendOptions<TMessage> & { messageAlreadyRedacted?: boolean },
+  options: TranscriptMessageAppendOptions<TMessage> & {
+    messageAlreadyRedacted?: boolean;
+    appendMode?: "side";
+  },
 ): TranscriptMessageAppendResult<TMessage> | undefined {
   const pending = resolveSessionPendingInputAppend(database, resolved, options.message);
   if (
@@ -140,12 +143,18 @@ export function appendTranscriptMessageInTransaction<TMessage>(
     pending && !pending.alreadyPromoted ? pending.inputId : (options.eventId ?? randomUUID());
   const now = options.now ?? Date.now();
   const finalMessage = pending ? prepared : serializeForStorage(prepared);
+  if (!pending) {
+    // Accepted custody and replay retain their original decision. Fresh input
+    // must still belong to its captured owner before any transcript write.
+    options.beforeFreshMessageCommit?.();
+  }
   ensureTranscriptHeader(database, resolved, options.cwd);
   const parentId = resolveTranscriptMessageAppendParent(database, resolved.sessionId, options);
   const event = {
     type: "message",
     id: messageId,
     parentId: parentId ?? null,
+    ...(options.appendMode ? { appendMode: options.appendMode } : {}),
     timestamp: resolveTimestampMsToIsoString(now),
     message: finalMessage,
   };

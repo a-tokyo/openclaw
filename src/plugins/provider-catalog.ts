@@ -46,6 +46,20 @@ export function findCatalogTemplate(params: {
     .find((entry) => entry !== undefined);
 }
 
+/** Selects one complete auth result in caller-defined order, including unresolved secret markers. */
+export function resolveFirstProviderCatalogAuth(
+  resolveProviderApiKey: ProviderCatalogContext["resolveProviderApiKey"],
+  providerIds: readonly string[],
+): ReturnType<ProviderCatalogContext["resolveProviderApiKey"]> | undefined {
+  for (const providerId of providerIds) {
+    const auth = resolveProviderApiKey(providerId);
+    if (auth.apiKey || auth.discoveryApiKey) {
+      return auth;
+    }
+  }
+  return undefined;
+}
+
 /** Builds a provider catalog result for providers that share one API key. */
 export async function buildSingleProviderApiKeyCatalog(params: {
   ctx: ProviderCatalogContext;
@@ -174,7 +188,7 @@ function cloneManifestCatalogMediaInput(
 function buildManifestCatalogModel(
   model: ModelCatalogModel,
   options: { providerId?: string; filterDocument?: boolean } = {},
-): ModelDefinitionConfig {
+): ModelDefinitionConfig & Pick<ModelCatalogModel, "contextWindows" | "contextWindowDefault"> {
   if (model.contextWindow === undefined) {
     throw new Error(`Manifest modelCatalog row ${model.id} is missing contextWindow`);
   }
@@ -193,6 +207,10 @@ function buildManifestCatalogModel(
     input: buildManifestCatalogModelInput(model, options.filterDocument),
     cost: cloneManifestCatalogCost(model.cost ?? {}),
     contextWindow: model.contextWindow,
+    ...(model.contextWindows
+      ? { contextWindows: model.contextWindows.map((option) => ({ ...option })) }
+      : {}),
+    ...(model.contextWindowDefault ? { contextWindowDefault: model.contextWindowDefault } : {}),
     ...(model.contextTokens !== undefined ? { contextTokens: model.contextTokens } : {}),
     maxTokens: model.maxTokens,
     ...(model.thinkingLevelMap ? { thinkingLevelMap: { ...model.thinkingLevelMap } } : {}),

@@ -1,33 +1,16 @@
 // Builds memory flush prompts when conversation context exceeds model budget.
 import { resolveAnthropicServerCompactionPlan } from "@openclaw/ai/internal/anthropic";
 import { resolveOpenAIResponsesServerCompactionPlan } from "@openclaw/ai/internal/openai-responses-payload-policy";
-import { resolveContextTokensForModel } from "../../agents/context.js";
-import { DEFAULT_CONTEXT_TOKENS } from "../../agents/defaults.js";
 import { resolveModelExtraParamSources } from "../../agents/model-extra-params.js";
 import { normalizeStaticProviderModelId } from "../../agents/model-ref-shared.js";
 import { normalizeProviderId } from "../../agents/model-selection.js";
 import { parseNonNegativeByteSize } from "../../config/byte-size.js";
 import {
+  findConfiguredProviderModel,
   resolveMergedModelProviderConfig,
-  resolveMergedModelProviderModels,
 } from "../../config/model-provider-config.js";
 import { resolveFreshSessionTotalTokens, type SessionEntry } from "../../config/sessions.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
-
-export function resolveMemoryFlushContextWindowTokens(params: {
-  modelId?: string;
-  cfg?: OpenClawConfig;
-  provider?: string;
-}): number {
-  return (
-    resolveContextTokensForModel({
-      cfg: params.cfg,
-      provider: params.provider,
-      model: params.modelId,
-      allowAsyncLoad: false,
-    }) ?? DEFAULT_CONTEXT_TOKENS
-  );
-}
 
 export function resolveMaxActiveTranscriptBytes(cfg?: OpenClawConfig): number | undefined {
   const parsed = parseNonNegativeByteSize(
@@ -42,6 +25,19 @@ function resolvePositiveTokenCount(value: number | undefined): number | undefine
     : undefined;
 }
 
+export function resolveEffectivePromptTokens(
+  basePromptTokens?: number,
+  lastOutputTokens?: number,
+  promptTokenEstimate?: number,
+): number {
+  const base = Math.max(0, basePromptTokens ?? 0);
+  const output = Math.max(0, lastOutputTokens ?? 0);
+  const estimate = Math.max(0, promptTokenEstimate ?? 0);
+  // Flush gating projects the next input context by adding the previous
+  // completion and the current user prompt estimate.
+  return base + output + estimate;
+}
+
 /** Resolves the blocking threshold using the selected reserve and server floor. */
 export function resolveCompactionThreshold(params: {
   contextWindowTokens: number;
@@ -54,6 +50,7 @@ export function resolveCompactionThreshold(params: {
 }
 
 export function resolveResponsesServerCompactionThreshold(params: {
+  contextWindowTokens: number;
   cfg?: OpenClawConfig;
   provider?: string;
   modelId?: string;
@@ -67,10 +64,12 @@ export function resolveResponsesServerCompactionThreshold(params: {
   const normalizeModelId = (value: string) =>
     normalizeStaticProviderModelId(normalizedProvider, value).trim().toLowerCase();
   const providerConfig = resolveMergedModelProviderConfig(params.cfg, provider);
-  const configuredModel = resolveMergedModelProviderModels({
-    models: providerConfig?.models,
+  const configuredModel = findConfiguredProviderModel(
+    providerConfig,
+    provider,
+    modelId,
     normalizeModelId,
-  }).get(normalizeModelId(modelId));
+  );
   const { defaultParams, modelParams } = resolveModelExtraParamSources({
     config: params.cfg,
     provider,
@@ -83,20 +82,13 @@ export function resolveResponsesServerCompactionThreshold(params: {
         provider,
         api: configuredModel?.api ?? providerConfig?.api ?? "anthropic-messages",
         baseUrl: configuredModel?.baseUrl ?? providerConfig?.baseUrl,
-        contextWindow:
-          configuredModel?.contextWindow ??
-          resolveMemoryFlushContextWindowTokens({ cfg: params.cfg, provider, modelId }),
+        contextWindow: configuredModel?.contextWindow ?? params.contextWindowTokens,
       },
       extraParams,
     ).threshold;
   }
   const defaultOpenAIBaseUrl =
     normalizedProvider === "openai" ? "https://api.openai.com/v1" : undefined;
-  const activeContextTokens = resolveMemoryFlushContextWindowTokens({
-    cfg: params.cfg,
-    provider,
-    modelId,
-  });
   return resolveOpenAIResponsesServerCompactionPlan(
     {
       provider,
@@ -106,8 +98,8 @@ export function resolveResponsesServerCompactionThreshold(params: {
         (normalizedProvider === "openai" ? "openai-responses" : undefined),
       baseUrl: configuredModel?.baseUrl ?? providerConfig?.baseUrl ?? defaultOpenAIBaseUrl,
       compat: configuredModel?.compat,
-      contextTokens: configuredModel?.contextTokens ?? activeContextTokens,
-      contextWindow: configuredModel?.contextWindow ?? activeContextTokens,
+      contextTokens: configuredModel?.contextTokens ?? params.contextWindowTokens,
+      contextWindow: configuredModel?.contextWindow ?? params.contextWindowTokens,
     },
     extraParams,
   ).threshold;

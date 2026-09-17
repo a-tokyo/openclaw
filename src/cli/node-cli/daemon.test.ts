@@ -1,3 +1,11 @@
+import type { DaemonRuntimePinSnapshot } from "../../daemon/runtime-pin-types.js";
+const pinSnapshotMock = vi.hoisted(() =>
+  vi.fn<() => DaemonRuntimePinSnapshot>(() => ({ revision: "empty", stored: false })),
+);
+vi.mock("../../daemon/runtime-pin-state.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../daemon/runtime-pin-state.js")>()),
+  readDaemonRuntimePinForInstall: pinSnapshotMock,
+}));
 // Node daemon tests cover node daemon command runtime behavior and errors.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { GatewayServiceRuntime } from "../../daemon/service-runtime.js";
@@ -139,11 +147,13 @@ afterEach(() => {
 
 describe("runNodeDaemonInstall", () => {
   beforeEach(() => {
+    pinSnapshotMock.mockReset().mockReturnValue({ revision: "empty", stored: false });
     mocks.runtime.log.mockClear();
     mocks.runtime.error.mockClear();
     mocks.runtime.writeJson.mockClear();
     mocks.runtime.exit.mockClear();
     vi.stubEnv("OPENCLAW_NIX_MODE", undefined);
+    mocks.service.readCommand.mockReset().mockResolvedValue(null);
     mocks.service.install.mockReset().mockResolvedValue(undefined);
     mocks.service.isLoaded.mockReset().mockResolvedValue(false);
     mocks.buildNodeInstallPlan.mockReset().mockResolvedValue({
@@ -168,6 +178,97 @@ describe("runNodeDaemonInstall", () => {
     });
   });
 
+  it.each(["preserve", "replace", "reset"] as const)(
+    "handles a runtime pin during %s node reinstall",
+    async (mode) => {
+      const pin = process.execPath;
+      mocks.service.isLoaded.mockResolvedValueOnce(false).mockResolvedValue(true);
+      mocks.service.readCommand.mockResolvedValue({
+        programArguments: [pin, "/fixture/openclaw.mjs", "node", "run"],
+      });
+      pinSnapshotMock.mockReturnValue({
+        revision: "prior",
+        stored: true,
+        pin: { runtime: "node", path: mode === "preserve" ? pin : "/removed/node" },
+      });
+      await runNodeDaemonInstall({
+        force: true,
+        ...(mode === "replace" ? { runtimePath: pin } : {}),
+        ...(mode === "reset" ? { runtime: "node" } : {}),
+      });
+      expect(mocks.runtime.error).not.toHaveBeenCalled();
+      expect(mocks.buildNodeInstallPlan).toHaveBeenCalledWith(
+        expect.objectContaining({
+          pinnedRuntimePath: mode === "reset" ? undefined : pin,
+          tls: true,
+          tlsFingerprint: TLS_FINGERPRINT,
+        }),
+      );
+      expect(mocks.service.install).toHaveBeenCalledOnce();
+    },
+  );
+
+  it.each([undefined, "", "/invoked/wrapper"])(
+    "preserves managed wrapper ownership with invocation value %s",
+    async (wrapper) => {
+      vi.stubEnv("OPENCLAW_WRAPPER", wrapper);
+      mocks.service.isLoaded.mockResolvedValue(true);
+      mocks.service.readCommand.mockResolvedValue({
+        programArguments: ["/override/wrapper", "node", "run"],
+        environment: {
+          OPENCLAW_WRAPPER: "/override/wrapper",
+        },
+        managedDefinition: {
+          programArguments: ["/managed/wrapper", "node", "run"],
+          environment: {
+            OPENCLAW_WRAPPER: "/managed/wrapper",
+          },
+        },
+      });
+      pinSnapshotMock.mockReturnValue({
+        revision: "prior",
+        stored: true,
+        pin: { runtime: "node", path: process.execPath },
+      });
+      await runNodeDaemonInstall({ force: true });
+      expect(mocks.runtime.error).not.toHaveBeenCalled();
+      expect(mocks.buildNodeInstallPlan).toHaveBeenCalledWith(
+        expect.objectContaining({
+          env: expect.objectContaining({
+            OPENCLAW_WRAPPER: wrapper ?? "/managed/wrapper",
+          }),
+          pinnedRuntimePath: process.execPath,
+          tls: true,
+          tlsFingerprint: TLS_FINGERPRINT,
+        }),
+      );
+      expect(mocks.service.install).toHaveBeenCalledOnce();
+    },
+  );
+
+  it("does not adopt an override-only pin or wrapper into the managed node service", async () => {
+    vi.stubEnv("OPENCLAW_WRAPPER", undefined);
+    mocks.service.isLoaded.mockResolvedValue(true);
+    mocks.service.readCommand.mockResolvedValue({
+      programArguments: ["/override/wrapper", "node", "run"],
+      environment: {
+        OPENCLAW_WRAPPER: "/override/wrapper",
+      },
+      managedDefinition: { programArguments: ["node", "node", "run"], environment: {} },
+    });
+    await runNodeDaemonInstall({ force: true });
+    expect(mocks.runtime.error).not.toHaveBeenCalled();
+    expect(mocks.buildNodeInstallPlan).toHaveBeenCalledWith(
+      expect.objectContaining({
+        runtime: "node",
+        env: expect.objectContaining({
+          OPENCLAW_WRAPPER: undefined,
+        }),
+      }),
+    );
+    expect(mocks.service.install).toHaveBeenCalledOnce();
+  });
+
   it.each([
     ["host", { host: "new-gateway.local" }],
     ["port", { port: 19_001 }],
@@ -183,8 +284,8 @@ describe("runNodeDaemonInstall", () => {
     );
   });
 
-  it("inherits saved TLS when the gateway endpoint is unchanged", async () => {
-    await runNodeDaemonInstall({ force: true });
+  it("inherits saved TLS and forwards explicit command restrictions to the install plan", async () => {
+    await runNodeDaemonInstall({ force: true, commands: ["fixture.list", "fixture.read"] });
 
     expect(mocks.buildNodeInstallPlan).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -193,8 +294,21 @@ describe("runNodeDaemonInstall", () => {
         contextPath: "/saved",
         tls: true,
         tlsFingerprint: TLS_FINGERPRINT,
+        commands: ["fixture.list", "fixture.read"],
       }),
     );
+  });
+
+  it("forwards a full-surface reset when replacing a restricted service", async () => {
+    mocks.loadNodeHostConfig.mockResolvedValue({
+      gateway: { host: "saved-gateway.local", port: 18789 },
+      commands: ["fixture.read"],
+    });
+    await runNodeDaemonInstall({ force: true, allCommands: true });
+    expect(mocks.buildNodeInstallPlan).toHaveBeenCalledWith(
+      expect.objectContaining({ allCommands: true, commands: undefined }),
+    );
+    expect(mocks.service.install).toHaveBeenCalledOnce();
   });
 
   it.each([
@@ -454,6 +568,7 @@ describe("runNodeDaemonInstall", () => {
 
 describe("node daemon lifecycle adapters", () => {
   beforeEach(() => {
+    pinSnapshotMock.mockReset().mockReturnValue({ revision: "empty", stored: false });
     mocks.runServiceRestart.mockReset();
     mocks.runServiceStart.mockReset();
     mocks.runServiceStop.mockReset();
@@ -515,6 +630,7 @@ describe("runNodeDaemonStatus", () => {
   }
 
   beforeEach(() => {
+    pinSnapshotMock.mockReset().mockReturnValue({ revision: "empty", stored: false });
     mocks.runtime.log.mockClear();
     mocks.runtime.error.mockClear();
     mocks.runtime.writeJson.mockClear();
@@ -592,7 +708,7 @@ describe("runNodeDaemonStatus", () => {
   });
 
   it("redacts service credentials from JSON status output", async () => {
-    mocks.service.readCommand.mockResolvedValue({
+    const command: GatewayServiceCommandConfig = {
       programArguments: ["node", "node-host"],
       environment: {
         OPENCLAW_PROFILE: "work",
@@ -604,7 +720,11 @@ describe("runNodeDaemonStatus", () => {
         environment: { OPENCLAW_GATEWAY_TOKEN: "managed-base-token" },
       },
       managedOverrides: { launcher: "command", environment: { keys: ["OPENCLAW_GATEWAY_TOKEN"] } },
-    });
+      definitionPaths: ["/etc/systemd/user/node-definition.conf"],
+      environmentValueSources: { OPENCLAW_PROFILE: "file" },
+      reloadPending: true,
+    };
+    mocks.service.readCommand.mockResolvedValue(command);
 
     await runNodeDaemonStatus({ json: true });
 
@@ -612,6 +732,9 @@ describe("runNodeDaemonStatus", () => {
       service: expect.objectContaining({
         command: expect.objectContaining({
           environment: { OPENCLAW_PROFILE: "work" },
+          definitionPaths: command.definitionPaths,
+          environmentValueSources: command.environmentValueSources,
+          reloadPending: true,
         }),
       }),
     });
@@ -621,5 +744,8 @@ describe("runNodeDaemonStatus", () => {
     expect(payload).not.toContain("managed-base-token");
     expect(payload).not.toContain("managedDefinition");
     expect(payload).not.toContain("managedOverrides");
+    expect(command.environment?.OPENCLAW_GATEWAY_TOKEN).toBe("gateway-token");
+    expect(command.managedDefinition).toBeDefined();
+    expect(command.managedOverrides).toBeDefined();
   });
 });

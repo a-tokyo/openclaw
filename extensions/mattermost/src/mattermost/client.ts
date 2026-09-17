@@ -3,13 +3,19 @@ import { bufferToBlobPart } from "openclaw/plugin-sdk/blob-runtime";
 import { createChannelPartialDeliveryError } from "openclaw/plugin-sdk/channel-inbound";
 import { collectErrorGraphCandidates } from "openclaw/plugin-sdk/error-runtime";
 import { buildTimeoutAbortSignal } from "openclaw/plugin-sdk/extension-shared";
-import { responseWithRelease } from "openclaw/plugin-sdk/fetch-runtime";
+import {
+  captureChannelReadAuthority,
+  responseWithRelease,
+} from "openclaw/plugin-sdk/fetch-runtime";
 import { resolveTimerTimeoutMs } from "openclaw/plugin-sdk/number-runtime";
 import {
   readProviderJsonResponse,
-  readResponseTextLimited,
+  redactProviderResponseErrorText,
 } from "openclaw/plugin-sdk/provider-http";
-import { readResponseWithLimit } from "openclaw/plugin-sdk/response-limit-runtime";
+import {
+  readResponseTextPrefix,
+  readResponseWithLimit,
+} from "openclaw/plugin-sdk/response-limit-runtime";
 import { retryAsync } from "openclaw/plugin-sdk/retry-runtime";
 import {
   fetchWithSsrFGuard,
@@ -146,21 +152,34 @@ async function readMattermostSuccessText(res: Response, path: string): Promise<s
   return new TextDecoder().decode(bytes);
 }
 
-export async function readMattermostError(res: Response): Promise<string> {
+export async function readMattermostError(
+  res: Response,
+  requestHeaders: HeadersInit,
+): Promise<string> {
   const contentType = res.headers.get("content-type") ?? "";
-  const text = await readResponseTextLimited(res, MATTERMOST_ERROR_BODY_LIMIT_BYTES);
+  const { text, truncated } = await readResponseTextPrefix(res, MATTERMOST_ERROR_BODY_LIMIT_BYTES, {
+    chunkTimeoutMs: 10_000,
+    onIdleTimeout: ({ chunkTimeoutMs }) =>
+      new Error(`error body read stalled for ${chunkTimeoutMs}ms`),
+  });
+  let detail = text;
   if (contentType.includes("application/json")) {
     try {
-      const data = JSON.parse(text) as { message?: string } | undefined;
-      if (data?.message) {
-        return data.message;
-      }
-      return JSON.stringify(data);
+      const data: unknown = JSON.parse(text);
+      detail =
+        data !== null &&
+        typeof data === "object" &&
+        "message" in data &&
+        typeof data.message === "string" &&
+        data.message
+          ? data.message
+          : JSON.stringify(data);
     } catch {
-      return text;
+      // A mislabeled or truncated JSON response retains its bounded text diagnostic.
     }
   }
-  return text;
+  // Decode first, then mask the active credential, including a clipped suffix.
+  return redactProviderResponseErrorText(detail, requestHeaders, { sourceTruncated: truncated });
 }
 
 export function createMattermostClient(params: {
@@ -188,6 +207,8 @@ export function createMattermostClient(params: {
     input: RequestInfo | URL,
     init?: MattermostRequestInit,
   ): Promise<Response> => {
+    const assertReadAuthority = captureChannelReadAuthority();
+    assertReadAuthority?.();
     const url =
       typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
     const { timeoutMs: initTimeoutMs, ...requestInit } = init ?? {};
@@ -195,6 +216,7 @@ export function createMattermostClient(params: {
     const { response, release } = await fetchWithSsrFGuard({
       url,
       init: requestInit,
+      beforeRequest: assertReadAuthority,
       auditContext: "mattermost-api",
       policy: ssrfPolicyFromPrivateNetworkOptIn(params.allowPrivateNetwork),
       signal: requestInit.signal ?? undefined,
@@ -207,6 +229,8 @@ export function createMattermostClient(params: {
     | ((input: RequestInfo | URL, init?: MattermostRequestInit) => Promise<Response>)
     | undefined = externalFetchImpl
     ? async (input, init) => {
+        const assertReadAuthority = captureChannelReadAuthority();
+        assertReadAuthority?.();
         const url =
           typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
         const { timeoutMs: initTimeoutMs, ...requestInit } = init ?? {};
@@ -244,13 +268,23 @@ export function createMattermostClient(params: {
     }
     const res = await fetchImpl(url, { ...init, headers });
     if (!res.ok) {
-      const detail = await readMattermostError(res);
+      const detail = await readMattermostError(res, headers);
       throw new Error(
         `Mattermost API ${res.status} ${res.statusText}: ${detail || "unknown error"}`,
       );
     }
 
     if (res.status === 204) {
+      return undefined as T;
+    }
+
+    if (path === "/reactions" && init?.method?.toUpperCase() === "POST") {
+      try {
+        await res.body?.cancel();
+      } catch {
+        // Ignore cancellation failures.
+      }
+      // SAFETY: Reaction creation is a no-result mutation; its caller discards the receipt.
       return undefined as T;
     }
 
@@ -485,7 +519,7 @@ export async function createMattermostDirectChannelWithRetry(
   );
 }
 
-function isRetryableError(error: Error): boolean {
+export function isRetryableError(error: Error): boolean {
   const candidates = collectErrorGraphCandidates(error, (current) => [
     current.cause,
     current.reason,
@@ -699,16 +733,15 @@ export async function uploadMattermostFile(
   form.append("files", blob, fileName);
   form.append("channel_id", params.channelId);
 
+  const headers = { Authorization: `Bearer ${client.token}` };
   const res = await client.fetchImpl(`${client.apiBaseUrl}/files`, {
     method: "POST",
-    headers: {
-      Authorization: `Bearer ${client.token}`,
-    },
+    headers,
     body: form,
   });
 
   if (!res.ok) {
-    const detail = await readMattermostError(res);
+    const detail = await readMattermostError(res, headers);
     throw new Error(`Mattermost API ${res.status} ${res.statusText}: ${detail || "unknown error"}`);
   }
   const data = await readProviderJsonResponse<{ file_infos?: MattermostFileInfo[] }>(

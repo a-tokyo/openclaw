@@ -20,6 +20,7 @@ vi.mock("../secrets/store/secret-store.js", () => {
     writeSecretStoreEntry: secretStoreMocks.writeEntry,
   };
 });
+import { createDeferred } from "../../test/helpers/promise.js";
 import {
   getRuntimeAuthProfileStoreCredentialsRevision,
   getRuntimeAuthProfileStoreSnapshotsRevision,
@@ -227,6 +228,7 @@ function createSecretsReloadHarness(params: SecretsReloadHarnessParams) {
   const respond = params.respond ?? vi.fn();
   const gatewayAux = createGatewayAuxHandlers({
     log: {},
+    getNativeApprovalRouteCoordinator: () => undefined,
     activateRuntimeSecrets: params.activateRuntimeSecrets,
     buildReloadPlan: params.buildReloadPlan,
     sharedGatewaySessionGenerationState: params.sharedGatewaySessionGenerationState ?? {
@@ -324,7 +326,7 @@ beforeEach(async () => {
   // These channel-only snapshots are not model fixtures; the real publication boundary is
   // exercised in server-secrets-reload.model-runtime.test.ts.
   vi.spyOn(modelRuntimeReload, "refreshModelRuntimeAfterHotReload").mockResolvedValue(undefined);
-  resetPreparedModelRuntimeSnapshotsForTest();
+  await resetPreparedModelRuntimeSnapshotsForTest();
   delete process.env.OPENCLAW_SKIP_CHANNELS;
   delete process.env.OPENCLAW_SKIP_PROVIDERS;
   secretStoreMocks.deleteEntry.mockReset();
@@ -339,7 +341,7 @@ afterEach(async () => {
   }
   auxiliaries.length = 0;
   vi.restoreAllMocks();
-  resetPreparedModelRuntimeSnapshotsForTest();
+  await resetPreparedModelRuntimeSnapshotsForTest();
   clearSecretsRuntimeSnapshot();
   await fixture?.cleanup();
   fixture = undefined;
@@ -496,14 +498,8 @@ describe("gateway aux handlers", () => {
       },
     });
     activateSecretsRuntimeSnapshot(createSourceSnapshot(sourceConfig));
-    let releaseFirst: (() => void) | undefined;
-    const firstBlocked = new Promise<void>((resolve) => {
-      releaseFirst = resolve;
-    });
-    let firstStarted: (() => void) | undefined;
-    const firstEntered = new Promise<void>((resolve) => {
-      firstStarted = resolve;
-    });
+    const { promise: firstBlocked, resolve: releaseFirst } = createDeferred();
+    const { promise: firstEntered, resolve: firstStarted } = createDeferred();
     const activateRuntimeSecrets = vi
       .fn()
       .mockImplementationOnce(async () => {

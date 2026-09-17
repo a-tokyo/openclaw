@@ -5,8 +5,9 @@ import {
   setDiscordTranscriptsVoiceManager,
 } from "../extensions/discord/test-api.js";
 import { createTranscriptsTool } from "../src/agents/tools/transcripts-tool.js";
+import { createPluginMetadataSnapshotFixture } from "../src/plugins/plugin-metadata.test-support.js";
 import { createEmptyPluginRegistry } from "../src/plugins/registry-empty.js";
-import { withPluginRuntimeRegistryScope } from "../src/plugins/runtime/gateway-request-scope.js";
+import { withPluginRuntimeGenerationScope } from "../src/plugins/runtime/generation-scope.js";
 import { closeOpenClawStateDatabaseForTest } from "../src/state/openclaw-state-db.js";
 import { TranscriptsStore } from "../src/transcripts/store.js";
 import { createTempDirTracker } from "./helpers/temp-dir.js";
@@ -23,10 +24,9 @@ defineDiscordVoiceTests(
     createManager,
     makeVoiceConfig,
     getSessionEntry,
-    getVoiceReceive,
+    receiveRecordedSpeech,
     expectConnectedStatus,
     requireRecord,
-    transcribeAudioFileMock,
     lastRealtimeBridgeParams,
     beginSpeakerTurn,
   }) => {
@@ -41,6 +41,7 @@ defineDiscordVoiceTests(
           { token: "test-token", groupPolicy: "open", allowFrom: ["discord:u-speaker"] },
         );
         const config = {
+          agents: { defaults: { utilityModel: "" } },
           transcripts: { enabled: true },
           channels: { discord: { accounts: { [accountId]: discordConfig } } },
         };
@@ -56,6 +57,9 @@ defineDiscordVoiceTests(
           source: "discord/transcripts-source-api.ts",
           provider: discordVoiceTranscriptsSourceProvider,
         });
+        const metadataSnapshot = createPluginMetadataSnapshotFixture({
+          plugins: [{ id: "discord", contracts: { transcriptSourceProviders: ["discord-voice"] } }],
+        });
         const tool = createTranscriptsTool({
           config,
           stateDir,
@@ -63,7 +67,9 @@ defineDiscordVoiceTests(
           caller: { kind: "operator", source: "local" },
         });
         const execute = (params: Record<string, unknown>) =>
-          withPluginRuntimeRegistryScope(registry, () => tool.execute("transcripts", params));
+          withPluginRuntimeGenerationScope({ metadataSnapshot, pluginRegistry: registry }, () =>
+            tool.execute("transcripts", params),
+          );
         const store = new TranscriptsStore(path.join(stateDir, "transcripts"), {
           env: { ...process.env, OPENCLAW_STATE_DIR: stateDir },
         });
@@ -77,30 +83,16 @@ defineDiscordVoiceTests(
           ).resolves.toMatchObject({
             details: { sessionId: "first", providerId: "discord-voice", accountId },
           });
-          const entry = getSessionEntry(manager);
-          const segment = {
-            entry,
-            wavPath: path.join(stateDir, "speech.wav"),
-            userId: "u-speaker",
-            durationSeconds: 1,
-          };
-          transcribeAudioFileMock.mockResolvedValueOnce({
-            text: "Keep the original historical note.",
-          });
-          await getVoiceReceive(manager).processSegment(segment);
+          const record = (text: string) =>
+            receiveRecordedSpeech(manager, text, getSessionEntry(manager), "u-speaker");
+          await record("Keep the original historical note.");
 
           await expect(
             execute({ action: "start", sessionId: "second", ...source }),
           ).resolves.toMatchObject({
             details: { sessionId: "second", providerId: "discord-voice", accountId },
           });
-          transcribeAudioFileMock.mockResolvedValueOnce({
-            text: "This belongs only to the replacement.",
-          });
-          await getVoiceReceive(manager).processSegment({
-            ...segment,
-            entry: getSessionEntry(manager),
-          });
+          await record("This belongs only to the replacement.");
 
           const first = expectDefined(await store.readSession("first"), "first capture");
           const second = expectDefined(await store.readSession("second"), "second capture");
@@ -128,12 +120,12 @@ defineDiscordVoiceTests(
             .toEqual(["second"]);
           expect.soft(first.stoppedAt).toEqual(expect.any(String));
 
+          await execute({ action: "stop", sessionId: "first" });
           await expect(execute({ action: "summarize", sessionId: "first" })).resolves.toMatchObject(
             {
               details: { summary: { sessionId: "first", utteranceCount: 1 } },
             },
           );
-          await execute({ action: "stop", sessionId: "first" });
           expect.soft(providerStop).not.toHaveBeenCalled();
           expectConnectedStatus(manager, "1001");
           await expect(execute({ action: "status" })).resolves.toMatchObject({
@@ -172,6 +164,7 @@ defineDiscordVoiceTests(
             const recoveredText = "The same capture continues after reconnect.";
             secondTexts.push(recoveredText);
             recovered.onTranscript?.("user", recoveredText, true);
+            await record(recoveredText);
             await vi.waitFor(async () => {
               expect(
                 (await store.readUtterancesForSession(second)).map((utterance) => utterance.text),
@@ -182,16 +175,20 @@ defineDiscordVoiceTests(
           } else {
             await manager.destroy();
           }
-          await vi.waitFor(async () => {
-            await expect(execute({ action: "status" })).resolves.toMatchObject({
-              details: { active: [], pendingFinalization: [] },
-            });
-            expect(await store.readSession("second")).toMatchObject({
-              stoppedAt: expect.any(String),
-            });
-          });
           expect(manager.status()).toEqual([]);
+          await expect(execute({ action: "status" })).resolves.toMatchObject({
+            details: { active: [expect.objectContaining({ sessionId: "second" })] },
+          });
+          expect((await store.readSession("second"))?.stoppedAt).toBeUndefined();
           expect(providerStop).not.toHaveBeenCalled();
+          await execute({ action: "stop", sessionId: "second" });
+          await expect(execute({ action: "status" })).resolves.toMatchObject({
+            details: { active: [], pendingFinalization: [] },
+          });
+          expect(await store.readSession("second")).toMatchObject({
+            stoppedAt: expect.any(String),
+          });
+          expect(providerStop).toHaveBeenCalledOnce();
 
           if (provider) {
             const stoppedSecond = expectDefined(await store.readSession("second"), "ended capture");
@@ -208,7 +205,7 @@ defineDiscordVoiceTests(
             provider.onReady?.();
             provider.onTranscript?.("user", "Late text from the retired provider.", true);
             await execute({ action: "stop", sessionId: "second" });
-            expect(providerStop).not.toHaveBeenCalled();
+            expect(providerStop).toHaveBeenCalledOnce();
             expectConnectedStatus(manager, "1001");
             await expect(execute({ action: "status" })).resolves.toMatchObject({
               details: {
@@ -229,6 +226,11 @@ defineDiscordVoiceTests(
           }
         } finally {
           try {
+            for (const capture of await discordVoiceTranscriptsSourceProvider.status!(source)) {
+              if (capture.sessionId) {
+                await execute({ action: "stop", sessionId: capture.sessionId });
+              }
+            }
             await manager.destroy();
             await vi.waitFor(async () => {
               await expect(execute({ action: "status" })).resolves.toMatchObject({
@@ -236,7 +238,11 @@ defineDiscordVoiceTests(
               });
             });
           } finally {
-            setDiscordTranscriptsVoiceManager({ accountId, manager: null });
+            setDiscordTranscriptsVoiceManager({
+              accountId,
+              manager: null,
+              expectedManager: manager,
+            });
             providerStop.mockRestore();
             closeOpenClawStateDatabaseForTest();
             tempDirs.cleanup();

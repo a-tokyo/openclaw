@@ -14,7 +14,6 @@ import {
 import type { CodexAttemptResources } from "./run-attempt-resources.js";
 import { joinPresentSections } from "./run-attempt-state.js";
 import { CodexThreadPolicyHandoffError } from "./thread-policy.js";
-import { recordCodexTrajectoryContext } from "./trajectory.js";
 
 export async function startCodexAttemptRuntime(resources: CodexAttemptResources) {
   const {
@@ -32,7 +31,6 @@ export async function startCodexAttemptRuntime(resources: CodexAttemptResources)
   const {
     context,
     turnState,
-    buildRenderedCodexDeveloperInstructions,
     rebuildCodexTurnPromptTextFromCurrentProjection,
     applyNoContextEngineContinuityProjection,
   } = prompt;
@@ -181,10 +179,11 @@ export async function startCodexAttemptRuntime(resources: CodexAttemptResources)
     }
     if (state.thread.lifecycle.action === "started" || state.thread.lifecycle.action === "forked") {
       const activePolicy = resolveReviewerPolicyContext(state.thread);
-      const activeConfig = resolveRuntimeOptionsForCurrentBinding({
+      const activeConfig = await resolveRuntimeOptionsForCurrentBinding({
         modelProvider: activePolicy.modelProvider,
         model: activePolicy.model,
       });
+      connection.assertCurrent();
       const activeAppServer = resolveCodexAppServerForModelProvider({
         appServer: activeConfig,
         provider: activePolicy.modelProvider,
@@ -221,7 +220,9 @@ export async function startCodexAttemptRuntime(resources: CodexAttemptResources)
         clientId: state.client.getInstanceId(),
       },
     });
-    if (applyNoContextEngineContinuityProjection(state.thread.lifecycle.action, state.thread)) {
+    if (
+      await applyNoContextEngineContinuityProjection(state.thread.lifecycle.action, state.thread)
+    ) {
       await rebuildCodexTurnPromptTextFromCurrentProjection();
     }
     trajectoryRecorder?.recordEvent("session.started", {
@@ -230,16 +231,6 @@ export async function startCodexAttemptRuntime(resources: CodexAttemptResources)
       authProfileId: startupAuthProfileId,
       workspaceDir: effectiveWorkspace,
       toolCount: flattenCodexDynamicToolFunctions(toolBridge.specs).length,
-    });
-    recordCodexTrajectoryContext(trajectoryRecorder, {
-      attempt: params,
-      cwd: effectiveCwd,
-      developerInstructions: joinPresentSections(
-        buildRenderedCodexDeveloperInstructions(),
-        attemptTools.configuredMcp?.diagnosticNotice,
-      ),
-      prompt: turnState.codexTurnPromptText,
-      tools: toolBridge.availableSpecs,
     });
     connection.mutable.pluginAppServer = pluginAppServer;
   } catch (error) {
@@ -250,9 +241,10 @@ export async function startCodexAttemptRuntime(resources: CodexAttemptResources)
     await runCleanupStep("codex-start-failure-route-release", releaseCurrentRoute);
     const nativeHookRelay = state.nativeHookRelay;
     state.nativeHookRelay = undefined;
-    await runCleanupStep("codex-start-failure-native-hook-relay", () =>
-      nativeHookRelay?.unregister(),
-    );
+    await runCleanupStep("codex-start-failure-native-hook-relay", async () => {
+      nativeHookRelay?.unregister();
+      await nativeHookRelay?.drain();
+    });
     await runCleanupStep("codex-start-failure-sandbox-release", releaseSandboxExecEnvironment);
     await runCleanupStep(
       "codex-start-failure-shared-client-release",

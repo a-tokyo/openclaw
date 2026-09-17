@@ -156,6 +156,7 @@ suite.define(() => {
                 done: true,
                 status: "error",
                 error: "Authentication failed (provider returned HTTP 401).",
+                activationRejection: { disposition: "rejected-before-promotion", status: "auth" },
               },
               "openclaw.setup.detect": {
                 candidates:
@@ -190,6 +191,10 @@ suite.define(() => {
             page.locator(".content").evaluate((element) => {
               element.scrollTo({ top: element.scrollHeight, behavior: "instant" });
             });
+          if (entry === "manual") {
+            await setup.locator(".model-setup-provider-select__trigger").click();
+            await setup.locator('[data-manual-provider="openai"]').click();
+          }
           await input.fill("invalid-test-key");
           const activate =
             entry === "manual"
@@ -323,8 +328,7 @@ suite.define(() => {
           expect(
             (await gateway.waitForRequest("openclaw.setup.prepare.start")).params,
           ).toMatchObject({ authChoice: "ollama" });
-          await page.getByRole("radio", { name: "Local only" }).check();
-          await page.getByRole("button", { name: "Continue", exact: true }).click();
+          await page.getByRole("button", { name: "Local only", exact: true }).click();
           await expect
             .poll(() => page.getByLabel("Ollama base URL").inputValue())
             .toBe("http://127.0.0.1:11434");
@@ -357,6 +361,7 @@ suite.define(() => {
               done: true,
               status: "error",
               error: "The model did not finish the setup test in time.",
+              activationRejection: { disposition: "rejected-before-promotion", status: "timeout" },
             });
             await gateway.resolveDeferred("openclaw.setup.activate.start", {
               sessionId: "activation-session",
@@ -383,7 +388,7 @@ suite.define(() => {
           }
           expect(await failure.count()).toBe(1);
           expect(await failure.isVisible()).toBe(true);
-          expect(await failure.textContent()).toBe(
+          expect((await failure.textContent())?.trim()).toBe(
             "The model did not finish the setup test in time.",
           );
           await dialog.getByRole("button", { name: "Close", exact: true }).click();

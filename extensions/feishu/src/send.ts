@@ -19,8 +19,9 @@ import {
 } from "./markdown.js";
 import type { MentionTarget } from "./mention-target.types.js";
 import { buildMentionedCardContent } from "./mention.js";
+import { parseMergeForwardContent } from "./message-content.js";
 import { resolveFeishuCardTemplate } from "./native-card.js";
-import { parsePostContent } from "./post.js";
+import { renderPostContent } from "./post.js";
 import { resolveFeishuReceiptKind, toFeishuSendResult } from "./send-result.js";
 import { resolveFeishuSendTarget } from "./send-target.js";
 import type { FeishuChatType, FeishuMessageInfo, FeishuSendResult } from "./types.js";
@@ -93,6 +94,7 @@ type FeishuMessageGetItem = {
   body?: { content?: string };
   sender?: FeishuMessageSender;
   create_time?: string;
+  upper_message_id?: string;
 };
 
 type FeishuGetMessageResponse = {
@@ -229,7 +231,7 @@ function parseFeishuMessageContent(
   }
 
   if (msgType === "post") {
-    return parsePostContent(rawContent).textContent;
+    return renderPostContent(parsed).textContent;
   }
 
   if (msgType === "interactive") {
@@ -307,8 +309,12 @@ export async function getMessageFeishu(params: {
       return null;
     }
 
-    // Support both list shape (data.items[0]) and single-object shape (data as message)
-    const rawItem = response.data?.items?.[0] ?? response.data;
+    // Support both list shape (including flattened merged forwards) and single-object shape.
+    const responseItems = response.data?.items;
+    const rawItem =
+      responseItems?.find((item) => item.msg_type === "merge_forward" && !item.upper_message_id) ??
+      responseItems?.[0] ??
+      response.data;
     const item =
       rawItem &&
       (rawItem.body !== undefined || (rawItem as { message_id?: string }).message_id !== undefined)
@@ -318,7 +324,14 @@ export async function getMessageFeishu(params: {
       return null;
     }
 
-    return parseFeishuMessageItem(item, messageId);
+    const parsedItem = parseFeishuMessageItem(item, messageId);
+    if (parsedItem.contentType === "merge_forward" && responseItems) {
+      return {
+        ...parsedItem,
+        content: parseMergeForwardContent(responseItems),
+      };
+    }
+    return parsedItem;
   } catch {
     return null;
   }

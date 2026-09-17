@@ -7,6 +7,10 @@ import {
   resetAgentRunRegistryForTest,
   rotateAgentRunRegistryLifecycleGeneration,
 } from "../infra/agent-run-registry.js";
+import type {
+  EmbeddedRunAttemptParams,
+  EmbeddedRunAttemptParamsV2,
+} from "../plugin-sdk/agent-harness-runtime.js";
 import type { AgentRuntimeIdentity } from "./agent-runtime-identity-token.js";
 import {
   consumeCronCreatorAuthorityGrant,
@@ -23,13 +27,15 @@ afterEach(() => {
 });
 
 function createManagementFixture(controlUiAdmin = true) {
+  let continuationCurrent = true;
   const runId = "run-admin-management";
   const { operationalRunInstance } = createTestAdmittedRunContext(runId);
   const authority = claimAgentRunDelegatedAuthority(operationalRunInstance);
   const scope = createCronCreatorAuthorityRunScope(
     runId,
     { kind: "local" },
-    controlUiAdmin ? true : undefined,
+    controlUiAdmin ? { source: "control-ui-admin" } : undefined,
+    () => continuationCurrent,
   );
   const operation = new AbortController();
   const identity: AgentRuntimeIdentity = {
@@ -45,12 +51,41 @@ function createManagementFixture(controlUiAdmin = true) {
     identity,
     scope,
     operation,
+    revokeContinuation: () => {
+      continuationCurrent = false;
+    },
     mint: (method = "cron.get") =>
       mintCronCreatorAuthorityGrant(scope, operation.signal, undefined, { method, authority }),
   };
 }
 
 describe("cron creator authority grants", () => {
+  it.each(["control-ui-admin", "channel-owner"] as const)(
+    "preserves the %s SDK projection without granting creator authority",
+    (source) => {
+      const entitlement =
+        source === "channel-owner" ? { source, isCurrent: () => true } : { source };
+      const scope = createCronCreatorAuthorityRunScope(
+        "sdk-compat",
+        { kind: "unknown" },
+        entitlement,
+      );
+      const legacy: Pick<EmbeddedRunAttemptParams, "cronCreatorAuthorityCapability"> = {
+        cronCreatorAuthorityCapability: scope,
+      };
+      const current: Pick<EmbeddedRunAttemptParamsV2, "cronCreatorAuthorityCapability"> = legacy;
+      expect(legacy.cronCreatorAuthorityCapability?.controlUiAdmin).toBe(
+        source === "control-ui-admin" ? true : undefined,
+      );
+      expect(current.cronCreatorAuthorityCapability?.controlUiAdmin).toBe(
+        source === "control-ui-admin" ? true : undefined,
+      );
+      expect(() => mintCronCreatorAuthorityGrant(scope)).toThrow(
+        "Automation creation is not granted",
+      );
+      revokeCronCreatorAuthorityRunScope(scope);
+    },
+  );
   it("consumes an exact live grant only once", () => {
     const scope = createCronCreatorAuthorityRunScope("run-1");
     const grant = mintCronCreatorAuthorityGrant(scope);
@@ -137,7 +172,8 @@ describe("cron creator authority grants", () => {
 });
 
 describe("cron management authority grants", () => {
-  const denied = /Retry from a fresh authenticated Control UI administrator turn/;
+  const denied =
+    /Retry from a fresh authenticated configured channel owner or Control UI administrator turn/;
 
   it("retains a redeemed queued operation until its exact run closes, without permitting replay", async () => {
     const fixture = createManagementFixture();
@@ -241,6 +277,10 @@ describe("cron management authority grants", () => {
   });
 
   it.each([
+    [
+      "continuation ownership loss",
+      (fixture: ReturnType<typeof createManagementFixture>) => fixture.revokeContinuation(),
+    ],
     [
       "release",
       (fixture: ReturnType<typeof createManagementFixture>) =>

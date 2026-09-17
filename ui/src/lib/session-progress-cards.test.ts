@@ -1,9 +1,9 @@
-import { GATEWAY_SERVER_CAPS } from "@openclaw/gateway-protocol";
 import { MAX_DATE_TIMESTAMP_MS } from "@openclaw/normalization-core/number-coercion";
 import { describe, expect, it, onTestFinished, vi } from "vitest";
 import { createDeferred } from "../../../test/helpers/promise.js";
 import { GatewayRequestError } from "../api/gateway.ts";
 import {
+  createGatewayEvent,
   createGatewayStoreTestStore,
   GATEWAY_STORE_TEST_HELLO,
   stubGatewayStoreTestGlobals,
@@ -18,11 +18,10 @@ function createProgressCard(updatedAt: number) {
   return { sessionKey, revision: 1, updatedAt, markdown: "Progress update" };
 }
 
-function createGateway(mainSessionKey?: string, mainKey = "main", supportsOwner = true) {
+function createGateway(mainSessionKey?: string, mainKey = "main") {
   const request = vi.fn();
   const features = {
     methods: ["progressCard.get", "progressCard.put"],
-    capabilities: supportsOwner ? [GATEWAY_SERVER_CAPS.PROGRESS_CARD_AGENT_SCOPE] : [],
   };
   let onEvent: Parameters<ApplicationGateway["subscribeEvents"]>[0] | undefined;
   const gateway = {
@@ -64,7 +63,9 @@ describe("session progress card Gateway response boundary", () => {
   ])(
     "revalidates after $method failure while hiding only denied content (denied: $denied)",
     async ({ method, denied }) => {
-      const { gateway, request, emitChange } = createGateway();
+      const { gateway, request, emitChange, features } = createGateway();
+      // Core methods are called directly; a missing advertisement is not a feature gate.
+      features.methods = [];
       const target = { sessionKey };
       const sibling = { sessionKey: "agent:main:other-progress" };
       const card = {
@@ -199,62 +200,55 @@ describe("session progress card Gateway response boundary", () => {
     expect(request).toHaveBeenCalledTimes(3);
   });
 
-  it.each([false, true])(
-    "retains bare target ownership for reads, events and dismissals (owner capability: %s)",
-    async (supportsOwner) => {
-      const { gateway, request, emitChange } = createGateway(
-        "agent:main:main",
-        "main",
-        supportsOwner,
-      );
-      const research = { sessionKey: "notes", agentId: "research" };
-      const main = { sessionKey: "notes", agentId: "main" };
-      const researchKey = "agent:research:notes";
-      const mainKey = "agent:main:notes";
-      const cards = new Map([
-        [researchKey, { sessionKey: researchKey, revision: 1, updatedAt: 1, markdown: "Research" }],
-        [mainKey, { sessionKey: mainKey, revision: 1, updatedAt: 1, markdown: "Main" }],
+  it("retains bare target ownership for reads, events and dismissals", async () => {
+    const { gateway, request, emitChange } = createGateway("agent:main:main");
+    const research = { sessionKey: "notes", agentId: "research" };
+    const main = { sessionKey: "notes", agentId: "main" };
+    const researchKey = "agent:research:notes";
+    const mainKey = "agent:main:notes";
+    const cards = new Map([
+      [researchKey, { sessionKey: researchKey, revision: 1, updatedAt: 1, markdown: "Research" }],
+      [mainKey, { sessionKey: mainKey, revision: 1, updatedAt: 1, markdown: "Main" }],
+    ]);
+    request.mockImplementation(async (method, params) => ({
+      card: method === "progressCard.put" ? null : cards.get(params.sessionKey),
+    }));
+    const store = sessionProgressCardsForGateway(gateway);
+    const owner = {};
+    store.watch(owner, [research, main]);
+    try {
+      await expect(store.load(research)).resolves.toEqual(cards.get(researchKey));
+      await expect(store.load(main)).resolves.toEqual(cards.get(mainKey));
+      expect(request.mock.calls).toEqual([
+        ["progressCard.get", { sessionKey: researchKey }],
+        ["progressCard.get", { sessionKey: mainKey }],
       ]);
-      request.mockImplementation(async (method, params) => ({
-        card: method === "progressCard.put" ? null : cards.get(params.sessionKey),
-      }));
-      const store = sessionProgressCardsForGateway(gateway);
-      const owner = {};
-      store.watch(owner, [research, main]);
-      try {
-        await expect(store.load(research)).resolves.toEqual(cards.get(researchKey));
-        await expect(store.load(main)).resolves.toEqual(cards.get(mainKey));
-        expect(request.mock.calls).toEqual([
-          ["progressCard.get", { sessionKey: researchKey }],
-          ["progressCard.get", { sessionKey: mainKey }],
-        ]);
-        expect(store.get({ sessionKey: mainKey, agentId: "research" })).toBe(store.get(main));
-        const replacement = {
-          sessionKey: researchKey,
-          revision: 2,
-          updatedAt: 2,
-          markdown: "Updated",
-        };
-        cards.set(researchKey, replacement);
-        emitChange(researchKey, null);
-        await vi.waitFor(() => expect(store.get(research)).toEqual(replacement));
-        expect(store.get(main)).toEqual(cards.get(mainKey));
-        const card = store.get(research);
-        if (!card) {
-          throw new Error("Expected the refreshed Research card");
-        }
-        await expect(store.dismiss(research, card)).resolves.toBe(true);
-        expect(request).toHaveBeenLastCalledWith("progressCard.put", {
-          sessionKey: researchKey,
-          expectedRevision: 2,
-        });
-        expect(store.get(research)).toBeNull();
-        expect(store.get(main)).toEqual(cards.get(mainKey));
-      } finally {
-        store.unwatch(owner);
+      expect(store.get({ sessionKey: mainKey, agentId: "research" })).toBe(store.get(main));
+      const replacement = {
+        sessionKey: researchKey,
+        revision: 2,
+        updatedAt: 2,
+        markdown: "Updated",
+      };
+      cards.set(researchKey, replacement);
+      emitChange(researchKey, null);
+      await vi.waitFor(() => expect(store.get(research)).toEqual(replacement));
+      expect(store.get(main)).toEqual(cards.get(mainKey));
+      const card = store.get(research);
+      if (!card) {
+        throw new Error("Expected the refreshed Research card");
       }
-    },
-  );
+      await expect(store.dismiss(research, card)).resolves.toBe(true);
+      expect(request).toHaveBeenLastCalledWith("progressCard.put", {
+        sessionKey: researchKey,
+        expectedRevision: 2,
+      });
+      expect(store.get(research)).toBeNull();
+      expect(store.get(main)).toEqual(cards.get(mainKey));
+    } finally {
+      store.unwatch(owner);
+    }
+  });
 
   it("preserves the owner-scoped unknown sentinel", async () => {
     const { gateway, request } = createGateway("agent:main:main");
@@ -421,7 +415,6 @@ describe("session progress card Gateway response boundary", () => {
       ...GATEWAY_STORE_TEST_HELLO,
       features: {
         methods: ["progressCard.get"],
-        capabilities: [GATEWAY_SERVER_CAPS.PROGRESS_CARD_AGENT_SCOPE],
       },
       snapshot: { sessionDefaults: { mainSessionKey, mainKey: "main", defaultAgentId: "main" } },
     });
@@ -440,16 +433,37 @@ describe("session progress card Gateway response boundary", () => {
     await store.load(target);
     expect(store.get(target)).toEqual(oldCard);
 
+    const staleRead = createDeferred<{ card: typeof oldCard }>();
+    current().request.mockReturnValueOnce(staleRead.promise);
+    current().opts.onEvent?.(
+      createGatewayEvent("progressCard.changed", { sessionKey: oldCard.sessionKey, revision: 2 }),
+    );
+    const oldRead = store.load(target);
+    current().opts.onEvent?.(
+      createGatewayEvent("progressCard.changed", { sessionKey: oldCard.sessionKey, revision: 3 }),
+    );
     gateway.connect();
     const replacement = current();
     replacement.request.mockResolvedValue({ card: nextCard });
     replacement.opts.onHello?.(hello("agent:main:main"));
     await vi.waitFor(() => expect(store.get(target)).toEqual(nextCard));
+    staleRead.resolve({ card: oldCard });
+    await expect(oldRead).resolves.toBeNull();
+    expect(store.get(target)).toEqual(nextCard);
     expect(replacement.request).toHaveBeenCalledTimes(1);
 
     const staleDismiss = createDeferred<{ card: null }>();
     replacement.request.mockReturnValueOnce(staleDismiss.promise);
     const dismissal = store.dismiss(target, store.get(target)!);
+    const interruptedRead = createDeferred<{ card: typeof nextCard }>();
+    replacement.request.mockReturnValueOnce(interruptedRead.promise);
+    replacement.opts.onEvent?.(
+      createGatewayEvent("progressCard.changed", { sessionKey: nextCard.sessionKey, revision: 2 }),
+    );
+    const reconnectRead = store.load(target);
+    replacement.opts.onEvent?.(
+      createGatewayEvent("progressCard.changed", { sessionKey: nextCard.sessionKey, revision: 3 }),
+    );
     replacement.opts.onClose?.({ code: 1006, reason: "socket lost", willRetry: true });
     expect(gateway.snapshot.phase).toBe("reconnecting");
     expect(gateway.snapshot.client).toBe(replacement);
@@ -458,55 +472,12 @@ describe("session progress card Gateway response boundary", () => {
     replacement.request.mockResolvedValue({ card: refreshedCard });
     replacement.opts.onHello?.(hello("agent:main:main"));
     await vi.waitFor(() => expect(store.get(target)).toEqual(refreshedCard));
+    interruptedRead.resolve({ card: nextCard });
+    await expect(reconnectRead).resolves.toBeNull();
     staleDismiss.resolve({ card: null });
     await expect(dismissal).resolves.toBe(false);
     expect(store.get(target)).toEqual(refreshedCard);
-    expect(replacement.request).toHaveBeenCalledTimes(3);
-  });
-
-  it("preserves old Gateway qualified reads and refuses an unsupported explicit global owner", async () => {
-    const { gateway, request, emitChange, features } = createGateway(
-      "agent:main:main",
-      "main",
-      false,
-    );
-    const ordinary = { sessionKey: "agent:research:ordinary", agentId: "research" };
-    const card = {
-      sessionKey: ordinary.sessionKey,
-      revision: 1,
-      updatedAt: 1,
-      markdown: "Ordinary progress",
-    };
-    request.mockResolvedValue({ card });
-    const store = sessionProgressCardsForGateway(gateway);
-    await expect(store.load(ordinary)).resolves.toEqual(card);
-    expect(request).toHaveBeenCalledExactlyOnceWith("progressCard.get", {
-      sessionKey: ordinary.sessionKey,
-    });
-    request.mockClear();
-    const global = { sessionKey: "global", agentId: "research" };
-    await expect(store.load(global)).rejects.toThrow("Update the Gateway");
-    expect(store.getError(global)).toBe("unsupported-owner");
-    expect(request).not.toHaveBeenCalled();
-    features.capabilities = [GATEWAY_SERVER_CAPS.PROGRESS_CARD_AGENT_SCOPE];
-    const globalCard = {
-      ...card,
-      sessionKey: "agent:research:global",
-      markdown: "Last global progress",
-    };
-    request.mockResolvedValue({ card: globalCard });
-    const owner = {};
-    store.watch(owner, [global]);
-    const capturedCard = await store.load(global);
-    expect(capturedCard).toEqual(globalCard);
-    features.capabilities = [];
-    request.mockClear();
-    emitChange(globalCard.sessionKey, null);
-    expect(store.get(global)).toBe(capturedCard);
-    expect(store.getError(global)).toBe("unsupported-owner");
-    await expect(store.dismiss(global, capturedCard!)).rejects.toThrow("Update the Gateway");
-    expect(request).not.toHaveBeenCalled();
-    store.unwatch(owner);
+    expect(replacement.request).toHaveBeenCalledTimes(4);
   });
 
   it.each([-MAX_DATE_TIMESTAMP_MS, MAX_DATE_TIMESTAMP_MS])(

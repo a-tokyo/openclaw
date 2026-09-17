@@ -1,6 +1,5 @@
 import { spawnSync } from "node:child_process";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { note as clackNote } from "@clack/prompts";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { sanitizeForLog, stripAnsi, visibleWidth } from "./ansi.js";
@@ -151,7 +150,7 @@ describe("renderTable", () => {
         process.execPath,
         [
           "--import",
-          fileURLToPath(new URL("../../../scripts/tsx.mjs", import.meta.url)),
+          new URL("../../../scripts/tsx.mjs", import.meta.url).href,
           "--input-type=module",
           "-e",
           `import { renderTable } from ${JSON.stringify(new URL("./table.ts", import.meta.url).href)};
@@ -620,6 +619,55 @@ console.log(JSON.stringify({
   );
 
   it.each([
+    ["LF", "\n", "", ""],
+    ["CR", "\r", "", ""],
+    ["CRLF", "\r\n", "", ""],
+    ["colored CRLF", "\r\n", "\x1b[31m", "\x1b[39m"],
+    ["linked LF", "\n", "\x1b]8;;https://example.com/\x07", "\x1b]8;;\x07"],
+  ])(
+    "preserves blank %s lines without adding rows after wrapped spacing",
+    (_label, separator, open, close) => {
+      const out = renderTable({
+        border: "ascii",
+        width: 15,
+        columns: [
+          { key: "A", header: "A", minWidth: 6, maxWidth: 6 },
+          { key: "B", header: "B", minWidth: 6, maxWidth: 6 },
+        ],
+        rows: [
+          {
+            A: `${open}${["", "Read ", "", "Next", "", ""].join(separator)}${close}`,
+            B: "0\n1\n2\n3\n4",
+          },
+        ],
+      });
+
+      const dataLines = out.trimEnd().split("\n").slice(3, -1);
+      expect(
+        dataLines.map((line) =>
+          stripAnsi(line)
+            .split("|")
+            .slice(1, -1)
+            .map((cell) => cell.trim()),
+        ),
+      ).toEqual([
+        ["", "0"],
+        ["Read", "1"],
+        ["", "2"],
+        ["Next", "3"],
+        ["", "4"],
+      ]);
+      if (open) {
+        for (const line of dataLines) {
+          const cell = line.split("|")[1] ?? "";
+          expect(cell).toContain(open);
+          expect(cell).toContain(close);
+        }
+      }
+    },
+  );
+
+  it.each([
     ["LF", "line1\n東京 line2", "", "", 0],
     ["CR", "line1\r東京 line2", "", "", 0],
     ["CRLF", "line1\r\n東京 line2", "", "", 0],
@@ -681,11 +729,18 @@ console.log(JSON.stringify({
     },
   );
 
-  it("shortens only exact home paths and child paths in table cells", () => {
-    const home = path.resolve("test-home", "alice");
-    vi.stubEnv("HOME", home);
+  it.each([
+    ["", path.resolve("/home/other"), "~"],
+    ["undefined", path.resolve("/home/other"), "~"],
+    ["null", path.resolve("/home/other"), "~"],
+    [" undefined ", path.resolve("/home/other"), "~"],
+    ["\tnull\t", path.resolve("/home/other"), "~"],
+    ["/srv/openclaw-home", path.resolve("/srv/openclaw-home"), "$OPENCLAW_HOME"],
+    [" /srv/openclaw-home ", path.resolve("/srv/openclaw-home"), "$OPENCLAW_HOME"],
+  ])("shortens home paths in table cells for OPENCLAW_HOME=%j", (override, home, prefix) => {
+    vi.stubEnv("HOME", "/home/other");
     vi.stubEnv("USERPROFILE", "");
-    vi.stubEnv("OPENCLAW_HOME", "");
+    vi.stubEnv("OPENCLAW_HOME", override);
 
     const out = renderTable({
       border: "none",
@@ -698,11 +753,11 @@ console.log(JSON.stringify({
       ],
     });
 
-    expect(out).toContain("~\n");
-    expect(out).toContain("~/project");
+    expect(out).toContain(`${prefix}\n`);
+    expect(out).toContain(`${prefix}/project`);
     expect(out).toContain(`${home}2/project`);
-    expect(out).toContain("Workspace: ~/project");
-    expect(out).not.toContain("~2/project");
+    expect(out).toContain(`Workspace: ${prefix}/project`);
+    expect(out).not.toContain(`${prefix}2/project`);
   });
 
   it("keeps table borders aligned when cells contain wide emoji graphemes", () => {
@@ -897,6 +952,31 @@ console.log(JSON.stringify({
 });
 
 describe("wrapNoteMessage", () => {
+  it.each([
+    ["LF", "\n"],
+    ["CRLF", "\r\n"],
+    ["CR", "\r"],
+    ["Unicode line separator", "\u2028"],
+    ["Unicode paragraph separator", "\u2029"],
+  ])("preserves note text across %s line endings", (_label, separator) => {
+    const input = ["First paragraph.", "", "- Second paragraph."].join(separator);
+    const writes: string[] = [];
+    const output = {
+      columns: 80,
+      write(chunk: string) {
+        writes.push(chunk);
+        return true;
+      },
+    } as unknown as NodeJS.WriteStream;
+
+    noteToStream(input, "Note", output);
+
+    const rendered = stripAnsi(writes.join(""));
+    expect(rendered).toContain("First paragraph.");
+    expect(rendered).toContain("- Second paragraph.");
+    expect(wrapNoteMessage(input, { columns: 80 })).toBe("First paragraph.\n\n- Second paragraph.");
+  });
+
   it("preserves long filesystem paths without inserting spaces/newlines", () => {
     const input =
       "/Users/user/Documents/Github/impact-signals-pipeline/with/really/long/segments/file.txt";
@@ -920,12 +1000,25 @@ describe("wrapNoteMessage", () => {
     expect(wrapped).toBe(input);
   });
 
-  it("still chunks generic long opaque tokens to avoid pathological line width", () => {
-    const input = "x".repeat(70);
-    const wrapped = wrapNoteMessage(input, { maxWidth: 20, columns: 80 });
-
-    expect(wrapped).toContain("\n");
-    expect(wrapped.replace(/\n/g, "")).toBe(input);
+  const word = "abcdefghijklmnopqrstuvwxyz";
+  it.each<[name: string, input: string, maxWidth: number, expected: string]>([
+    [
+      "opaque token",
+      "x".repeat(70),
+      20,
+      ["x".repeat(20), "x".repeat(20), "x".repeat(20), "x".repeat(10)].join("\n"),
+    ],
+    ["token followed by another word", `${word} tail`, 14, "abcdefghijklmn\nopqrstuvwxyz\ntail"],
+    ["token after a short word", `ok ${word} tail`, 14, "ok\nabcdefghijklmn\nopqrstuvwxyz\ntail"],
+    ["bullet token", `- ${word} tail`, 14, "- abcdefghijkl\n  mnopqrstuvwx\n  yz\n  tail"],
+    [
+      "bullet with wide spacing",
+      `-\u3000${word} tail`,
+      14,
+      "-\u3000abcdefghijk\n  lmnopqrstuv\n  wxyz\n  tail",
+    ],
+  ])("chunks a %s with exact note spacing", (_name, input, maxWidth, expected) => {
+    expect(wrapNoteMessage(input, { maxWidth, columns: 80 })).toBe(expected);
   });
 
   it("wraps bullet lines while preserving bullet indentation", () => {
@@ -1013,7 +1106,7 @@ describe("wrapNoteMessage", () => {
   });
 
   it("keeps wrapped lines within the visible-column budget for wide (CJK) words", () => {
-    // A long CJK run with no separators reaches splitLongWord; each fullwidth char is 2 columns,
+    // A long CJK run with no separators reaches word-fragment wrapping; each fullwidth char is 2 columns,
     // so splitting by code-point count would emit lines up to 2x the budget.
     const input = "東京特許許可局長今日休暇許可局長今日休暇東京特許";
     const lines = wrapNoteMessage(input, { maxWidth: 20, columns: 80 }).split("\n");

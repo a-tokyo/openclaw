@@ -12,8 +12,11 @@ import {
   resolveDiscordGuildEntry,
   resolveDiscordMemberAccessState,
 } from "../monitor/allow-list.js";
+import type { DiscordLivePolicyReader } from "../monitor/live-policy.js";
+import { resolveDiscordVoiceAccess } from "./owner-access.js";
 
-export async function authorizeDiscordVoiceIngress(params: {
+export async function authorizeDiscordVoiceIngress(initialParams: {
+  readPolicy?: DiscordLivePolicyReader;
   cfg: OpenClawConfig;
   discordConfig: DiscordAccountConfig;
   accountId?: string;
@@ -34,8 +37,24 @@ export async function authorizeDiscordVoiceIngress(params: {
   admissionAllowFrom?: string[];
   sender: { id: string; name?: string; tag?: string };
 }): Promise<
-  { ok: true; channelConfig?: DiscordChannelConfigResolved | null } | { ok: false; message: string }
+  | {
+      ok: true;
+      channelConfig?: DiscordChannelConfigResolved | null;
+      isCurrent?: () => boolean;
+    }
+  | { ok: false; message: string }
 > {
+  const policy = await initialParams.readPolicy?.();
+  if (policy?.isCurrent() === false) {
+    return { ok: false, message: "Access policy changed. Try this interaction again." };
+  }
+  const params = policy
+    ? {
+        ...initialParams,
+        ...policy,
+        admissionAllowFrom: resolveDiscordVoiceAccess(policy).admissionAllowFrom,
+      }
+    : initialParams;
   const groupPolicy =
     params.groupPolicy ??
     resolveOpenProviderRuntimeGroupPolicy({
@@ -126,6 +145,6 @@ export async function authorizeDiscordVoiceIngress(params: {
     modeWhenAccessGroupsOff: "configured",
   });
   return commandAuthorized
-    ? { ok: true, channelConfig }
+    ? { ok: true, channelConfig, ...(policy ? { isCurrent: policy.isCurrent } : {}) }
     : { ok: false, message: "You are not authorized to use this command." };
 }

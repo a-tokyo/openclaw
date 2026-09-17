@@ -3,7 +3,11 @@
 
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
 import { uniqueStrings } from "@openclaw/normalization-core/string-normalization";
-import { executeSqliteQuerySync } from "../../infra/kysely-sync.js";
+import {
+  executeSqliteQuerySync,
+  iterateSqliteQuerySync,
+  sqliteStringSet,
+} from "../../infra/kysely-sync.js";
 import {
   parseAgentSessionKey,
   parseThreadSessionSuffix,
@@ -12,10 +16,14 @@ import {
   collectActiveSessionWorkAdmissions,
   runExclusiveSessionLifecycleMutation,
 } from "../../sessions/session-lifecycle-admission.js";
-import type { OpenClawAgentDatabase } from "../../state/openclaw-agent-db.js";
+import {
+  openOpenClawAgentDatabase,
+  type OpenClawAgentDatabase,
+} from "../../state/openclaw-agent-db.js";
 import { sessionDeliveryOrigin } from "../../utils/delivery-context.shared.js";
 import { measureSessionPhysicalDiskUsage, type SessionPhysicalDiskUsage } from "./disk-budget.js";
-import type { SessionStateDeletePlan } from "./session-accessor.sqlite-archive.js";
+import type { SessionStateDeletePlan } from "./session-accessor.sqlite-archive-types.js";
+import { readSessionEntryStore } from "./session-accessor.sqlite-entry-inventory.js";
 import { emitArchivedTranscriptUpdates } from "./session-accessor.sqlite-events.js";
 import {
   collectProjectedReferencedSessionIds,
@@ -30,6 +38,7 @@ import type {
 import {
   cloneSessionEntry,
   getSessionKysely,
+  toDatabaseOptions,
   type ResolvedSqliteReadScope,
 } from "./session-accessor.sqlite-scope.js";
 import { parseSessionEntryJson as parseSessionEntryRow } from "./session-accessor.sqlite-status.js";
@@ -68,24 +77,12 @@ function isDurableConversationSessionKey(
 function loadSqliteSessionMaintenanceStore(
   database: OpenClawAgentDatabase,
 ): Record<string, SessionEntry> {
-  const db = getSessionKysely(database.db);
-  const rows = executeSqliteQuerySync(
-    database.db,
-    db.selectFrom("session_nodes").select(["session_key", "entry_json"]).orderBy("session_key"),
-  ).rows;
-  const store: Record<string, SessionEntry> = {};
-  for (const row of rows) {
-    const entry = parseSessionEntryRow(row);
-    if (entry) {
-      store[row.session_key] = entry;
-    }
-  }
-  return store;
+  return readSessionEntryStore(database);
 }
 
 /** Session ids owned by in-flight work admissions, without live-reference protection. */
 export function collectAdmissionProtectedSessionIds(params: {
-  database: OpenClawAgentDatabase;
+  database: Pick<OpenClawAgentDatabase, "db">;
   storePath: string;
 }): Set<string> {
   const protectedSessionIds = new Set<string>();
@@ -95,6 +92,8 @@ export function collectAdmissionProtectedSessionIds(params: {
     return protectedSessionIds;
   }
 
+  // Admissions may carry either the backing session id or its live session key. Protect both,
+  // then resolve admitted keys through their entries so cleanup cannot reclaim active work.
   for (const identity of admissionIdentities) {
     protectedSessionIds.add(identity);
   }
@@ -102,14 +101,36 @@ export function collectAdmissionProtectedSessionIds(params: {
     [...admissionIdentities].map((identity) => normalizeStoreSessionKey(identity)),
   );
   const db = getSessionKysely(params.database.db);
-  const rows = executeSqliteQuerySync(
+  const admittedKeyBytes: string[] = [];
+  // Normalize lightweight keys before reading payloads; unrelated saved prompts can be large.
+  for (const row of iterateSqliteQuerySync(
     params.database.db,
-    db.selectFrom("session_nodes").select(["entry_json", "current_session_id", "session_key"]),
-  ).rows;
-  for (const row of rows) {
-    if (!normalizedAdmissionKeys.has(normalizeStoreSessionKey(row.session_key))) {
-      continue;
+    db
+      .selectFrom("session_nodes")
+      .select(["session_key", db.fn<string>("hex", ["session_key"]).as("key_bytes")]),
+  )) {
+    if (normalizedAdmissionKeys.has(normalizeStoreSessionKey(row.session_key))) {
+      admittedKeyBytes.push(row.key_bytes);
     }
+  }
+  const rows = admittedKeyBytes.length
+    ? iterateSqliteQuerySync(
+        params.database.db,
+        db
+          .selectFrom("session_nodes")
+          .select(["entry_json", "current_session_id"])
+          // Keep stored keys inside SQLite: Node TEXT rebinding can change raw UTF-16 keys.
+          .where(
+            "session_key",
+            "in",
+            db
+              .selectFrom("session_nodes")
+              .select("session_key")
+              .where(db.fn<string>("hex", ["session_key"]), "in", sqliteStringSet(admittedKeyBytes)),
+          ),
+      )
+    : [];
+  for (const row of rows) {
     protectedSessionIds.add(row.current_session_id);
     const entry = parseSessionEntryRow(row);
     if (entry) {
@@ -118,10 +139,13 @@ export function collectAdmissionProtectedSessionIds(params: {
       }
     }
   }
-  const generationRows = executeSqliteQuerySync(
+  // Key-scoped admissions must survive rollover: an in-flight run admitted by
+  // key may still write to a generation the entry no longer references, so
+  // every generation of an admitted key stays off-limits.
+  const generationRows = iterateSqliteQuerySync(
     params.database.db,
     db.selectFrom("session_windows").select(["session_id", "session_key"]),
-  ).rows;
+  );
   for (const row of generationRows) {
     if (normalizedAdmissionKeys.has(normalizeStoreSessionKey(row.session_key))) {
       protectedSessionIds.add(row.session_id);
@@ -168,6 +192,7 @@ function collectCapacityEligibleLivePreserveKeys(params: {
   skipSessionKeys?: ReadonlySet<string>;
   store: Record<string, SessionEntry>;
   storePath: string;
+  unprotectSessionKeys?: ReadonlySet<string>;
 }): Set<string> {
   const preserveKeys =
     collectSessionMaintenancePreserveKeysForStore({
@@ -183,6 +208,9 @@ function collectCapacityEligibleLivePreserveKeys(params: {
     storePath: params.storePath,
   })) {
     preserveKeys.add(key);
+  }
+  for (const key of params.unprotectSessionKeys ?? []) {
+    preserveKeys.delete(key);
   }
   return preserveKeys;
 }
@@ -257,6 +285,7 @@ export function planOldestCapacityEligibleSqliteLiveEntryRemoval(params: {
   skipSessionKeys?: ReadonlySet<string>;
   storePath: string;
   preserveRecentMs?: number | null;
+  unprotectSessionKeys?: ReadonlySet<string>;
 }): SessionEntryMaintenancePlan {
   const store = loadSqliteSessionMaintenanceStore(params.database);
   const preserveKeys = collectCapacityEligibleLivePreserveKeys({
@@ -264,6 +293,7 @@ export function planOldestCapacityEligibleSqliteLiveEntryRemoval(params: {
     skipSessionKeys: params.skipSessionKeys,
     store,
     storePath: params.storePath,
+    unprotectSessionKeys: params.unprotectSessionKeys,
   });
   const preserveRecentMs = resolveLivePreserveRecentMs(params.preserveRecentMs);
 
@@ -360,7 +390,7 @@ export async function reclaimSqliteLiveSessionEntriesToHighWater(params: {
     removedFiles: number;
     usage: SessionPhysicalDiskUsage;
   }>;
-  reclaimFreePages: (database: OpenClawAgentDatabase) => void;
+  reclaimFreePages: () => void | Promise<void>;
   resolved: Pick<ResolvedSqliteReadScope, "agentId" | "env" | "path">;
   storePath: string;
   usage: SessionPhysicalDiskUsage;
@@ -374,6 +404,7 @@ export async function reclaimSqliteLiveSessionEntriesToHighWater(params: {
   let removedEntries = 0;
   let removedFiles = 0;
   const skipSessionKeys = new Set<string>();
+  const databaseOptions = toDatabaseOptions(params.resolved);
   const livePlanParams = {
     archiveDirectory: params.archiveDirectory,
     database: params.database,
@@ -382,6 +413,7 @@ export async function reclaimSqliteLiveSessionEntriesToHighWater(params: {
     preserveRecentMs: params.preserveRecentMs,
   };
   while (usage.totalBytes > params.highWaterBytes) {
+    livePlanParams.database = openOpenClawAgentDatabase(databaseOptions);
     const livePlan = planOldestCapacityEligibleSqliteLiveEntryRemoval(livePlanParams);
     const victim = livePlan.entryRemovals[0];
     if (!victim) {
@@ -391,7 +423,7 @@ export async function reclaimSqliteLiveSessionEntriesToHighWater(params: {
       [
         victim.sessionKey,
         victim.expectedEntry?.sessionId,
-        ...readSessionGenerationIdsForKeys(params.database, [victim.sessionKey]),
+        ...readSessionGenerationIdsForKeys(livePlanParams.database, [victim.sessionKey]),
       ].filter(
         (identity): identity is string => typeof identity === "string" && identity.length > 0,
       ),
@@ -401,7 +433,13 @@ export async function reclaimSqliteLiveSessionEntriesToHighWater(params: {
       scope: params.storePath,
       identities,
       run: async () => {
-        const fencedPlan = planOldestCapacityEligibleSqliteLiveEntryRemoval(livePlanParams);
+        const fencedPlan = planOldestCapacityEligibleSqliteLiveEntryRemoval({
+          ...livePlanParams,
+          unprotectSessionKeys: new Set([
+            victim.sessionKey,
+            normalizeStoreSessionKey(victim.sessionKey),
+          ]),
+        });
         if (fencedPlan.entryRemovals[0]?.sessionKey !== victim.sessionKey) {
           retargeted = true;
           return null;
@@ -410,16 +448,18 @@ export async function reclaimSqliteLiveSessionEntriesToHighWater(params: {
       },
     });
     if (retargeted) {
+      skipSessionKeys.add(victim.sessionKey);
       continue;
     }
-    if (!published || sqliteSessionNodeExists(params.database, victim.sessionKey)) {
-      skipSessionKeys.add(victim.sessionKey);
+    livePlanParams.database = openOpenClawAgentDatabase(databaseOptions);
+    skipSessionKeys.add(victim.sessionKey);
+    if (!published || sqliteSessionNodeExists(livePlanParams.database, victim.sessionKey)) {
       continue;
     }
     removedEntries += 1;
     emitArchivedTranscriptUpdates(published.archivedTranscripts);
     try {
-      params.reclaimFreePages(params.database);
+      await params.reclaimFreePages();
     } catch {
       // Best-effort reclamation only.
     }
@@ -429,6 +469,7 @@ export async function reclaimSqliteLiveSessionEntriesToHighWater(params: {
       removedFiles += repruned.removedFiles;
       usage = repruned.usage;
     }
+    livePlanParams.database = openOpenClawAgentDatabase(databaseOptions);
   }
   return { removedEntries, removedFiles, usage };
 }

@@ -5,7 +5,11 @@ import {
   createEmptyCostUsageTotals,
 } from "../../../../src/infra/session-cost-usage-totals.js";
 import { renderProviderUsageDetails } from "../../components/provider-usage.ts";
-import { renderSettingsPage, renderSettingsSection } from "../../components/settings-ui.ts";
+import {
+  renderSettingsPage,
+  renderSettingsSection,
+  renderSettingsSegmented,
+} from "../../components/settings-ui.ts";
 import "../../components/tooltip.ts";
 import "../../components/web-awesome.ts";
 import { t } from "../../i18n/index.ts";
@@ -28,12 +32,13 @@ import {
   buildDailyCsv,
   buildQuerySuggestions,
   buildSessionsCsv,
+  buildUsageFilterOptions,
   normalizeQueryText,
   removeQueryToken,
   setQueryTokensForKey,
 } from "./query.ts";
-import type { UsageFilterState, UsageProps, UsageSessionEntry, UsageTotals } from "./types.ts";
-import { renderSessionDetailPanel, usageDateKey } from "./view-details.ts";
+import type { UsageProps, UsageSessionEntry, UsageTotals } from "./types.ts";
+import { renderSessionDetailPanel } from "./view-details.ts";
 import { renderUsageHeatmap } from "./view-heatmap.ts";
 import {
   renderCostBreakdownCompact,
@@ -51,33 +56,6 @@ function renderUsageLoadingStatus(label: unknown) {
       ${label}
     </span>
   `;
-}
-
-function renderUsageLoadingState(filters: UsageFilterState) {
-  return renderSettingsSection(
-    {
-      title: t("usage.loading.title"),
-      actions: renderUsageLoadingStatus(t("usage.loading.badge")),
-    },
-    html`
-      <div class="usage-panel usage-loading-card">
-        <div class="usage-loading-header">
-          <div class="usage-loading-controls">
-            <div class="usage-date-range usage-date-range--loading">
-              <input class="usage-date-input" type="date" .value=${filters.startDate} disabled />
-              <span class="usage-separator">${t("usage.filters.to")}</span>
-              <input class="usage-date-input" type="date" .value=${filters.endDate} disabled />
-            </div>
-          </div>
-        </div>
-        <div class="usage-loading-grid">
-          <div class="skeleton usage-skeleton-block usage-skeleton-block--tall"></div>
-          <div class="skeleton usage-skeleton-block"></div>
-          <div class="skeleton usage-skeleton-block"></div>
-        </div>
-      </div>
-    `,
-  );
 }
 
 function renderUsageEmptyState(onRefresh: () => void) {
@@ -154,13 +132,7 @@ export function renderUsage(props: UsageProps) {
   const displayActions = callbacks.display;
   const detailActions = callbacks.details;
 
-  if (data.loading && !data.totals) {
-    return renderSettingsPage(
-      html`<div class="usage-page">${renderUsageLoadingState(filters)}</div>`,
-      { wide: true },
-    );
-  }
-
+  const hasOverviewData = Boolean(data.totals || data.sessions.length || data.costDaily.length);
   const isTokenMode = display.chartMode === "tokens";
   const hasQuery = filters.query.trim().length > 0;
   const hasDraftQuery = filters.queryDraft.trim().length > 0;
@@ -168,7 +140,7 @@ export function renderUsage(props: UsageProps) {
   const selectedSessionSet = new Set(filters.selectedSessions);
 
   // Sort sessions by tokens or cost depending on mode
-  const sortedSessions = [...data.sessions].toSorted((a, b) => {
+  const sortedSessions = data.sessions.toSorted((a, b) => {
     const valA = isTokenMode ? (a.usage?.totalTokens ?? 0) : (a.usage?.totalCost ?? 0);
     const valB = isTokenMode ? (b.usage?.totalTokens ?? 0) : (b.usage?.totalCost ?? 0);
     return valB - valA;
@@ -195,16 +167,14 @@ export function renderUsage(props: UsageProps) {
       return session.usage.activityDates.some((date) => selectedDaySet.has(date));
     }
     return Boolean(
-      session.updatedAt && selectedDaySet.has(usageDateKey(session.updatedAt, filters.timeZone)),
+      session.updatedAt &&
+      selectedDaySet.has(formatIsoDate(new Date(session.updatedAt), filters.timeZone)),
     );
   };
   const filteredSessions = queryResult.sessions.filter(matchesSelectedDays);
   const queryWarnings = queryResult.warnings;
-  const querySuggestions = buildQuerySuggestions(
-    filters.queryDraft,
-    agentScopedSessions,
-    data.aggregates,
-  );
+  const filterOptions = buildUsageFilterOptions(agentScopedSessions, data.aggregates);
+  const querySuggestions = buildQuerySuggestions(filters.queryDraft, filterOptions);
   const queryTerms = extractQueryTerms(filters.queryDraft);
   const selectedValuesFor = (key: string): string[] => {
     const normalized = normalizeQueryText(key);
@@ -213,29 +183,6 @@ export function renderUsage(props: UsageProps) {
       .map((term) => term.value)
       .filter(Boolean);
   };
-  const unique = (items: Array<string | undefined>) => {
-    const set = new Set<string>();
-    for (const item of items) {
-      if (item) {
-        set.add(item);
-      }
-    }
-    return Array.from(set);
-  };
-  const channelOptions = unique(agentScopedSessions.map((s) => s.channel)).slice(0, 12);
-  const providerOptions = unique([
-    ...agentScopedSessions.map((s) => s.modelProvider),
-    ...agentScopedSessions.map((s) => s.providerOverride),
-    ...(data.aggregates?.byProvider.map((entry) => entry.provider) ?? []),
-  ]).slice(0, 12);
-  const modelOptions = unique([
-    ...agentScopedSessions.map((s) => s.model),
-    ...(data.aggregates?.byModel.map((entry) => entry.model) ?? []),
-  ]).slice(0, 12);
-  const toolOptions = unique(data.aggregates?.tools.tools.map((tool) => tool.name) ?? []).slice(
-    0,
-    12,
-  );
 
   // Get first selected session for detail view (timeseries, logs)
   const primarySelectedEntry =
@@ -279,11 +226,13 @@ export function renderUsage(props: UsageProps) {
         );
       })()
     : data.costDaily;
-  const displayTotals = selectedDaySet.size
-    ? computeTotals(filteredDaily.filter((day) => selectedDaySet.has(day.date)))
-    : hasSessionFilters
-      ? computeTotals(aggregateSessions.map((session) => session.usage))
-      : data.totals;
+  const displayTotals = !hasOverviewData
+    ? null
+    : selectedDaySet.size
+      ? computeTotals(filteredDaily.filter((day) => selectedDaySet.has(day.date)))
+      : hasSessionFilters
+        ? computeTotals(aggregateSessions.map((session) => session.usage))
+        : data.totals;
   const displaySessionCount = aggregateSessions.length;
   const totalSessions = agentScopedSessions.length;
   const activeAggregates = hasAggregateFilters
@@ -299,13 +248,19 @@ export function renderUsage(props: UsageProps) {
   // Cost windows use range-wide daily totals; filtered pages need exact scoped data.
   const costWindowComparison = hasAggregateFilters
     ? nothing
-    : renderCostWindowComparison(data.costDaily, filters.startDate, filters.endDate);
+    : renderCostWindowComparison(
+        data.costDaily,
+        filters.startDate,
+        filters.endDate,
+        filters.timeZone,
+      );
 
   const insightStats = buildUsageInsightStats(aggregateSessions, insightTotals, insightAggregates);
   // The gateway always returns a totals object (all-zero when idle), so key
   // the empty state off content — and never render it under an error callout,
   // where "no usage data yet" would misexplain the failure.
   const isEmpty =
+    data.totals !== null &&
     !data.loading &&
     !data.error &&
     data.sessions.length === 0 &&
@@ -330,14 +285,18 @@ export function renderUsage(props: UsageProps) {
   ];
   const applyPreset = (days: number) => {
     const end = new Date();
-    const start = new Date();
-    start.setDate(start.getDate() - (days - 1));
-    filterActions.onStartDateChange(formatIsoDate(start));
-    filterActions.onEndDateChange(formatIsoDate(end));
+    const start = new Date(end);
+    if (filters.timeZone === "utc") {
+      start.setUTCDate(start.getUTCDate() - (days - 1));
+    } else {
+      start.setDate(start.getDate() - (days - 1));
+    }
+    filterActions.onStartDateChange(formatIsoDate(start, filters.timeZone));
+    filterActions.onEndDateChange(formatIsoDate(end, filters.timeZone));
   };
   const applyAllRange = () => {
     filterActions.onStartDateChange("1970-01-01");
-    filterActions.onEndDateChange(formatIsoDate(new Date()));
+    filterActions.onEndDateChange(formatIsoDate(new Date(), filters.timeZone));
   };
   const renderFilterSelect = (key: string, label: string, options: string[]) => {
     if (options.length === 0) {
@@ -580,36 +539,38 @@ export function renderUsage(props: UsageProps) {
                   <option value="local">${t("usage.filters.timeZoneLocal")}</option>
                   <option value="utc">${t("usage.filters.timeZoneUtc")}</option>
                 </select>
-                <div class="chart-toggle">
-                  <button
-                    class="btn btn--sm toggle-btn ${filters.scope === "instance" ? "active" : ""}"
-                    title=${t("usage.scope.instanceHint")}
-                    @click=${() => filterActions.onScopeChange("instance")}
-                  >
-                    ${t("usage.scope.instance")}
-                  </button>
-                  <button
-                    class="btn btn--sm toggle-btn ${filters.scope === "family" ? "active" : ""}"
-                    title=${t("usage.scope.familyHint")}
-                    @click=${() => filterActions.onScopeChange("family")}
-                  >
-                    ${t("usage.scope.family")}
-                  </button>
-                </div>
-                <div class="chart-toggle">
-                  <button
-                    class="btn btn--sm toggle-btn ${isTokenMode ? "active" : ""}"
-                    @click=${() => displayActions.onChartModeChange("tokens")}
-                  >
-                    ${t("usage.metrics.tokens")}
-                  </button>
-                  <button
-                    class="btn btn--sm toggle-btn ${!isTokenMode ? "active" : ""}"
-                    @click=${() => displayActions.onChartModeChange("cost")}
-                  >
-                    ${t("usage.metrics.cost")}
-                  </button>
-                </div>
+                ${renderSettingsSegmented({
+                  mode: "buttons",
+                  variant: "accent",
+                  ariaPressed: false,
+                  value: filters.scope,
+                  onChange: filterActions.onScopeChange,
+                  onReselect: filterActions.onScopeChange,
+                  options: [
+                    {
+                      value: "instance",
+                      label: t("usage.scope.instance"),
+                      title: t("usage.scope.instanceHint"),
+                    },
+                    {
+                      value: "family",
+                      label: t("usage.scope.family"),
+                      title: t("usage.scope.familyHint"),
+                    },
+                  ],
+                })}
+                ${renderSettingsSegmented({
+                  mode: "buttons",
+                  variant: "accent",
+                  ariaPressed: false,
+                  value: isTokenMode ? "tokens" : "cost",
+                  onChange: displayActions.onChartModeChange,
+                  onReselect: displayActions.onChartModeChange,
+                  options: [
+                    { value: "tokens", label: t("usage.metrics.tokens") },
+                    { value: "cost", label: t("usage.metrics.cost") },
+                  ],
+                })}
                 <button
                   class="btn btn--sm primary"
                   @click=${filterActions.onRefresh}
@@ -655,21 +616,23 @@ export function renderUsage(props: UsageProps) {
                   }
                   <span class="usage-query-hint">
                     ${
-                      hasQuery
-                        ? t("usage.query.matching", {
-                            shown: String(filteredSessions.length),
-                            total: String(totalSessions),
-                          })
-                        : t("usage.query.inRange", { total: String(totalSessions) })
+                      !hasOverviewData
+                        ? nothing
+                        : hasQuery
+                          ? t("usage.query.matching", {
+                              shown: String(filteredSessions.length),
+                              total: String(totalSessions),
+                            })
+                          : t("usage.query.inRange", { total: String(totalSessions) })
                     }
                   </span>
                 </div>
               </div>
               <div class="usage-filter-row">
-                ${renderFilterSelect("channel", t("usage.filters.channel"), channelOptions)}
-                ${renderFilterSelect("provider", t("usage.filters.provider"), providerOptions)}
-                ${renderFilterSelect("model", t("usage.filters.model"), modelOptions)}
-                ${renderFilterSelect("tool", t("usage.filters.tool"), toolOptions)}
+                ${renderFilterSelect("channel", t("usage.filters.channel"), filterOptions.channel)}
+                ${renderFilterSelect("provider", t("usage.filters.provider"), filterOptions.provider)}
+                ${renderFilterSelect("model", t("usage.filters.model"), filterOptions.model)}
+                ${renderFilterSelect("tool", t("usage.filters.tool"), filterOptions.tool)}
                 <span class="usage-query-hint">${t("usage.query.tip")}</span>
               </div>
               ${
@@ -771,108 +734,115 @@ export function renderUsage(props: UsageProps) {
           data.providerUsageStalled,
         )}
         ${
-          isEmpty
-            ? renderUsageEmptyState(filterActions.onRefresh)
-            : html`
-                ${renderUsageInsights(
-                  insightTotals,
-                  insightAggregates,
-                  insightStats,
-                  hasMissingCost,
-                  // Day totals are exact daily buckets; category rollups remain full-session totals.
-                  // Hide shares instead of mixing those scopes into percentages above 100%.
-                  filters.selectedDays.length === 0,
-                  buildPeakErrorHours(aggregateSessions, filters.timeZone),
-                  displaySessionCount,
-                  totalSessions,
-                )}
-                ${renderUsageHeatmap(filteredDaily, filters.startDate, filters.endDate)}
-                ${renderUsageMosaic(
-                  aggregateSessions,
-                  filters.timeZone,
-                  filters.selectedHours,
-                  filterActions.onSelectHour,
-                )}
-
-                <div class="usage-grid">
-                  <div class="usage-grid-column">
-                    <div class="settings-group usage-panel usage-left-card">
-                      ${costWindowComparison}
-                      ${renderDailyChartCompact(
-                        filteredDaily,
-                        filters.selectedDays,
-                        display.chartMode,
-                        display.dailyChartMode,
-                        displayActions.onDailyChartModeChange,
-                        filterActions.onSelectDay,
-                      )}
-                      ${
-                        displayTotals
-                          ? renderCostBreakdownCompact(displayTotals, display.chartMode)
-                          : nothing
-                      }
-                    </div>
-                    ${renderSessionsCard(
-                      filteredSessions,
-                      filters.selectedSessions,
-                      filters.selectedDays,
-                      isTokenMode,
-                      display.sessionSort,
-                      display.sessionSortDir,
-                      display.recentSessions,
-                      display.sessionsTab,
-                      detailActions.onSelectSession,
-                      displayActions.onSessionSortChange,
-                      displayActions.onSessionSortDirChange,
-                      displayActions.onSessionsTabChange,
-                      display.visibleColumns,
-                      totalSessions,
-                      filterActions.onClearSessions,
-                    )}
+          !hasOverviewData
+            ? data.loading
+              ? html`<div class="usage-panel usage-loading-card">
+                  <div class="usage-loading-grid">
+                    <div class="skeleton usage-skeleton-block usage-skeleton-block--tall"></div>
+                    <div class="skeleton usage-skeleton-block"></div>
+                    <div class="skeleton usage-skeleton-block"></div>
                   </div>
-                  ${
-                    primarySelectedEntry
-                      ? html`<div class="usage-grid-column">
-                          ${renderSessionDetailPanel(
-                            primarySelectedEntry,
-                            detail.timeSeries,
-                            detail.timeSeriesLoading,
-                            detail.timeSeriesStatus,
-                            detailActions.onRetryTimeSeries,
-                            detail.timeSeriesMode,
-                            detailActions.onTimeSeriesModeChange,
-                            detail.timeSeriesBreakdownMode,
-                            detailActions.onTimeSeriesBreakdownChange,
-                            detail.timeSeriesCursorStart,
-                            detail.timeSeriesCursorEnd,
-                            detailActions.onTimeSeriesCursorRangeChange,
-                            filters.startDate,
-                            filters.endDate,
-                            filters.selectedDays,
-                            filters.timeZone,
-                            detail.sessionLogs,
-                            detail.sessionLogsLoading,
-                            detail.sessionLogsStatus,
-                            detailActions.onRetrySessionLogs,
-                            detail.sessionLogsExpanded,
-                            detailActions.onToggleSessionLogsExpanded,
-                            detail.logFilters,
-                            detailActions.onLogFilterRolesChange,
-                            detailActions.onLogFilterToolsChange,
-                            detailActions.onLogFilterHasToolsChange,
-                            detailActions.onLogFilterQueryChange,
-                            detailActions.onLogFilterClear,
-                            detail.context,
-                            detailActions.onRetryContextWeight,
-                            display.contextExpanded,
-                            detailActions.onToggleContextExpanded,
-                            filterActions.onClearSessions,
-                          )}
-                        </div>`
-                      : nothing
-                  }
-                </div>
-              `
+                </div>`
+              : nothing
+            : isEmpty
+              ? renderUsageEmptyState(filterActions.onRefresh)
+              : html`
+                  ${renderUsageInsights(
+                    insightTotals,
+                    insightAggregates,
+                    insightStats,
+                    hasMissingCost,
+                    // Day totals are exact daily buckets; category rollups remain full-session totals.
+                    // Hide shares instead of mixing those scopes into percentages above 100%.
+                    filters.selectedDays.length === 0,
+                    buildPeakErrorHours(aggregateSessions, filters.timeZone),
+                    displaySessionCount,
+                    totalSessions,
+                  )}
+                  ${renderUsageHeatmap(filteredDaily, filters.startDate, filters.endDate)}
+                  ${renderUsageMosaic(
+                    aggregateSessions,
+                    filters.timeZone,
+                    filters.selectedHours,
+                    filterActions.onSelectHour,
+                  )}
+
+                  <div class="usage-grid">
+                    <div class="usage-grid-column">
+                      <div class="settings-group usage-panel usage-left-card">
+                        ${costWindowComparison}
+                        ${renderDailyChartCompact(
+                          filteredDaily,
+                          filters.selectedDays,
+                          display.chartMode,
+                          display.dailyChartMode,
+                          displayActions.onDailyChartModeChange,
+                          filterActions.onSelectDay,
+                        )}
+                        ${
+                          displayTotals
+                            ? renderCostBreakdownCompact(displayTotals, display.chartMode)
+                            : nothing
+                        }
+                      </div>
+                      ${renderSessionsCard(
+                        filteredSessions,
+                        filters.selectedSessions,
+                        filters.selectedDays,
+                        isTokenMode,
+                        display.sessionSort,
+                        display.sessionSortDir,
+                        display.recentSessions,
+                        display.sessionsTab,
+                        detailActions.onSelectSession,
+                        displayActions.onSessionSortChange,
+                        displayActions.onSessionSortDirChange,
+                        displayActions.onSessionsTabChange,
+                        display.visibleColumns,
+                        totalSessions,
+                        filterActions.onClearSessions,
+                      )}
+                    </div>
+                    ${
+                      primarySelectedEntry
+                        ? html`<div class="usage-grid-column">
+                            ${renderSessionDetailPanel(
+                              primarySelectedEntry,
+                              detail.timeSeries,
+                              detail.timeSeriesLoading,
+                              detail.timeSeriesStatus,
+                              detail.timeSeriesMode,
+                              detailActions.onTimeSeriesModeChange,
+                              detail.timeSeriesBreakdownMode,
+                              detailActions.onTimeSeriesBreakdownChange,
+                              detail.timeSeriesCursorStart,
+                              detail.timeSeriesCursorEnd,
+                              detailActions.onTimeSeriesCursorRangeChange,
+                              filters.startDate,
+                              filters.endDate,
+                              filters.selectedDays,
+                              filters.timeZone,
+                              detail.sessionLogs,
+                              detail.sessionLogsLoading,
+                              detail.sessionLogsStatus,
+                              detail.sessionLogsExpanded,
+                              detailActions.onToggleSessionLogsExpanded,
+                              detail.logFilters,
+                              detailActions.onLogFilterRolesChange,
+                              detailActions.onLogFilterToolsChange,
+                              detailActions.onLogFilterHasToolsChange,
+                              detailActions.onLogFilterQueryChange,
+                              detailActions.onLogFilterClear,
+                              detail.context,
+                              display.contextExpanded,
+                              detailActions.onToggleContextExpanded,
+                              filterActions.onClearSessions,
+                            )}
+                          </div>`
+                        : nothing
+                    }
+                  </div>
+                `
         }
       </div>
     `,

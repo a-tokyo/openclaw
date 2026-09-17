@@ -1,3 +1,4 @@
+import "../../../styles/chat/composer-surface.css";
 import { truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
 import { html, nothing, type TemplateResult } from "lit";
 import { guard } from "lit/directives/guard.js";
@@ -15,10 +16,12 @@ import { insertComposerDictation } from "../composer-dictation.ts";
 import {
   handleChatAttachmentPaste,
   renderAttachmentPreview,
+  renderAttachmentReadStatus,
   renderChatAttachmentInputs,
 } from "./chat-attachments.ts";
 import type { ChatRunControlsProps } from "./chat-composer-controls.ts";
 import {
+  renderChatAbortAction,
   renderChatPrimaryActions,
   renderComposerDictationStatus,
 } from "./chat-composer-controls.ts";
@@ -87,6 +90,7 @@ type ChatComposerViewContext = {
   slashMenuVisible: boolean;
   skillMenuVisible: boolean;
   mentionMenuVisible: boolean;
+  emojiMenuVisible: boolean;
   mentionMenuHost: HumanMentionMenuHost;
   mentionError: string | null;
   skillMenuHost: SkillMenuHost;
@@ -129,6 +133,7 @@ export function renderChatComposerView(context: ChatComposerViewContext) {
     slashMenuVisible,
     skillMenuVisible,
     mentionMenuVisible,
+    emojiMenuVisible,
     mentionMenuHost,
     mentionError,
     skillMenuHost,
@@ -139,7 +144,7 @@ export function renderChatComposerView(context: ChatComposerViewContext) {
     slashMenuAnnouncementId,
     goalComposer,
   } = context;
-  if (slashMenuVisible || skillMenuVisible || mentionMenuVisible) {
+  if (slashMenuVisible || skillMenuVisible || mentionMenuVisible || emojiMenuVisible) {
     ensureChatComposerPickerDismissal();
   }
   const disabledBanner = props.disabledBanner
@@ -197,7 +202,7 @@ export function renderChatComposerView(context: ChatComposerViewContext) {
           </button>
           ${
             props.disabledBanner.kind === "composer-replacement" && showAbortableUi
-              ? renderChatPrimaryActions(runControlsProps)
+              ? renderChatAbortAction(runControlsProps)
               : nothing
           }
         </div>
@@ -210,12 +215,16 @@ export function renderChatComposerView(context: ChatComposerViewContext) {
   const disabledReasonId = paneDomId(props.paneId, "disabled-reason");
   const composerAlerts = showComposerInput
     ? renderChatVoiceStatus({
-        status: props.realtimeTalkCameraError ? "error" : props.realtimeTalkStatus,
-        detail: props.realtimeTalkDetail,
+        status:
+          props.realtimeTalkCameraError || props.realtimeTalkVoice?.error
+            ? "error"
+            : props.realtimeTalkStatus,
+        detail: props.realtimeTalkVoice?.error ?? props.realtimeTalkDetail,
         onUseSystemDefaultMicrophone: props.onUseSystemDefaultMicrophone,
-        onDismissError: props.realtimeTalkCameraError
-          ? undefined
-          : props.onDismissRealtimeTalkError,
+        onDismissError:
+          props.realtimeTalkCameraError || props.realtimeTalkVoice?.error
+            ? undefined
+            : props.onDismissRealtimeTalkError,
       })
     : nothing;
   const offlineText = props.offline
@@ -272,37 +281,42 @@ export function renderChatComposerView(context: ChatComposerViewContext) {
     ? nothing
     : renderChatRunStatusIndicator(composerRunStatus);
   const fallbackStatus = renderFallbackIndicator(props.fallbackStatus);
-  const progressCard =
-    props.progressCard || props.progressCardError
-      ? html`<div class="agent-chat__progress-float">
-          ${props.progressCardError ? html`<div class="callout info" role="status">${props.progressCardError}</div>` : nothing}
-          ${
-            props.progressCard
-              ? renderSessionProgressCard(
-                  props.progressCard,
-                  "composer",
-                  props.onDismissProgressCard,
-                  activeSession?.status,
-                  activeSession?.startedAt,
-                  activeSession?.endedAt,
-                  props.runActive,
-                  props.collapseTaskProgress,
-                  {
-                    activeRunId: props.runId,
-                    completedRunId:
-                      props.runStatus?.phase === "done" ? props.runStatus.runId : null,
-                  },
-                )
-              : nothing
-          }
-        </div>`
+  const progressCard = props.progressCard
+    ? html`<div class="agent-chat__progress-float">
+        ${renderSessionProgressCard(
+          props.progressCard,
+          "composer",
+          props.onDismissProgressCard,
+          activeSession?.status,
+          activeSession?.startedAt,
+          activeSession?.endedAt,
+          props.runActive,
+          props.collapseTaskProgress,
+          {
+            gatewayScope: props.gatewayScope,
+            sessionIdentity: props.progressCardIdentity,
+            activeRunId: props.runId,
+            readingHistory: props.readingHistory,
+            onManipulate: props.onProgressManipulate,
+            completedRunId: props.runStatus?.phase === "done" ? props.runStatus.runId : null,
+          },
+        )}
+      </div>`
+    : props.progressCardInitialLoading
+      ? html`<div
+          class="agent-chat__progress-float agent-chat__progress-float--loading"
+          aria-hidden="true"
+        ></div>`
       : nothing;
   const queue = renderChatQueue({
     queue: props.queue,
+    displayQueue: props.displayQueue,
     offline: props.offline,
     canAbort: showAbortableUi,
-    onQueueRetry: props.connected && canCompose ? props.onQueueRetry : undefined,
-    onQueueSteer: props.connected && canCompose ? props.onQueueSteer : undefined,
+    onQueueRetry:
+      props.connected && canCompose && !props.submitDisabledReason ? props.onQueueRetry : undefined,
+    onQueueSteer:
+      props.connected && canCompose && !props.submitDisabledReason ? props.onQueueSteer : undefined,
     // Reordering is local bookkeeping, so it stays available while offline —
     // exactly when a queue is long enough to need it.
     onQueueMove: props.onQueueMove,
@@ -352,7 +366,8 @@ export function renderChatComposerView(context: ChatComposerViewContext) {
             `
           : nothing
       }
-      ${disabledBanner} ${progressCard} ${queue} ${goalCard}
+      ${props.disabledBanner?.kind === "above-composer" ? disabledBanner : nothing} ${progressCard}
+      ${queue} ${goalCard}
       ${
         showComposerInput
           ? html`<div
@@ -367,6 +382,7 @@ export function renderChatComposerView(context: ChatComposerViewContext) {
                 resetSlashMenuState(state);
                 resetSkillMenuState(state);
                 state.mentionMenu.close();
+                state.emojiMenu.dismiss(state.composerTextarea);
                 requestUpdate();
               }}
               @click=${(event: MouseEvent) => focusComposerFromChrome(event, canCompose)}
@@ -382,6 +398,7 @@ export function renderChatComposerView(context: ChatComposerViewContext) {
                   : nothing
               }
               ${skillMenuVisible ? renderSkillMenu(state, skillMenuHost, requestUpdate) : nothing}
+              ${state.emojiMenu.render(props.paneId, state.composerTextarea, requestUpdate)}
               ${
                 mentionMenuVisible
                   ? state.mentionMenu.render(mentionMenuHost, requestUpdate)
@@ -389,6 +406,7 @@ export function renderChatComposerView(context: ChatComposerViewContext) {
               }
               <div class="agent-chat__composer-lede">
                 ${goalComposer.render()} ${renderAttachmentPreview(props)}
+                ${renderAttachmentReadStatus(props.getPendingAttachmentReads?.() ?? props.pendingAttachmentReads ?? 0)}
                 ${renderSelectedHumanMentions(visibleDraft, props.mentions, () => {
                   commitComposerDraft(props, props.getDraft?.() ?? props.draft, []);
                   requestUpdate();
@@ -475,12 +493,12 @@ export function renderChatComposerView(context: ChatComposerViewContext) {
                     ?readonly=${dictation?.locksComposer === true || goalComposer.pending}
                     aria-autocomplete="list"
                     aria-controls=${ifDefined(
-                      slashMenuVisible || skillMenuVisible || mentionMenuVisible
+                      slashMenuVisible || skillMenuVisible || mentionMenuVisible || emojiMenuVisible
                         ? slashMenuListboxId
                         : undefined,
                     )}
                     aria-expanded=${ifDefined(
-                      slashMenuVisible || skillMenuVisible || mentionMenuVisible
+                      slashMenuVisible || skillMenuVisible || mentionMenuVisible || emojiMenuVisible
                         ? "true"
                         : undefined,
                     )}
@@ -497,13 +515,29 @@ export function renderChatComposerView(context: ChatComposerViewContext) {
                     @select=${handleSelect}
                     @focus=${handleSelect}
                     @pointerup=${handleSelect}
+                    @keyup=${(event: KeyboardEvent) => {
+                      state.emojiMenu.handleKeyup(event);
+                      if (
+                        event.key.startsWith("Arrow") ||
+                        event.key === "Home" ||
+                        event.key === "End"
+                      ) {
+                        handleSelect(event);
+                      }
+                    }}
                     @compositionstart=${(event: CompositionEvent) => {
+                      const emojiWasOpen = state.emojiMenu.open;
                       state.mentionMenu.close();
+                      state.emojiMenu.close();
+                      state.editRevision += 1;
                       state.composerComposing = true;
                       state.composingDraft = {
                         key: draftKey,
                         value: (event.target as HTMLTextAreaElement).value,
                       };
+                      if (emojiWasOpen) {
+                        requestUpdate();
+                      }
                     }}
                     @compositionend=${handleCompositionEnd}
                     @blur=${handleBlur}
@@ -572,7 +606,9 @@ export function renderChatComposerView(context: ChatComposerViewContext) {
                 </div>
               </div>
             </div> `
-          : nothing
+          : props.disabledBanner?.kind === "composer-replacement"
+            ? disabledBanner
+            : nothing
       }
       ${composerUnderlaps}
     </div>

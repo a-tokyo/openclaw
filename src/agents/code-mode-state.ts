@@ -4,18 +4,22 @@ import {
   resolveExpiresAtMsFromDurationSeconds,
 } from "@openclaw/normalization-core/number-coercion";
 import type { Snapshot } from "quickjs-wasi";
+import { observeAgentRunApprovalWait } from "./agent-run-approval-wait.js";
 import { raceWithAbortSignal } from "./agent-tools.abort.js";
 import { runBridgeRequest } from "./code-mode-bridge.js";
 import type { CodeModeCatalogProjection } from "./code-mode-catalog.js";
 import { CODE_MODE_EXEC_TOOL_NAME, CODE_MODE_WAIT_TOOL_NAME } from "./code-mode-control-tools.js";
 import type { CodeModeOutputState } from "./code-mode-json.js";
 import type { CodeModeNamespaceRuntime } from "./code-mode-namespaces.js";
+import { CodeModeProgramDataInbox, type CodeModeReplyLease } from "./code-mode-program-data.js";
+import { createCodeModeResultsAccess, type CodeModeResultsAccess } from "./code-mode-results.js";
 import type {
   CodeModeConfig,
   CodeModeSettlementMode,
   PendingBridgeRequest,
   SettledBridgeRequest,
 } from "./code-mode-runtime.js";
+import { captureAgentPluginRuntimeRefresh } from "./plugin-runtime-refresh.js";
 import type { AgentToolUpdateCallback } from "./runtime/index.js";
 import type { ToolSearchRuntime } from "./tool-search-runtime.js";
 import type { ToolSearchToolContext } from "./tool-search-types.js";
@@ -26,8 +30,9 @@ export type CodeModeBridgeDispatchState = {
 };
 
 export type PendingBridgeState = PendingBridgeRequest & {
-  promise: Promise<SettledBridgeRequest>;
-  settled?: SettledBridgeRequest;
+  promise: Promise<void>;
+  reply: CodeModeReplyLease;
+  settled?: boolean;
   settledSequence?: number;
   cancel?: () => void;
 };
@@ -67,9 +72,15 @@ let nextPendingBridgeSettlementSequence = 0;
 let activeRunExpiryTimer: ReturnType<typeof setTimeout> | undefined;
 
 /** Catalog ownership spans worker legs and snapshots; parking never closes the cell. */
-export function createCodeModeRunOwner(ctx: ToolSearchToolContext) {
+export function createCodeModeRunOwner(ctx: ToolSearchToolContext, config: CodeModeConfig) {
+  const inbox = new CodeModeProgramDataInbox(config);
+  // A parked cell still owns pending calls and their output. Re-admission waits
+  // for its final exec/wait result rather than stranding or replaying that work.
+  const releaseRuntimeRefresh = captureAgentPluginRuntimeRefresh().hold();
   const runId = `cm_${randomUUID()}`;
   const closed = new AbortController();
+  // Observe approvals for the entire cell, including parked gaps.
+  const approvalWait = observeAgentRunApprovalWait(ctx);
   const signal = ctx.abortSignal
     ? AbortSignal.any([closed.signal, ctx.abortSignal])
     : closed.signal;
@@ -81,7 +92,10 @@ export function createCodeModeRunOwner(ctx: ToolSearchToolContext) {
     if (closed.signal.aborted) {
       return;
     }
+    inbox.close();
+    releaseRuntimeRefresh();
     releaseCall();
+    approvalWait.dispose();
     signal.removeEventListener("abort", onLifetimeAbort);
     disposers?.delete(close);
     liveRunOwners.delete(owner);
@@ -97,7 +111,10 @@ export function createCodeModeRunOwner(ctx: ToolSearchToolContext) {
   const owner = {
     runId,
     signal,
+    inbox,
+    results: createCodeModeResultsAccess(ctx, config),
     close,
+    approvalWait,
     bindCall(callSignal?: AbortSignal): AbortSignal {
       releaseCall();
       if (signal.aborted) {
@@ -198,7 +215,9 @@ export function disposeAllCodeModeRuns(): void {
 /** Abort each bridge call whose result has not already reached its guest. */
 export function cancelPendingBridgeStates(pending: readonly PendingBridgeState[]): void {
   for (const entry of pending) {
-    if (!entry.settled) {
+    if (entry.settled) {
+      entry.reply.release();
+    } else {
       entry.cancel?.();
     }
   }
@@ -213,18 +232,39 @@ export function cancelPendingBridgeStatesById(
     return;
   }
   const canceled = new Set(canceledRequestIds);
-  cancelPendingBridgeStates(pending.filter((entry) => canceled.has(entry.id)));
+  const discarded = pending.filter((entry) => canceled.has(entry.id));
+  cancelPendingBridgeStates(discarded);
+  // The guest removed these requests; no cancellation reply will be delivered.
+  // Keep ordinary cancellation catchable, but release guest-discarded leases now.
+  for (const entry of discarded) {
+    entry.reply.release();
+  }
   pending.splice(0, pending.length, ...pending.filter((entry) => !canceled.has(entry.id)));
 }
 
 /** Deliver bridge responses in actual settlement order, not request order. */
-export function settledBridgeRequestsInCompletionOrder(
-  pending: readonly PendingBridgeState[],
-): SettledBridgeRequest[] {
-  return pending
-    .filter((entry) => entry.settled !== undefined)
+export function takeSettledBridgeRequests(pending: readonly PendingBridgeState[]) {
+  const leases = pending
+    .filter((entry) => entry.settled)
     .toSorted((left, right) => (left.settledSequence ?? 0) - (right.settledSequence ?? 0))
-    .flatMap((entry) => (entry.settled ? [entry.settled] : []));
+    .map((entry) => entry.reply);
+  const requests: SettledBridgeRequest[] = [];
+  const release = () => {
+    for (const lease of leases) {
+      lease.release();
+    }
+    leases.length = 0;
+    requests.length = 0;
+  };
+  try {
+    for (const lease of leases) {
+      requests.push(lease.take());
+    }
+    return { requests, release };
+  } catch (error) {
+    release();
+    throw error;
+  }
 }
 
 /** Keep every dispatched bridge call required until its guest has received the result. */
@@ -326,6 +366,8 @@ function isPendingBridgeRequestReplaySafe(
   if (request.method === "nodes") {
     return request.args[0] === "list" || request.args[0] === "get";
   }
+  // Saved references are transient, and deletion cannot be replayed safely.
+  // Result operations intentionally stay outside restart-safe execution.
   if (request.method !== "callValue") {
     return false;
   }
@@ -341,6 +383,8 @@ export function createPendingBridgeStates(
   pendingRequests: PendingBridgeRequest[],
   params: {
     config: CodeModeConfig;
+    inbox: CodeModeProgramDataInbox;
+    results: CodeModeResultsAccess;
     runtime: ToolSearchRuntime;
     catalogProjection: CodeModeCatalogProjection;
     namespaceRuntime: CodeModeNamespaceRuntime;
@@ -358,11 +402,15 @@ export function createPendingBridgeStates(
   return pendingRequests.map((request) => {
     // Bridge calls start immediately while the VM snapshot is stored. Their
     // settled values are later replayed into QuickJS by the wait tool.
+    const reply = params.inbox.createReply(request.id);
     const abortController = new AbortController();
     const signal = abortController.signal;
     // Relay only while pending: closing a finished cell must not cancel an
     // external operation whose result was already delivered to its guest.
-    const onAbort = () => abortController.abort(params.signal.reason);
+    const onAbort = () => {
+      reply.cancel();
+      abortController.abort(params.signal.reason);
+    };
     params.signal.addEventListener("abort", onAbort, { once: true });
     if (params.signal.aborted) {
       onAbort();
@@ -372,31 +420,31 @@ export function createPendingBridgeStates(
     }
     const bridgeCall = runBridgeRequest({
       runtime: params.runtime,
+      results: params.results,
       catalogProjection: params.catalogProjection,
       namespaceRuntime: params.namespaceRuntime,
       parentToolCallId: params.parentToolCallId,
       codeModeRunId: params.codeModeRunId,
-      maxOutputBytes: params.config.maxOutputBytes,
+      reply,
       remainingMs: Math.max(1, params.remainingMs),
       ctx: params.ctx,
       request,
       signal,
       onUpdate: params.onUpdate,
     });
-    const completion = raceWithAbortSignal(bridgeCall, signal).catch((): SettledBridgeRequest => ({
-      id: request.id,
-      ok: false,
-      error: signal.reason instanceof Error ? signal.reason.message : BRIDGE_CLOSED_MESSAGE,
-    }));
+    const completion = raceWithAbortSignal(bridgeCall, signal).catch(() => {
+      // Canceled leases are fenced; this cannot retain an arbitrary abort reason.
+      reply.settle(false, BRIDGE_CLOSED_MESSAGE);
+    });
     const state: PendingBridgeState = {
       ...request,
-      promise: completion.then((settled) => {
+      reply,
+      promise: completion.then(() => {
         params.signal.removeEventListener("abort", onAbort);
         state.settledSequence = ++nextPendingBridgeSettlementSequence;
-        state.settled = settled;
+        state.settled = true;
         // Only the response is needed until guest replay; live calls keep their own request.
         state.args = [];
-        state.cancel = undefined;
         if (state.method === "agentWait" && params.activeRunId) {
           const active = activeRuns.get(params.activeRunId);
           if (active?.pending.includes(state)) {
@@ -410,9 +458,13 @@ export function createPendingBridgeStates(
             }
           }
         }
-        return settled;
       }),
-      cancel: () => abortController.abort(new Error(BRIDGE_CLOSED_MESSAGE)),
+      cancel: () => {
+        reply.cancel();
+        if (!state.settled) {
+          abortController.abort(new Error(BRIDGE_CLOSED_MESSAGE));
+        }
+      },
     };
     return state;
   });

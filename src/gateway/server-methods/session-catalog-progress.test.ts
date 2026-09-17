@@ -1,5 +1,11 @@
+import { performance } from "node:perf_hooks";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  areDiagnosticsEnabledForProcess,
+  setDiagnosticsEnabledForProcess,
+} from "../../infra/diagnostic-events.js";
 import { createDeferredCore } from "../../shared/deferred.js";
+import { catalogLog } from "./session-catalog-log.test-support.js";
 import {
   call,
   hoisted,
@@ -59,10 +65,13 @@ describe("session catalog progress ownership", () => {
   });
 
   it("single-flights identical concurrent lists for one caller and fans progress to active followers", async () => {
-    let release!: () => void;
-    const gate = new Promise<void>((resolve) => {
-      release = resolve;
-    });
+    const previousDiagnostics = areDiagnosticsEnabledForProcess();
+    setDiagnosticsEnabledForProcess(true);
+    let clock = 0;
+    const now = vi.spyOn(performance, "now").mockImplementation(() => clock);
+    const enabled = catalogLog.isEnabled.mockReset().mockReturnValue(true);
+    const warn = catalogLog.warn.mockReset().mockImplementation(() => {});
+    const { promise: gate, resolve: release } = createDeferredCore();
     const host = {
       hostId: "gateway:local",
       label: "Local",
@@ -108,6 +117,7 @@ describe("session catalog progress ownership", () => {
 
     try {
       await vi.waitFor(() => expect(list).toHaveBeenCalledTimes(3));
+      clock = 1_500;
       release();
       await Promise.all([
         leader.completion,
@@ -118,6 +128,11 @@ describe("session catalog progress ownership", () => {
 
       expect(leaderBroadcast).toHaveBeenCalledOnce();
       expect(followerBroadcast).toHaveBeenCalledOnce();
+      expect(warn).toHaveBeenCalledTimes(3);
+      for (const [message, fields] of warn.mock.calls) {
+        expect(message).toBe("slow session catalog provider list");
+        expect(fields).toMatchObject({ providerElapsedMs: 1_500, returnedGatewayHostCount: 1 });
+      }
       for (const pending of [leader, follower, otherAgent, otherParams]) {
         expect(pending.respond).toHaveBeenCalledWith(true, {
           catalogs: [expect.objectContaining({ id: "codex", hosts: [host] })],
@@ -131,12 +146,14 @@ describe("session catalog progress ownership", () => {
         sharedClient,
         { broadcastToConnIds: settledBroadcast },
       );
+      clock = 5_000;
       late.resolve();
       await Promise.all(publications);
       expect(leaderBroadcast).toHaveBeenCalledTimes(2);
       expect(followerBroadcast).toHaveBeenCalledTimes(2);
       expect(settledBroadcast).not.toHaveBeenCalled();
       expect(list).toHaveBeenCalledTimes(3);
+      expect(warn).toHaveBeenCalledTimes(3);
     } finally {
       release();
       late.resolve();
@@ -147,8 +164,169 @@ describe("session catalog progress ownership", () => {
         otherParams.completion,
         ...publications,
       ]);
+      now.mockRestore();
+      enabled.mockReset();
+      warn.mockReset();
+      setDiagnosticsEnabledForProcess(previousDiagnostics);
     }
   });
+
+  it.each([0, 128])(
+    "keeps an active list shared after %i distinct lists settle",
+    async (completedQueries) => {
+      const now = vi.spyOn(Date, "now").mockReturnValue(1_000);
+      const started = createDeferredCore();
+      const release = createDeferredCore();
+      const list = vi.fn<SessionCatalogProvider["list"]>(async ({ search }) => {
+        if (search === "held") {
+          started.resolve();
+          await release.promise;
+        }
+        return [];
+      });
+      hoisted.activeRegistry.sessionCatalogs = [{ provider: provider("fixture", { list }) }];
+      const config = {};
+      const client = { connId: "requester" };
+      const request = { catalogId: "fixture", search: "held" };
+      const leader = startCall("sessions.catalog.list", request, config, client);
+      const pending = [leader];
+      try {
+        await started.promise;
+        now.mockReturnValue(5_000);
+        for (let index = 0; index < completedQueries; index += 1) {
+          const respond = await call(
+            "sessions.catalog.list",
+            { catalogId: "fixture", search: `completed-${index}` },
+            config,
+            client,
+          );
+          expect(respond).toHaveBeenCalledWith(true, {
+            catalogs: [expect.objectContaining({ id: "fixture", hosts: [] })],
+          });
+        }
+        pending.push(startCall("sessions.catalog.list", request, config, client));
+        release.resolve();
+        await Promise.all(pending.map(({ completion }) => completion));
+        for (const { respond } of pending) {
+          expect(respond).toHaveBeenCalledWith(true, {
+            catalogs: [expect.objectContaining({ id: "fixture", hosts: [] })],
+          });
+        }
+        expect(list.mock.calls.filter(([params]) => params.search === "held")).toHaveLength(1);
+        now.mockReturnValue(7_999);
+        await call("sessions.catalog.list", request, config, client);
+        expect(list.mock.calls.filter(([params]) => params.search === "held")).toHaveLength(1);
+        now.mockReturnValue(8_000);
+        await call("sessions.catalog.list", request, config, client);
+        expect(list.mock.calls.filter(([params]) => params.search === "held")).toHaveLength(2);
+      } finally {
+        release.resolve();
+        await Promise.allSettled(pending.map(({ completion }) => completion));
+        now.mockRestore();
+      }
+    },
+  );
+
+  it.each(["settled", "in-flight"] as const)(
+    "refreshes %s lists immediately after archiving a session",
+    async (listingState) => {
+      const now = vi.spyOn(Date, "now").mockReturnValue(1_000);
+      const gate = createDeferredCore();
+      const started = createDeferredCore();
+      const late = createDeferredCore();
+      const publications: Promise<void>[] = [];
+      const broadcastToConnIds = vi.fn();
+      const session = {
+        threadId: "deleted-thread",
+        status: "stored",
+        archived: false,
+        canContinue: false,
+        canArchive: true,
+      };
+      const host = {
+        hostId: "gateway:local",
+        label: "Local",
+        kind: "gateway" as const,
+        connected: true,
+        sessions: [session],
+      };
+      let archived = false;
+      const list = vi.fn<SessionCatalogProvider["list"]>(async ({ onHost, waitUntil }) => {
+        const resultHost = { ...host, sessions: archived ? [] : [session] };
+        const publication = late.promise.then(() => onHost?.(resultHost));
+        publications.push(publication);
+        waitUntil?.(publication);
+        started.resolve();
+        await gate.promise;
+        return [resultHost];
+      });
+      hoisted.activeRegistry.sessionCatalogs = [
+        {
+          provider: provider("fixture", {
+            list,
+            archive: async () => {
+              archived = true;
+              return { ok: true };
+            },
+          }),
+        },
+      ];
+      const config = {};
+      const client = { connId: "requester" };
+      const original = startCall(
+        "sessions.catalog.list",
+        { progressId: "before-delete" },
+        config,
+        client,
+        { broadcastToConnIds },
+      );
+      try {
+        await started.promise;
+        if (listingState === "settled") {
+          gate.resolve();
+          await original.completion;
+        }
+        const deletion = await call(
+          "sessions.catalog.archive",
+          {
+            catalogId: "fixture",
+            hostId: host.hostId,
+            threadId: session.threadId,
+            confirmNoOtherRunner: true,
+          },
+          config,
+          client,
+        );
+        expect(deletion).toHaveBeenCalledWith(true, { ok: true });
+        late.resolve();
+        await publications[0];
+        gate.resolve();
+        await original.completion;
+        expect(original.respond).toHaveBeenCalledWith(true, {
+          catalogs: [expect.objectContaining({ hosts: [host] })],
+        });
+
+        const refreshed = await call(
+          "sessions.catalog.list",
+          { progressId: "after-delete" },
+          config,
+          client,
+          { broadcastToConnIds: vi.fn() },
+        );
+        expect(refreshed).toHaveBeenCalledWith(true, {
+          catalogs: [expect.objectContaining({ hosts: [{ ...host, sessions: [] }] })],
+        });
+        expect(list).toHaveBeenCalledTimes(2);
+        expect(broadcastToConnIds).not.toHaveBeenCalled();
+      } finally {
+        gate.resolve();
+        late.resolve();
+        await original.completion;
+        await Promise.allSettled(publications);
+        now.mockRestore();
+      }
+    },
+  );
 
   it("retires pending progress when aggregate projection fails", async () => {
     const late = createDeferredCore();

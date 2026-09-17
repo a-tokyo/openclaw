@@ -1,9 +1,5 @@
 /* @vitest-environment jsdom */
-import {
-  GATEWAY_SERVER_CAPS,
-  type ProgressCard,
-  type ProgressCardChangedEvent,
-} from "@openclaw/gateway-protocol";
+import type { ProgressCard, ProgressCardChangedEvent } from "@openclaw/gateway-protocol";
 import { html, render } from "lit";
 import { describe, expect, it, onTestFinished, vi } from "vitest";
 import { createDeferred } from "../../../../test/helpers/promise.js";
@@ -13,6 +9,7 @@ import type { ApplicationContext } from "../../app/context.ts";
 import { t } from "../../i18n/index.ts";
 import type { SessionCapability } from "../../lib/sessions/index.ts";
 import { gatewayHelloForMethods } from "../../test-helpers/gateway-methods.ts";
+import { setChatHistoryLoad } from "./chat-history-state.ts";
 import { ChatPaneBase } from "./chat-pane-base.ts";
 import {
   createGatewayBrowserClientFixture,
@@ -126,7 +123,6 @@ describe("chat pane assistant identity snapshots", () => {
     Object.assign(context.config.current, {
       allowExternalEmbedUrls: false,
       embedSandboxMode: "strict",
-      localMediaPreviewRoots: [],
       serverVersion: null,
     });
     Object.assign(context.config, { subscribe: () => () => undefined });
@@ -201,7 +197,7 @@ describe("chat pane assistant identity snapshots", () => {
   });
 
   it("keeps a session-specific assistant identity across ordinary gateway snapshots", () => {
-    const client = {} as GatewayBrowserClient;
+    const client = createGatewayBrowserClientFixture();
     const { pane } = createTestChatPane({ client, sessions: {} as SessionCapability });
     const state = (pane as unknown as { state: ChatPageHost }).state;
     state.client = client;
@@ -217,8 +213,8 @@ describe("chat pane assistant identity snapshots", () => {
   });
 
   it("resets a session-specific identity when the logical connection changes", () => {
-    const client = {} as GatewayBrowserClient;
-    const nextClient = {} as GatewayBrowserClient;
+    const client = createGatewayBrowserClientFixture();
+    const nextClient = createGatewayBrowserClientFixture();
     const { pane, state } = createTestChatPane({ client, sessions: {} as SessionCapability });
     state.assistantName = "Session Agent";
 
@@ -370,7 +366,6 @@ describe("chat pane approval requester identity", () => {
 function createGlobalFeaturePane(
   request: (method: string, params?: unknown) => unknown,
   methods: string[],
-  supportsOwner = true,
 ) {
   const client = createGatewayBrowserClientFixture({
     request: (method, params) =>
@@ -389,10 +384,6 @@ function createGlobalFeaturePane(
     config: { ...initial.config, current: { ...initial.config.current, ...live.config.current } },
   };
   context.gateway.snapshot.hello = gatewayHelloForMethods(methods);
-  context.gateway.snapshot.hello.features = {
-    ...context.gateway.snapshot.hello.features,
-    capabilities: supportsOwner ? [GATEWAY_SERVER_CAPS.PROGRESS_CARD_AGENT_SCOPE] : [],
-  };
   const pane = createRenderTestChatPane();
   const state = pane.initialize(context);
   Object.defineProperty(pane, "isConnected", { configurable: true, value: true });
@@ -407,6 +398,21 @@ function createGlobalFeaturePane(
   const select = (agentId: string) => {
     context.agentSelection.set(agentId);
     state.assistantAgentId = agentId;
+    state.currentSessionId = `${agentId}-parent`;
+    setChatHistoryLoad(state, {
+      phase: "committed",
+      sessions: state.sessions,
+      client,
+      connectionEpoch: state.connectionEpoch,
+      sessionKey: state.sessionKey,
+      requestAgentId: agentId,
+      sessionInfo: {
+        key: state.sessionKey,
+        sessionId: state.currentSessionId,
+        agentId,
+        kind: "global",
+      },
+    });
     state.sessionsResultAgentId = agentId;
     state.sessionsResult = {
       ts: 1,
@@ -446,25 +452,6 @@ function globalProgressCard(agentId: string, revision = 1): ProgressCard {
 }
 
 describe("global chat pane feature ownership", () => {
-  it("explains an unavailable global owner without requesting another session", async () => {
-    const request = vi.fn(async () => ({}));
-    const { pane } = createGlobalFeaturePane(request, ["progressCard.get"], false);
-    await vi.waitFor(() =>
-      expect(pane.chatProps?.progressCardError).toBe(t("sessionProgressCard.ownerUnsupported")),
-    );
-    expect(pane.chatProps?.progressCard).toBeNull();
-    expect(request).not.toHaveBeenCalled();
-    const container = document.createElement("div");
-    try {
-      render(renderChat(pane.chatProps!), container);
-      expect(
-        container.querySelector('.agent-chat__progress-float [role="status"]')?.textContent,
-      ).toBe(t("sessionProgressCard.ownerUnsupported"));
-      expect(request).toHaveBeenCalledExactlyOnceWith("talk.catalog", {});
-    } finally {
-      render(html``, container);
-    }
-  });
   it("loads, refreshes and dismisses the selected agent's global progress card", async () => {
     let card: ProgressCard | null = globalProgressCard("research");
     const request = vi.fn(async (method: string) => {

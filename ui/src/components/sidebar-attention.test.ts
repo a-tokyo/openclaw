@@ -2,6 +2,7 @@
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { MentionInboxItem } from "../../../packages/gateway-protocol/src/index.js";
+import { createDeferred as deferred } from "../../../test/helpers/promise.js";
 import type { GatewayBrowserClient } from "../api/gateway.ts";
 import type { CronJob, CronJobsListResult, ModelAuthStatusResult } from "../api/types.ts";
 import type { ApplicationContext, ApplicationGateway } from "../app/context.ts";
@@ -12,6 +13,7 @@ import {
   createSidebarAttentionStore,
   type SidebarAttentionStore,
 } from "../app/sidebar-attention-store.ts";
+import { invalidateModelAuthStatusRequests } from "../lib/model-auth-request-state.ts";
 import {
   createApplicationContextProvider,
   hiddenScopeUpgradeCapability,
@@ -33,16 +35,6 @@ import { buildSidebarAttentionEntries } from "./sidebar-attention-items.ts";
 import { SidebarAttentionStoreController } from "./sidebar-attention-store.ts";
 import { resolveSidebarUpdateAttention } from "./sidebar-attention-update.ts";
 import "./sidebar-attention.ts";
-
-function deferred<T>() {
-  let resolve!: (value: T) => void;
-  let reject!: (error: unknown) => void;
-  const promise = new Promise<T>((next, fail) => {
-    resolve = next;
-    reject = fail;
-  });
-  return { promise, reject, resolve };
-}
 
 function cronJob(id: string): CronJob {
   return {
@@ -220,6 +212,7 @@ describe("sidebar attention refresh ownership", () => {
     await waitForFast(() =>
       expect(element.querySelector<HTMLButtonElement>(".sidebar-issues-button")).not.toBeNull(),
     );
+    await vi.dynamicImportSettled();
     const trigger = element.querySelector<HTMLButtonElement>(".sidebar-issues-button")!;
     return { element, provider, store, trigger };
   }
@@ -228,8 +221,7 @@ describe("sidebar attention refresh ownership", () => {
     const { element, trigger } = await mountAttention();
     trigger.click();
 
-    await import("./sidebar-attention-panel.runtime.ts");
-    await element.updateComplete;
+    await waitForFast(() => expect(element.querySelector(".sidebar-issues-panel")).not.toBeNull());
     const panel = element.querySelector(".sidebar-issues-panel");
     expect(panel).not.toBeNull();
     expect(panel?.closest("openclaw-menu-surface")).not.toBeNull();
@@ -414,6 +406,9 @@ describe("sidebar attention refresh ownership", () => {
       if (method === "exec.approval.resolve") {
         return resolution.promise;
       }
+      if (method === "update.status") {
+        return Promise.resolve({ sentinel: null, updateAvailable: null });
+      }
       if (method === "cron.list") {
         return Promise.resolve(cronListResponse([]));
       }
@@ -581,6 +576,8 @@ describe("sidebar attention refresh ownership", () => {
 
       now = 200_000;
       document.dispatchEvent(new Event("visibilitychange"));
+      invalidateModelAuthStatusRequests(client);
+      eventListener?.({ type: "event", event: "chat.metadata.changed", payload: {} });
       await waitForFast(() => expect(request).toHaveBeenCalledTimes(6));
 
       selectionState.selectedId = "writer";

@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
 import { resetPluginStateStoreForTests } from "openclaw/plugin-sdk/plugin-state-test-runtime";
+import { closeOpenClawStateDatabaseAsync } from "openclaw/plugin-sdk/sqlite-runtime-testing";
 import { describe, expect, it, onTestFinished } from "vitest";
 import { VoiceCallConfigSchema } from "./config.js";
 import { CallManager } from "./manager.js";
@@ -56,12 +57,13 @@ describe("CallManager termination lifecycle", () => {
         new FakeProvider(providerName),
       );
       const managers = [manager];
-      onTestFinished(() => {
+      onTestFinished(async () => {
         try {
           for (const owner of managers) {
-            finalizeTestManagerCalls(owner);
+            await finalizeTestManagerCalls(owner);
           }
         } finally {
+          await closeOpenClawStateDatabaseAsync();
           resetPluginStateStoreForTests();
           fs.rmSync(storePath, { recursive: true, force: true });
         }
@@ -104,7 +106,7 @@ describe("CallManager termination lifecycle", () => {
         }
         return event;
       };
-      manager.processEvent(callback(initialProviderId, "in-progress", true));
+      await manager.processEvent(callback(initialProviderId, "in-progress", true));
       await expect(
         manager.speak(started.callId, "Preserve this call transcript."),
       ).resolves.toEqual({
@@ -136,7 +138,7 @@ describe("CallManager termination lifecycle", () => {
         providerName === "plivo" ? "ringing" : "completed",
         providerName === "twilio",
       );
-      expect(current.processEvent(late).kind).not.toBe("final-speech");
+      expect((await current.processEvent(late)).kind).not.toBe("final-speech");
 
       const history = await current.getCallHistory();
       expect(new Set(history.map((call) => call.callId))).toEqual(new Set([started.callId]));
@@ -159,7 +161,7 @@ describe("CallManager termination lifecycle", () => {
     try {
       expect(provider.attempts).toHaveLength(1);
 
-      manager.processEvent({
+      await manager.processEvent({
         id: "provider-terminal",
         type: "call.ended",
         callId: call.callId,

@@ -2,7 +2,8 @@
 import type { DatabaseSync } from "node:sqlite";
 import type { Insertable, Selectable } from "kysely";
 import type { WebPushDevicePreferences } from "../../packages/gateway-protocol/src/schema/push.js";
-import { readConfigMachineState, updateConfigMachineState } from "../state/config-machine-state.js";
+import { updateConfigMachineState } from "../state/config-machine-state-write.js";
+import { readConfigMachineState } from "../state/config-machine-state.js";
 import { ensureColumn } from "../state/openclaw-state-db-schema-helpers.js";
 import type { DB as OpenClawStateKyselyDatabase } from "../state/openclaw-state-db.generated.js";
 import {
@@ -10,6 +11,7 @@ import {
   runOpenClawStateWriteTransaction,
   type OpenClawStateDatabaseOptions,
 } from "../state/openclaw-state-db.js";
+import { createOpenClawStateSchemaEnsurer } from "../state/openclaw-state-feature-schema.js";
 import { sha256HexPrefixCore } from "./crypto-digest.js";
 import {
   executeSqliteQuerySync,
@@ -63,23 +65,11 @@ type WebPushSubscriptionRow = Selectable<WebPushDatabase["web_push_subscriptions
 type WebPushSubscriptionInsert = Insertable<WebPushDatabase["web_push_subscriptions"]>;
 
 const ensuredWebPushBindingDatabases = new WeakSet<DatabaseSync>();
-const ensuredWebPushApprovalDeliveryDatabases = new WeakSet<DatabaseSync>();
-
-const WEB_PUSH_APPROVAL_DELIVERY_SCHEMA_SQL = `
-CREATE TABLE IF NOT EXISTS web_push_approval_deliveries (
-  approval_id TEXT NOT NULL
-    REFERENCES operator_approvals(approval_id) ON DELETE CASCADE,
-  subscription_id TEXT NOT NULL
-    REFERENCES web_push_subscriptions(subscription_id) ON DELETE CASCADE,
-  device_id TEXT NOT NULL,
-  user_profile_id TEXT,
-  prepared_at_ms INTEGER NOT NULL,
-  PRIMARY KEY (approval_id, subscription_id)
-) STRICT;
-
-CREATE INDEX IF NOT EXISTS idx_web_push_approval_deliveries_subscription
-  ON web_push_approval_deliveries(subscription_id, approval_id);
-`;
+const ensureWebPushApprovalDeliveryStateSchema = createOpenClawStateSchemaEnsurer({
+  table: "web_push_approval_deliveries",
+  endMarker: "  ON web_push_approval_deliveries(subscription_id, approval_id);\n",
+  operationLabel: "web-push.approval-delivery.schema.ensure",
+});
 
 function webPushStateDatabaseOptions(stateDir?: string): OpenClawStateDatabaseOptions {
   return stateDir
@@ -108,22 +98,8 @@ function ensureWebPushSubscriptionBindingSchema(stateDir?: string): void {
   ensuredWebPushBindingDatabases.add(database.db);
 }
 
-/** Lazily adds the restart-safe approval delivery table on first feature use. */
-function ensureWebPushApprovalDeliveryTable(db: DatabaseSync): void {
-  // sqlite-allow-raw -- feature-local additive schema DDL; rows use Kysely.
-  db.exec(WEB_PUSH_APPROVAL_DELIVERY_SCHEMA_SQL);
-}
-
 function ensureWebPushApprovalDeliverySchema(stateDir?: string): void {
-  const options = webPushStateDatabaseOptions(stateDir);
-  const database = openOpenClawStateDatabase(options);
-  if (ensuredWebPushApprovalDeliveryDatabases.has(database.db)) {
-    return;
-  }
-  runOpenClawStateWriteTransaction(({ db }) => ensureWebPushApprovalDeliveryTable(db), options, {
-    operationLabel: "web-push.approval-delivery.schema.ensure",
-  });
-  ensuredWebPushApprovalDeliveryDatabases.add(database.db);
+  ensureWebPushApprovalDeliveryStateSchema(webPushStateDatabaseOptions(stateDir));
 }
 
 export function hashWebPushEndpoint(endpoint: string): string {
@@ -145,7 +121,12 @@ export function isValidWebPushKey(key: unknown): key is string {
   return typeof key === "string" && key.length > 0 && key.length <= WEB_PUSH_MAX_KEY_LENGTH;
 }
 
-export function webPushSubscriptionFromRow(row: WebPushSubscriptionRow): WebPushSubscription {
+export function webPushSubscriptionFromRow(
+  row: Pick<
+    WebPushSubscriptionRow,
+    "subscription_id" | "endpoint" | "p256dh" | "auth" | "created_at_ms" | "updated_at_ms"
+  >,
+): WebPushSubscription {
   return {
     subscriptionId: row.subscription_id,
     endpoint: row.endpoint,
@@ -271,10 +252,26 @@ export function listWebPushSubscriptions(stateDir?: string): WebPushSubscription
     database.db,
     stateDb
       .selectFrom("web_push_subscriptions")
-      .selectAll()
+      .select(["subscription_id", "endpoint", "p256dh", "auth", "created_at_ms", "updated_at_ms"])
       .orderBy("created_at_ms", "asc")
       .orderBy("subscription_id", "asc"),
   ).rows.map(webPushSubscriptionFromRow);
+}
+
+export function hasBoundWebPushSubscriptions(stateDir?: string): boolean {
+  ensureWebPushSubscriptionBindingSchema(stateDir);
+  const { db } = openOpenClawStateDatabase(webPushStateDatabaseOptions(stateDir));
+  return Boolean(
+    executeSqliteQueryTakeFirstSync(
+      db,
+      getNodeSqliteKysely<WebPushDatabase>(db)
+        .selectFrom("web_push_subscriptions")
+        .select("subscription_id")
+        .where("device_id", "is not", null)
+        .where("device_id", "!=", "")
+        .limit(1),
+    ),
+  );
 }
 
 /** Lists only subscriptions reconciled by an authenticated browser device. */

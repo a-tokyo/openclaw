@@ -6,11 +6,14 @@ import { html, nothing, type TemplateResult } from "lit";
 import type { UpdateRunRecord } from "../../../../src/infra/update-run-record.ts";
 import "../../components/update-run-view.ts";
 import type { UpdateAvailable, UpdateScheduleState } from "../../api/types.ts";
+import { deviceSettingsGroupLabelKey } from "../../app-navigation.ts";
 import type { NativeDeviceSettingsCapability } from "../../app/native-device-settings.ts";
+import type { UpdateFailureReportNotice } from "../../app/overlays-types.ts";
 import type { ApplicationStatusBanner } from "../../app/update-overlay-helpers.ts";
 import {
   formatUpdateCampaignLabel,
   formatUpdateTargetLabel,
+  isUpdateActionable,
 } from "../../app/update-schedule-projection.ts";
 import { icons } from "../../components/icons.ts";
 import {
@@ -28,7 +31,8 @@ import { formatDateTimeMs, formatTimeAgo } from "../../lib/format.ts";
 
 registerSettingsEnglish();
 
-type UpdatesChannel = "stable" | "beta" | "dev" | "extended-stable";
+const UPDATES_CHANNELS = ["stable", "beta", "dev", "extended-stable"] as const;
+type UpdatesChannel = (typeof UPDATES_CHANNELS)[number];
 
 type UpdatesViewProps = {
   nativeDeviceSettings?: NativeDeviceSettingsCapability | null;
@@ -41,6 +45,7 @@ type UpdatesViewProps = {
   heldUpdateCampaignId: string | null;
   updateAvailable: UpdateAvailable | null;
   statusBanner: ApplicationStatusBanner | null;
+  statusCheckBanner: ApplicationStatusBanner | null;
   run: UpdateRunRecord | null;
   connected: boolean;
   configBusy: boolean;
@@ -48,56 +53,58 @@ type UpdatesViewProps = {
   canUpdate: boolean;
   canCheckStatus: boolean;
   canHoldUpdate: boolean;
+  canReport: boolean;
   updateBusy: boolean;
+  statusChecking: boolean;
+  reportableUpdateFailureId: string | null;
+  updateFailureReportBusy: boolean;
+  updateFailureReportNotice: UpdateFailureReportNotice | null;
   nowMs?: number;
   onChannelChange: (channel: UpdatesChannel) => void;
   onUpdateChecksChange: (enabled: boolean) => void;
   onAutomaticUpdatesChange: (enabled: boolean) => void;
   onUpdateNow: () => void;
   onHoldUpdate: () => Promise<boolean>;
-  onCheckStatus: () => Promise<void>;
+  onCheckStatus: () => Promise<boolean>;
+  onReportFailure: (attemptId: string) => Promise<void>;
 };
 
 function renderDeviceUpdates(capability: NativeDeviceSettingsCapability | null | undefined) {
-  if (!capability) {
+  const snapshot = capability?.snapshot;
+  const updates = snapshot?.updates;
+  if (!capability || !snapshot || !updates) {
     return nothing;
   }
-  const snapshot = capability.snapshot;
-  return renderSettingsSection(
-    { title: t("updates.device.title") },
-    snapshot
-      ? [
-          renderSettingsRow({
-            title: t("updates.device.version"),
-            control: renderSettingsValue(
-              t("updates.device.versionBuild", {
-                version: snapshot.device.appVersion,
-                build: snapshot.device.appBuild,
-              }),
-            ),
-          }),
-          snapshot.updates.available
-            ? html`${renderSettingsToggleRow({
-                title: t("updates.device.automatic"),
-                checked: snapshot.updates.automatic,
-                onChange: (value) => capability.set("updates.automatic", value),
-              })}${renderSettingsRow({
-                title: t("updates.device.check"),
-                control: html`<button
-                  class="btn btn--sm"
-                  type="button"
-                  @click=${() => capability.checkForUpdates()}
-                >
-                  ${t("updates.device.check")}
-                </button>`,
-              })}`
-            : renderSettingsRow({
-                title: t("updates.device.unavailable"),
-                description: snapshot.updates.unavailableReason,
-              }),
-        ]
-      : renderSettingsRow({ title: t("common.loading") }),
-  );
+  return renderSettingsSection({ title: t(deviceSettingsGroupLabelKey(snapshot)) }, [
+    renderSettingsRow({
+      title: t("updates.device.version"),
+      control: renderSettingsValue(
+        t("updates.device.versionBuild", {
+          version: snapshot.device.appVersion,
+          build: snapshot.device.appBuild,
+        }),
+      ),
+    }),
+    updates.available
+      ? html`${renderSettingsToggleRow({
+          title: t("updates.device.automatic"),
+          checked: updates.automatic,
+          onChange: (value) => capability.set("updates.automatic", value),
+        })}${renderSettingsRow({
+          title: t("updates.device.check"),
+          control: html`<button
+            class="btn btn--sm"
+            type="button"
+            @click=${() => capability.checkForUpdates()}
+          >
+            ${t("updates.device.check")}
+          </button>`,
+        })}`
+      : renderSettingsRow({
+          title: t("updates.device.unavailable"),
+          description: updates.unavailableReason,
+        }),
+  ]);
 }
 
 function renderRecordedAttempt(props: UpdatesViewProps) {
@@ -108,7 +115,7 @@ function renderRecordedAttempt(props: UpdatesViewProps) {
   const failed = run
     ? run.status === "failed" || run.status === "rolled-back" || run.status === "skipped"
     : true;
-  const canRetry = props.canUpdate && !props.updateBusy;
+  const canRetry = props.canUpdate && !props.updateBusy && !props.statusChecking;
   return renderSettingsSection({ title: t("updates.page.latestAttempt") }, [
     run
       ? html`<div class="settings-row settings-row--stacked">
@@ -117,7 +124,12 @@ function renderRecordedAttempt(props: UpdatesViewProps) {
             .connected=${props.connected}
           ></openclaw-update-run-view>
         </div>`
-      : nothing,
+      : props.statusBanner && !props.updateBusy && (props.statusChecking || props.statusCheckBanner)
+        ? renderSettingsRow({
+            title: t("updates.page.failedStep"),
+            description: props.statusBanner.text,
+          })
+        : nothing,
     ...(!failed
       ? []
       : [
@@ -128,7 +140,7 @@ function renderRecordedAttempt(props: UpdatesViewProps) {
                 class="btn btn--sm"
                 type="button"
                 title=${props.canCheckStatus ? "" : t("updates.adminRequired")}
-                ?disabled=${!props.canCheckStatus || props.updateBusy}
+                ?disabled=${!props.canCheckStatus || props.updateBusy || props.statusChecking}
                 @click=${() => void props.onCheckStatus()}
               >
                 ${t("updates.page.checkStatus")}
@@ -142,6 +154,23 @@ function renderRecordedAttempt(props: UpdatesViewProps) {
               >
                 ${t("updates.page.retryUpdate")}
               </button>
+              ${
+                props.reportableUpdateFailureId
+                  ? html`<button
+                      class="btn btn--sm"
+                      type="button"
+                      title=${props.canReport ? "" : t("updates.page.reportOwnerRequired")}
+                      ?disabled=${!props.canReport || props.updateBusy || props.statusChecking || props.updateFailureReportBusy}
+                      @click=${() => void props.onReportFailure(props.reportableUpdateFailureId!)}
+                    >
+                      ${
+                        props.updateFailureReportBusy
+                          ? t("updates.page.reportSubmitting")
+                          : t("updates.page.reportFailure")
+                      }
+                    </button>`
+                  : nothing
+              }
             </div>`,
           }),
           renderSettingsRow({
@@ -154,31 +183,72 @@ function renderRecordedAttempt(props: UpdatesViewProps) {
             </details>`,
           }),
         ]),
+    props.updateFailureReportNotice
+      ? renderUpdateFailureReportNotice(props.updateFailureReportNotice)
+      : nothing,
   ]);
+}
+
+function renderUpdateFailureReportNotice(notice: UpdateFailureReportNotice) {
+  const result = notice.result;
+  const label =
+    result.status === "created"
+      ? t("updates.page.reportCreated")
+      : result.status === "fallback"
+        ? t("updates.page.reportFallback")
+        : result.status === "pending"
+          ? t("updates.page.reportPending")
+          : result.status === "retryable"
+            ? t("updates.page.reportRetryable")
+            : result.status === "duplicate"
+              ? t("updates.page.reportDuplicate")
+              : t("updates.page.reportError");
+  const url = "url" in result && result.url ? result.url : null;
+  const fallbackUrl = "fallbackUrl" in result && result.fallbackUrl ? result.fallbackUrl : null;
+  return renderSettingsRow({
+    title: t("updates.page.reportResult"),
+    stacked: true,
+    control: html`<div class="updates-attempt-details" role="status">
+      <div>${label}</div>
+      ${
+        url
+          ? html`<div>
+              <a href=${url} target="_blank" rel="noreferrer">${t("updates.page.openIssue")}</a>
+            </div>`
+          : nothing
+      }
+      ${
+        fallbackUrl
+          ? html`<div>
+              <a href=${fallbackUrl} target="_blank" rel="noreferrer"
+                >${t("updates.page.openPrefilledIssue")}</a
+              >
+            </div>`
+          : nothing
+      }
+      ${"message" in result && result.message ? html`<div>${result.message}</div>` : nothing}
+    </div>`,
+  });
 }
 
 function readUpdatesSettings(
   configObject: Record<string, unknown>,
   schedule: UpdateScheduleState | null,
-): { channel: UpdatesChannel; autoEnabled: boolean; extendedStableAuthored: boolean } {
+): { channel: UpdatesChannel; autoEnabled: boolean; extendedStable: boolean } {
   const update = asConfigRecord(configObject.update);
   const auto = asConfigRecord(update?.auto);
-  const authoredChannel = update?.channel;
-  const extendedStableAuthored = authoredChannel === "extended-stable";
+  // The saved (or drafted) channel owns policy; the Gateway schedule reports the
+  // channel a configless install resolved to, since a direct
+  // openclaw@extended-stable package install never writes update.channel.
   const channel =
-    authoredChannel === "stable" ||
-    authoredChannel === "beta" ||
-    authoredChannel === "dev" ||
-    extendedStableAuthored
-      ? authoredChannel
-      : schedule?.channel === "beta" || schedule?.channel === "dev"
-        ? schedule.channel
-        : "stable";
+    UPDATES_CHANNELS.find((candidate) => candidate === update?.channel) ??
+    UPDATES_CHANNELS.find((candidate) => candidate === schedule?.channel) ??
+    "stable";
   return {
     channel,
     autoEnabled:
       typeof auto?.enabled === "boolean" ? auto.enabled : (schedule?.autoEnabled ?? false),
-    extendedStableAuthored,
+    extendedStable: channel === "extended-stable",
   };
 }
 
@@ -258,7 +328,12 @@ function renderScheduleStatus(props: UpdatesViewProps): TemplateResult {
   const target = formatUpdateTargetLabel(props.schedule, props.updateAvailable);
   let kind: Parameters<typeof renderSettingsStatus>[0]["kind"] = "muted";
   let label: string;
-  if (campaignLabel) {
+  if (props.statusChecking && !props.updateBusy) {
+    label = t("updates.page.checking");
+  } else if (props.statusCheckBanner && !props.updateBusy) {
+    kind = "warn";
+    label = props.statusCheckBanner.text;
+  } else if (campaignLabel) {
     kind = campaign?.state === "waiting-for-idle" ? "warn" : "accent";
     label = campaignLabel;
   } else if (props.statusBanner) {
@@ -312,8 +387,12 @@ function renderScheduleStatus(props: UpdatesViewProps): TemplateResult {
   } else {
     label = t("updates.page.statusUnavailable");
   }
+  const checkFailed = props.statusCheckBanner && !props.statusChecking && !props.updateBusy;
   const countdown = campaign?.state === "waiting-for-idle" || campaign?.state === "countdown";
-  return html`<span role=${countdown ? "timer" : nothing} aria-live=${countdown ? "off" : nothing}
+  return html`<span
+    class=${checkFailed ? "updates-status-check-failed" : nothing}
+    role=${countdown ? "timer" : nothing}
+    aria-live=${countdown ? "off" : nothing}
     >${renderSettingsStatus({ kind, label, dot: false })}</span
   >`;
 }
@@ -368,7 +447,7 @@ export function renderUpdates(props: UpdatesViewProps): TemplateResult {
     { value: "beta", label: t("updates.channel.beta") },
     { value: "dev", label: t("updates.channel.dev") },
   ];
-  if (settings.extendedStableAuthored) {
+  if (settings.extendedStable) {
     channelOptions.push({
       value: "extended-stable",
       label: t("updates.channel.extendedStable"),
@@ -424,7 +503,21 @@ export function renderUpdates(props: UpdatesViewProps): TemplateResult {
       onChange: props.onAutomaticUpdatesChange,
     }),
   ];
-  const updateButtonTitle = !props.canAdmin ? t("updates.adminRequired") : "";
+  const checkRequired = Boolean(
+    props.statusCheckBanner &&
+    !isUpdateActionable(props.updateAvailable, props.schedule, props.updateBusy) &&
+    props.schedule?.target?.kind !== "package" &&
+    props.schedule?.install?.git?.status !== "behind" &&
+    props.schedule?.install?.git?.status !== "diverged",
+  );
+  const updateButtonTitle =
+    props.statusChecking && !props.updateBusy
+      ? t("updates.page.checking")
+      : !props.canAdmin
+        ? t("updates.adminRequired")
+        : checkRequired
+          ? t("updates.page.checkRequired")
+          : "";
   return html`
     <div id="config-section-update">
       ${renderSettingsPage([
@@ -442,12 +535,27 @@ export function renderUpdates(props: UpdatesViewProps): TemplateResult {
               <div class="updates-status-control">
                 ${renderScheduleStatus(props)}
                 ${
+                  props.statusCheckBanner
+                    ? html`
+                        <button
+                          type="button"
+                          class="btn btn--sm"
+                          title=${props.statusChecking ? t("updates.page.checking") : props.canCheckStatus ? "" : t("updates.adminRequired")}
+                          ?disabled=${!props.canCheckStatus || props.statusChecking || props.updateBusy}
+                          @click=${() => void props.onCheckStatus()}
+                        >
+                          ${t("updates.page.checkForUpdates")}
+                        </button>
+                      `
+                    : nothing
+                }
+                ${
                   showHold
                     ? html`
                         <button
                           type="button"
                           class="btn btn--sm"
-                          ?disabled=${props.updateBusy}
+                          ?disabled=${props.updateBusy || props.statusChecking}
                           @click=${() => void props.onHoldUpdate()}
                         >
                           ${t("updates.holdOneHour")}
@@ -467,11 +575,11 @@ export function renderUpdates(props: UpdatesViewProps): TemplateResult {
                 type="button"
                 class="btn primary"
                 title=${updateButtonTitle}
-                ?disabled=${props.updateBusy || !props.canUpdate}
+                ?disabled=${props.updateBusy || props.statusChecking || !props.canUpdate || checkRequired}
                 @click=${props.onUpdateNow}
               >
                 ${icons.download}
-                ${props.updateBusy ? t("chat.updating") : t("updates.page.updateNow")}
+                ${props.updateBusy ? t("updates.page.updating") : t("updates.page.updateNow")}
               </button>
             `,
           }),

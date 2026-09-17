@@ -232,7 +232,7 @@ export class SqliteBackedMatrixSyncStore extends MemoryStore {
     try {
       await this.persistLock(async () => {
         writeMatrixSyncCacheStateToSyncStore({ payload, store: this.store });
-        claimCurrentTokenStorageState({
+        await claimCurrentTokenStorageState({
           rootDir: this.storageRootDir,
         });
       });
@@ -257,6 +257,7 @@ function createNoopMatrixSyncCacheStore(): PluginStateSyncKeyedStore<MatrixSyncC
     register: () => {},
     registerIfAbsent: () => false,
     lookup: () => undefined,
+    lookupMany: (keys) => keys.map(() => ({ ok: true, value: undefined })),
     consume: () => undefined,
     delete: () => false,
     entries: () => [],

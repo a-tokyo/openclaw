@@ -1,9 +1,10 @@
-import { html, nothing, render } from "lit";
+import { html, nothing } from "lit";
 import type { SessionMoveTarget } from "../../../packages/gateway-protocol/src/index.js";
 import { t } from "../i18n/index.ts";
 import { formatUiError } from "../lib/format-error.ts";
 import {
   renderCloudMachineMenuItems,
+  renderCloudOsMenuItems,
   renderCloudProfileMenuItems,
   renderSessionMenuItem,
 } from "../pages/new-session/cloud-target.ts";
@@ -12,7 +13,7 @@ import type { DraftCloudProfile } from "../pages/new-session/discovery.ts";
 import { DraftCloudMachineState } from "../pages/new-session/draft-cloud-machine-state.ts";
 import "../styles/new-session.css";
 import { icons } from "./icons.ts";
-import "./modal-dialog.ts";
+import { withPromiseModalHost } from "./promise-modal-host.ts";
 
 type Catalog = {
   profiles: readonly DraftCloudProfile[];
@@ -20,9 +21,10 @@ type Catalog = {
 };
 
 type Options = {
-  mode: "move" | "restart";
+  mode: "dispatch" | "move" | "restart";
   sessionLabel: string;
   activeRun: boolean;
+  gatewayDisabledReason?: string;
   deviceDisabledReason?: string;
   profileDisabledReason?: (profile: DraftCloudProfile) => string | undefined;
   loadCatalog: () => Promise<Catalog>;
@@ -52,9 +54,7 @@ export function showSessionPlacementTargetDialog(
     return Promise.resolve(null);
   }
   active = true;
-  const host = document.createElement("div");
-  document.body.append(host);
-  return new Promise((resolve) => {
+  return withPromiseModalHost<SessionMoveTarget | null>(undefined, ({ render, finish: settle }) => {
     let loading = true;
     let loadError: string | null = null;
     let catalog: Catalog = { profiles: [], devices: [] };
@@ -62,10 +62,8 @@ export function showSessionPlacementTargetDialog(
     const cloudMachines = new DraftCloudMachineState();
 
     const finish = (result: SessionMoveTarget | null) => {
-      render(nothing, host);
-      host.remove();
+      settle(result);
       active = false;
-      resolve(result);
     };
 
     const select = (target: SessionMoveTarget) => {
@@ -83,51 +81,45 @@ export function showSessionPlacementTargetDialog(
         return;
       }
       const machineClass = cloudMachines.resolve(selected.profileId);
+      const os = cloudMachines.resolveOs(selected.profileId);
       finish({
         ...selected,
         ...(machineClass ? { machineClass } : {}),
+        ...(os ? { os } : {}),
       });
     };
 
     function paint() {
       const selectedKey = targetKey(selected);
       const restart = options.mode === "restart";
-      render(
-        html`
-          <openclaw-modal-dialog
-            label=${t(
-              restart ? "sessionsView.restartSessionTitle" : "sessionsView.moveSessionTitle",
-            )}
-            @modal-cancel=${() => finish(null)}
-          >
+      const dispatch = options.mode === "dispatch";
+      const title = t(`sessionsView.${options.mode}SessionTitle`);
+      const description = t(`sessionsView.${options.mode}SessionDescription`, {
+        session: options.sessionLabel,
+      });
+      const action = t(`sessionsView.${options.mode}SessionAction`);
+      render(() => {
+        return html`
+          <openclaw-modal-dialog label=${title} @modal-cancel=${() => finish(null)}>
             <form class="exec-approval-card" @submit=${submit}>
               <div class="exec-approval-header">
-                <div class="exec-approval-title">
-                  ${t(
-                    restart ? "sessionsView.restartSessionTitle" : "sessionsView.moveSessionTitle",
-                  )}
-                </div>
-                <div class="muted">
-                  ${t(
-                    restart
-                      ? "sessionsView.restartSessionDescription"
-                      : "sessionsView.moveSessionDescription",
-                    { session: options.sessionLabel },
-                  )}
-                </div>
+                <div class="exec-approval-title">${title}</div>
+                <div class="muted">${description}</div>
               </div>
               ${
                 restart
                   ? html`<div class="exec-approval-error" role="alert">
                       ${t("sessionsView.restartSessionWarning")}
                     </div>`
-                  : options.activeRun
-                    ? html`<div class="exec-approval-error" role="alert">
-                        ${t("sessionsView.moveSessionActiveRunWarning")}
-                      </div>`
-                    : html`<div class="callout">
-                        ${t("sessionsView.moveSessionNoReplayWarning")}
-                      </div>`
+                  : dispatch
+                    ? html`<div class="callout">${t("sessionsView.dispatchSessionNotice")}</div>`
+                    : options.activeRun
+                      ? html`<div class="exec-approval-error" role="alert">
+                          ${t("sessionsView.moveSessionActiveRunWarning")}
+                        </div>`
+                      : html`<div class="callout">
+                          ${t("sessionsView.moveSessionNoReplayWarning")}
+                        </div>`
               }
               ${
                 loading
@@ -137,7 +129,7 @@ export function showSessionPlacementTargetDialog(
                     : html`
                         <div class="new-session-page__picker-root">
                           ${
-                            restart
+                            dispatch
                               ? nothing
                               : renderSessionMenuItem(
                                   {
@@ -145,6 +137,8 @@ export function showSessionPlacementTargetDialog(
                                     label: t("newSession.gateway"),
                                     icon: icons.monitor,
                                     checked: selectedKey === "gateway",
+                                    disabled: Boolean(options.gatewayDisabledReason),
+                                    title: options.gatewayDisabledReason,
                                     onSelect: () => select({ kind: "gateway" }),
                                   },
                                   false,
@@ -192,7 +186,8 @@ export function showSessionPlacementTargetDialog(
                                     const profileSelected =
                                       selected?.kind === "profile" &&
                                       selected.profileId === profile.id;
-                                    const machines = profile.machines ?? [];
+                                    const machines = cloudMachines.machines(profile);
+                                    const operatingSystems = profile.operatingSystems ?? [];
                                     const selectedMachineId =
                                       cloudMachines.resolve(profile.id) ||
                                       machines.find((machine) => machine.default === true)?.id ||
@@ -207,6 +202,28 @@ export function showSessionPlacementTargetDialog(
                                         onSelect: (profileId) =>
                                           select({ kind: "profile", profileId }),
                                       })}
+                                      ${
+                                        profileSelected && operatingSystems.length >= 2
+                                          ? html`
+                                              <div class="new-session-page__menu-title">
+                                                ${t("newSession.operatingSystem")}
+                                              </div>
+                                              ${renderCloudOsMenuItems({
+                                                operatingSystems,
+                                                selectedId: cloudMachines.selectedOs(profile),
+                                                submitting: false,
+                                                onSelect: (osId) =>
+                                                  cloudMachines.selectOs(
+                                                    profile.id,
+                                                    osId,
+                                                    catalog.profiles,
+                                                    false,
+                                                    paint,
+                                                  ),
+                                              })}
+                                            `
+                                          : nothing
+                                      }
                                       ${
                                         profileSelected && machines.length > 0
                                           ? html`
@@ -243,11 +260,7 @@ export function showSessionPlacementTargetDialog(
                   class="btn primary"
                   ?disabled=${loading || Boolean(loadError) || !selected}
                 >
-                  ${t(
-                    restart
-                      ? "sessionsView.restartSessionAction"
-                      : "sessionsView.moveSessionAction",
-                  )}
+                  ${action}
                 </button>
                 <button type="button" class="btn" @click=${() => finish(null)}>
                   ${t("common.cancel")}
@@ -255,9 +268,8 @@ export function showSessionPlacementTargetDialog(
               </div>
             </form>
           </openclaw-modal-dialog>
-        `,
-        host,
-      );
+        `;
+      });
     }
 
     paint();

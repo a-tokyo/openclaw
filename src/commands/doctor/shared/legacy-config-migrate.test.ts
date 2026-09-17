@@ -429,6 +429,7 @@ describe("legacy memory search config migrate", () => {
     });
     expect(res.config?.models?.providers).not.toHaveProperty("openai-codex");
     expect(res.changes).toEqual([
+      "Preserved the implicit primary model in agents.defaults.model.primary (openai-codex/gpt-5.5).",
       'Moved models.providers.openai-codex.api "openai-codex-responses" → "openai-chatgpt-responses".',
       'Moved models.providers.openai-codex.models[0].api "openai-codex-responses" → "openai-chatgpt-responses".',
       "Moved models.providers.openai-codex → models.providers.openai.",
@@ -1046,8 +1047,14 @@ describe("legacy memory search config migrate", () => {
     };
     const res = migrateLegacyConfigForTest(raw);
 
-    expect(res.config).toBeNull();
-    expect(res.changes).toEqual([]);
+    expect(res.config?.models).toEqual(raw.models);
+    expect(res.config?.agents?.defaults?.model).toEqual({
+      primary: "openai/text-embedding-3-small",
+    });
+    expect(res.changes).toEqual([
+      "Preserved the implicit primary model in agents.defaults.model.primary (openai/text-embedding-3-small).",
+    ]);
+    expect(migrateLegacyConfigForTest(res.config)).toEqual({ config: null, changes: [] });
     expect(findLegacyConfigIssues(raw).map((issue) => issue.path)).not.toContain(
       "models.providers",
     );
@@ -1205,6 +1212,7 @@ describe("legacy memory search config migrate", () => {
       "Moved agents.list[1].memorySearch → agents.list[1].memory.search.",
       'Moved memory.search.provider from legacy "auto" to "openai".',
       'Moved agents.list[0].memory.search.provider from legacy "auto" to "openai".',
+      "Stamped the multi-agent roster for explicit per-surface ownership.",
     ]);
   });
 });
@@ -1312,6 +1320,7 @@ describe("legacy agent system prompt override config migrate", () => {
     expect(res.changes).toEqual([
       "Removed agents.defaults.systemPromptOverride.",
       "Removed agents.list[0].systemPromptOverride.",
+      "Stamped the multi-agent roster for explicit per-surface ownership.",
     ]);
   });
 });
@@ -3546,6 +3555,18 @@ describe("gateway.port out-of-range repair migrate", () => {
 });
 
 describe("legacy model compat migrate", () => {
+  function withVllmModels(
+    models: Record<string, unknown>[],
+    defaults?: Record<string, unknown>,
+    providerParams?: Record<string, unknown>,
+  ) {
+    return {
+      ...(defaults ? { agents: { defaults } } : {}),
+      models: {
+        providers: { vllm: { models, ...(providerParams ? { params: providerParams } : {}) } },
+      },
+    };
+  }
   it("upgrades the retired xAI quality image slug without pinning active aliases", () => {
     const raw = {
       agents: {
@@ -4132,32 +4153,24 @@ describe("legacy model compat migrate", () => {
       supportsTools: true,
     });
     expect(res.changes).toStrictEqual([
+      "Preserved the implicit primary model in agents.defaults.model.primary (bailian/qwen-legacy).",
       'Removed models.providers.bailian.models.0.compat.thinkingFormat (unrecognized value "bailian-legacy"; runtime default applies).',
     ]);
   });
 
   it("moves legacy vLLM Qwen thinking params to model compat", () => {
-    const res = migrateLegacyConfigForTest({
-      agents: {
-        defaults: {
-          models: {
-            "vllm/Qwen/Qwen3-8B": {
-              params: {
-                qwenThinkingFormat: "chat-template",
-                temperature: 0.2,
-              },
+    const res = migrateLegacyConfigForTest(
+      withVllmModels([{ id: "Qwen/Qwen3-8B", name: "Qwen3 8B" }], {
+        models: {
+          "vllm/Qwen/Qwen3-8B": {
+            params: {
+              qwenThinkingFormat: "chat-template",
+              temperature: 0.2,
             },
           },
         },
-      },
-      models: {
-        providers: {
-          vllm: {
-            models: [{ id: "Qwen/Qwen3-8B", name: "Qwen3 8B" }],
-          },
-        },
-      },
-    });
+      }),
+    );
 
     expect(res.config?.agents?.defaults?.models?.["vllm/Qwen/Qwen3-8B"]?.params).toEqual({
       temperature: 0.2,
@@ -4167,6 +4180,7 @@ describe("legacy model compat migrate", () => {
     });
     expect(res.config?.models?.providers?.vllm?.models?.[0]?.reasoning).toBe(true);
     expect(res.changes).toStrictEqual([
+      "Preserved the implicit primary model in agents.defaults.model.primary (vllm/Qwen/Qwen3-8B).",
       "Copied the legacy default model map to agents.defaults.modelPolicy.allow.",
       'Moved agents.defaults.models."vllm/Qwen/Qwen3-8B".params.qwenThinkingFormat to models.providers.vllm.models[0].compat.thinkingFormat ("qwen-chat-template").',
     ]);
@@ -4237,31 +4251,17 @@ describe("legacy model compat migrate", () => {
   });
 
   it("preserves existing vLLM model compat when removing legacy Qwen thinking params", () => {
-    const res = migrateLegacyConfigForTest({
-      agents: {
-        defaults: {
-          models: {
-            "vllm/Qwen/Qwen3-8B": {
-              params: {
-                qwenThinkingFormat: "top-level",
-              },
+    const res = migrateLegacyConfigForTest(
+      withVllmModels([{ id: "Qwen/Qwen3-8B", compat: { thinkingFormat: "qwen-chat-template" } }], {
+        models: {
+          "vllm/Qwen/Qwen3-8B": {
+            params: {
+              qwenThinkingFormat: "top-level",
             },
           },
         },
-      },
-      models: {
-        providers: {
-          vllm: {
-            models: [
-              {
-                id: "Qwen/Qwen3-8B",
-                compat: { thinkingFormat: "qwen-chat-template" },
-              },
-            ],
-          },
-        },
-      },
-    });
+      }),
+    );
 
     expect(res.config?.agents?.defaults?.models?.["vllm/Qwen/Qwen3-8B"]).not.toHaveProperty(
       "params",
@@ -4271,32 +4271,24 @@ describe("legacy model compat migrate", () => {
     });
     expect(res.config?.models?.providers?.vllm?.models?.[0]?.reasoning).toBe(true);
     expect(res.changes).toStrictEqual([
+      "Preserved the implicit primary model in agents.defaults.model.primary (vllm/Qwen/Qwen3-8B).",
       "Copied the legacy default model map to agents.defaults.modelPolicy.allow.",
       'Removed agents.defaults.models."vllm/Qwen/Qwen3-8B".params.qwenThinkingFormat; models.providers.vllm.models[0].compat.thinkingFormat is already "qwen-chat-template".',
     ]);
   });
 
   it("moves legacy vLLM Qwen thinking params onto provider-qualified model rows", () => {
-    const res = migrateLegacyConfigForTest({
-      agents: {
-        defaults: {
-          models: {
-            "vllm/Qwen/Qwen3-8B": {
-              params: {
-                qwenThinkingFormat: "chat-template",
-              },
+    const res = migrateLegacyConfigForTest(
+      withVllmModels([{ id: "vllm/Qwen/Qwen3-8B", name: "Qwen3 8B" }], {
+        models: {
+          "vllm/Qwen/Qwen3-8B": {
+            params: {
+              qwenThinkingFormat: "chat-template",
             },
           },
         },
-      },
-      models: {
-        providers: {
-          vllm: {
-            models: [{ id: "vllm/Qwen/Qwen3-8B", name: "Qwen3 8B" }],
-          },
-        },
-      },
-    });
+      }),
+    );
 
     expect(res.config?.models?.providers?.vllm?.models).toEqual([
       {
@@ -4307,30 +4299,25 @@ describe("legacy model compat migrate", () => {
       },
     ]);
     expect(res.changes).toStrictEqual([
+      "Preserved the implicit primary model in agents.defaults.model.primary (vllm/vllm/Qwen/Qwen3-8B).",
       "Copied the legacy default model map to agents.defaults.modelPolicy.allow.",
       'Moved agents.defaults.models."vllm/Qwen/Qwen3-8B".params.qwenThinkingFormat to models.providers.vllm.models[0].compat.thinkingFormat ("qwen-chat-template").',
     ]);
   });
 
   it("moves legacy vLLM Qwen model-row params to model compat", () => {
-    const res = migrateLegacyConfigForTest({
-      models: {
-        providers: {
-          vllm: {
-            models: [
-              {
-                id: "Qwen/Qwen3-8B",
-                name: "Qwen3 8B",
-                params: {
-                  qwenThinkingFormat: "chat-template",
-                  temperature: 0.2,
-                },
-              },
-            ],
+    const res = migrateLegacyConfigForTest(
+      withVllmModels([
+        {
+          id: "Qwen/Qwen3-8B",
+          name: "Qwen3 8B",
+          params: {
+            qwenThinkingFormat: "chat-template",
+            temperature: 0.2,
           },
         },
-      },
-    });
+      ]),
+    );
 
     expect(res.config?.models?.providers?.vllm?.models?.[0]).toEqual({
       id: "Qwen/Qwen3-8B",
@@ -4340,27 +4327,22 @@ describe("legacy model compat migrate", () => {
       compat: { thinkingFormat: "qwen-chat-template" },
     });
     expect(res.changes).toStrictEqual([
+      "Preserved the implicit primary model in agents.defaults.model.primary (vllm/Qwen/Qwen3-8B).",
       'Moved models.providers.vllm.models[0].params.qwenThinkingFormat to models.providers.vllm.models[0].compat.thinkingFormat ("qwen-chat-template").',
     ]);
   });
 
   it("moves legacy vLLM Qwen provider params to model compat rows", () => {
-    const res = migrateLegacyConfigForTest({
-      models: {
-        providers: {
-          vllm: {
-            params: {
-              qwen_thinking_format: "enable_thinking",
-              temperature: 0.2,
-            },
-            models: [
-              { id: "Qwen/Qwen3-8B", name: "Qwen3 8B" },
-              { id: "Qwen/Qwen3-14B", name: "Qwen3 14B" },
-            ],
-          },
-        },
-      },
-    });
+    const res = migrateLegacyConfigForTest(
+      withVllmModels(
+        [
+          { id: "Qwen/Qwen3-8B", name: "Qwen3 8B" },
+          { id: "Qwen/Qwen3-14B", name: "Qwen3 14B" },
+        ],
+        undefined,
+        { qwen_thinking_format: "enable_thinking", temperature: 0.2 },
+      ),
+    );
 
     expect(res.config?.models?.providers?.vllm?.params).toEqual({ temperature: 0.2 });
     expect(res.config?.models?.providers?.vllm?.models).toEqual([
@@ -4378,9 +4360,68 @@ describe("legacy model compat migrate", () => {
       },
     ]);
     expect(res.changes).toStrictEqual([
+      "Preserved the implicit primary model in agents.defaults.model.primary (vllm/Qwen/Qwen3-8B).",
       'Moved models.providers.vllm.params.qwen_thinking_format to models.providers.vllm.models[0].compat.thinkingFormat ("qwen").',
       'Moved models.providers.vllm.params.qwen_thinking_format to models.providers.vllm.models[1].compat.thinkingFormat ("qwen").',
     ]);
+  });
+
+  it("preserves vLLM target order and cached formats across provider, default, and agent params", () => {
+    const res = migrateLegacyConfigForTest({
+      agents: {
+        defaults: {
+          model: { primary: "vllm/Qwen/Qwen3-8B", fallbacks: ["vllm/Qwen/Qwen3-14B"] },
+          params: { qwenThinkingFormat: "chat-template" },
+        },
+        entries: {
+          worker: {
+            model: { primary: "vllm/Qwen/Qwen3-14B", fallbacks: ["vllm/Qwen/Qwen3-8B"] },
+            params: { qwen_thinking_format: "invalid" },
+          },
+        },
+      },
+      models: {
+        providers: {
+          vllm: {
+            params: { qwenThinkingFormat: "enable-thinking" },
+            models: [
+              {
+                id: "Qwen/Qwen3-8B",
+                reasoning: false,
+                compat: { thinkingFormat: "qwen-chat-template" },
+              },
+              { id: "Qwen/Qwen3-14B" },
+            ],
+          },
+        },
+      },
+    });
+
+    expect(res.config?.models?.providers?.vllm).toEqual({
+      models: [
+        {
+          id: "Qwen/Qwen3-8B",
+          reasoning: false,
+          compat: { thinkingFormat: "qwen-chat-template" },
+        },
+        { id: "Qwen/Qwen3-14B", reasoning: true, compat: { thinkingFormat: "qwen" } },
+      ],
+    });
+    expect(res.config?.agents?.defaults).toEqual({
+      model: { primary: "vllm/Qwen/Qwen3-8B", fallbacks: ["vllm/Qwen/Qwen3-14B"] },
+    });
+    expect(res.config?.agents?.entries?.worker).toEqual({
+      model: { primary: "vllm/Qwen/Qwen3-14B", fallbacks: ["vllm/Qwen/Qwen3-8B"] },
+    });
+    expect(res.changes).toStrictEqual([
+      'Removed models.providers.vllm.params.qwenThinkingFormat; models.providers.vllm.models[0].compat.thinkingFormat is already "qwen-chat-template".',
+      'Moved models.providers.vllm.params.qwenThinkingFormat to models.providers.vllm.models[1].compat.thinkingFormat ("qwen").',
+      'Removed agents.defaults.params.qwenThinkingFormat; models.providers.vllm.models[0].compat.thinkingFormat is already "qwen-chat-template".',
+      'Removed agents.defaults.params.qwenThinkingFormat; models.providers.vllm.models[1].compat.thinkingFormat is already "qwen".',
+      'Removed agents.entries.worker.params.qwen_thinking_format (unrecognized value "invalid"; configure models.providers.vllm.models[].compat.thinkingFormat if needed).',
+      'Removed agents.entries.worker.params.qwen_thinking_format (unrecognized value "invalid"; configure models.providers.vllm.models[].compat.thinkingFormat if needed).',
+    ]);
+    expect(migrateLegacyConfigForTest(res.config)).toEqual({ config: null, changes: [] });
   });
 
   it("moves legacy vLLM Qwen provider params to existing and selected model rows", () => {
@@ -4831,8 +4872,14 @@ describe("legacy model compat migrate", () => {
       },
     });
 
-    expect(res.config).toBeNull();
-    expect(res.changes).toStrictEqual([]);
+    expect(res.config?.models?.providers?.bailian?.models?.[0]?.compat).toEqual({
+      thinkingFormat: "qwen",
+    });
+    expect(res.config?.agents?.defaults?.model).toEqual({ primary: "bailian/qwen3" });
+    expect(res.changes).toStrictEqual([
+      "Preserved the implicit primary model in agents.defaults.model.primary (bailian/qwen3).",
+    ]);
+    expect(migrateLegacyConfigForTest(res.config)).toEqual({ config: null, changes: [] });
   });
 
   it("selectively removes invalid thinkingFormat values across providers", () => {
@@ -4872,6 +4919,7 @@ describe("legacy model compat migrate", () => {
     expect(res.config?.models?.providers?.bailian?.models?.[1]?.compat).toEqual({});
     expect(res.config?.models?.providers?.openrouter?.models?.[0]?.compat).toEqual({});
     expect(res.changes).toStrictEqual([
+      "Preserved the implicit primary model in agents.defaults.model.primary (bailian/valid).",
       'Removed models.providers.bailian.models.1.compat.thinkingFormat (unrecognized value "old-bailian"; runtime default applies).',
       'Removed models.providers.openrouter.models.0.compat.thinkingFormat (unrecognized value "openrouter-v0"; runtime default applies).',
     ]);

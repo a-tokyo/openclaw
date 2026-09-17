@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { setTimeout as sleep } from "node:timers/promises";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
+import { truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
 import { formatErrorMessage } from "../infra/errors.js";
 import { NODE_FS_LIST_DIR_COMMAND } from "../infra/node-commands.js";
 import { createLazyRuntimeNamedExport } from "../shared/lazy-runtime.js";
@@ -8,15 +9,20 @@ import { parseNodeList } from "../shared/node-list-parse.js";
 import type { NodeListNode } from "../shared/node-list-types.js";
 import { resolveEligibleNodeFromList } from "../shared/node-resolve.js";
 import { resolveSafeTimeoutDelayMs } from "../utils/timer-delay.js";
+import { getBeforeToolCallFailureDisposition } from "./agent-tools.before-tool-call.js";
 import { redactCodeModeCatalogIds, type CodeModeCatalogProjection } from "./code-mode-catalog.js";
-import { boundCodeModeError, boundCodeModeValue } from "./code-mode-json.js";
 import type { CodeModeNamespaceRuntime } from "./code-mode-namespaces.js";
-import type { PendingBridgeRequest, SettledBridgeRequest } from "./code-mode-runtime.js";
+import type { CodeModeReplyLease } from "./code-mode-program-data.js";
+import type { CodeModeResultsAccess } from "./code-mode-results.js";
+import type { PendingBridgeRequest } from "./code-mode-runtime.js";
 import { readCodeModeSkill } from "./code-mode-skills.js";
+import { createCodeModeToolApiFile } from "./code-mode-tool-api.js";
 import { consumeMcpCodeModeGuestResult } from "./mcp-content.js";
 import type { AgentToolUpdateCallback } from "./runtime/index.js";
 import { isCollectorSpawnTool } from "./subagents/swarm/swarm-collector-capability.js";
 import { resolveSwarmConfig } from "./subagents/swarm/swarm-config.js";
+import { getToolContractFailureCode } from "./tool-contract-error.js";
+import { isTrustedToolInputError } from "./tool-input-error.js";
 import { isToolExecutionAllowed, TOOL_EXECUTION_GATED_MESSAGE } from "./tool-policy-shared.js";
 import type { ToolSearchRuntime } from "./tool-search-runtime.js";
 import type { ToolSearchCatalogEntry, ToolSearchToolContext } from "./tool-search-types.js";
@@ -207,39 +213,80 @@ export async function runBridgeRequest(params: {
   namespaceRuntime: CodeModeNamespaceRuntime;
   parentToolCallId: string;
   codeModeRunId: string;
-  maxOutputBytes: number;
+  reply: CodeModeReplyLease;
+  results: CodeModeResultsAccess;
   remainingMs: number;
   ctx: ToolSearchToolContext;
   request: PendingBridgeRequest;
   signal?: AbortSignal;
   onUpdate?: AgentToolUpdateCallback;
-}): Promise<SettledBridgeRequest> {
+}): Promise<void> {
   const catalogProjection = params.catalogProjection;
   try {
+    params.signal?.throwIfAborted();
     const values = Array.isArray(params.request.args) ? params.request.args : [];
     let value: unknown;
     switch (params.request.method) {
+      case "resultSave":
+      case "resultLoad":
+      case "resultDelete": {
+        if (params.request.method === "resultSave") {
+          value = params.results.save(values[0], params.runtime.hasNetworkContent());
+        } else if (params.request.method === "resultLoad") {
+          const loaded = params.results.load(values[0]);
+          if (loaded.networkContent) {
+            params.runtime.observeNetworkContent(params.parentToolCallId);
+          }
+          value = loaded.value;
+        } else {
+          value = params.results.delete(values[0]);
+        }
+        break;
+      }
       case "search": {
         const query = values[0];
         if (typeof query !== "string") {
           throw new ToolInputError("search query must be a string.");
         }
         const options = isRecord(values[1]) ? values[1] : undefined;
-        const matches = await params.runtime.search(query, {
-          limit: typeof options?.limit === "number" ? options.limit : undefined,
-          includeMcp: false,
-          allowedIds: catalogProjection.byId,
-        });
         const exact = query.trim().toLowerCase();
-        const exactBinding = catalogProjection.bindings.find(
-          (binding) =>
-            binding.name.toLowerCase() === exact || binding.callableName.toLowerCase() === exact,
-        );
+        const mcpBindings = params.namespaceRuntime.mcpBindings;
+        const mcpRoutes = [...mcpBindings];
+        const exactMcpId = (mcpRoutes.find(
+          ([, binding]) => binding.callableName === query.trim(),
+        ) ?? mcpRoutes.find(([, binding]) => binding.callableName.toLowerCase() === exact))?.[0];
+        const exactBinding = exactMcpId
+          ? undefined
+          : catalogProjection.bindings.find(
+              (binding) =>
+                binding.name.toLowerCase() === exact ||
+                binding.callableName.toLowerCase() === exact,
+            );
+        const matches = await params.runtime.search(exactBinding?.id ?? exactMcpId ?? query, {
+          limit: typeof options?.limit === "number" ? options.limit : undefined,
+          allowedIds: catalogProjection.searchableIds,
+        });
         value = exactBinding
           ? [exactBinding.callableName]
-          : matches.flatMap((entry) => {
+          : matches.map((entry) => {
               const binding = catalogProjection.byId.get(entry.id);
-              return binding ? [binding.callableName] : [];
+              if (binding) {
+                return binding.callableName;
+              }
+              const mcp = mcpBindings.get(entry.id);
+              if (!mcp) {
+                throw new ToolInputError("Search result has no callable namespace route.");
+              }
+              params.runtime.observeNetworkContent(params.parentToolCallId);
+              return {
+                callableName: mcp.callableName,
+                namespaceId: mcp.namespaceId,
+                path: mcp.path,
+                apiPath: mcp.apiPath,
+                name: entry.mcp?.toolName ?? entry.name,
+                source: "mcp",
+                description: truncateUtf16Safe(entry.description, 512),
+              };
             });
         break;
       }
@@ -256,7 +303,10 @@ export async function runBridgeRequest(params: {
           includeMcp: false,
         });
         const { id: _id, sourceName: _sourceName, mcp: _mcp, ...guestDescription } = described;
-        value = { ...guestDescription, callableName: binding.callableName };
+        value =
+          values[1] === "declaration"
+            ? await createCodeModeToolApiFile(binding.callableName, guestDescription)
+            : { ...guestDescription, callableName: binding.callableName };
         break;
       }
       case "callValue": {
@@ -403,23 +453,18 @@ export async function runBridgeRequest(params: {
         break;
       }
     }
-    value = boundCodeModeValue(value, params.maxOutputBytes);
-    // Search must remain a callable-name array; a truncation marker erases discovery.
-    if (params.request.method === "search" && !Array.isArray(value)) {
-      throw new ToolInputError(
-        "Search results exceed the output budget. Narrow the query or lower the limit.",
-      );
-    }
-    return { id: params.request.id, ok: true, value };
+    params.reply.settle(true, value);
   } catch (error) {
-    const boundedError = boundCodeModeError(
-      redactCodeModeCatalogIds(formatErrorMessage(error), catalogProjection.bindings),
-      params.maxOutputBytes,
-    );
-    return {
-      id: params.request.id,
-      ok: false,
-      error: boundedError,
-    };
+    const classified =
+      getBeforeToolCallFailureDisposition(error) !== undefined && error instanceof Error
+        ? (error.cause ?? error)
+        : error;
+    params.reply.settle(false, {
+      message: redactCodeModeCatalogIds(formatErrorMessage(error), catalogProjection.bindings),
+      code:
+        getToolContractFailureCode(classified) ??
+        (isTrustedToolInputError(classified) ? "invalid_input" : "tool_error"),
+      effectStatus: "unknown",
+    });
   }
 }

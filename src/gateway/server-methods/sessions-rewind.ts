@@ -18,6 +18,7 @@ import {
   type SessionBranchSwitchMutationResult,
   type SessionMessageCutMutationResult,
 } from "../../config/sessions/session-accessor.js";
+import { parseInboundMediaUri } from "../../media/media-reference.js";
 import { MEDIA_MAX_BYTES, readMediaBuffer } from "../../media/store.js";
 import { isIncognitoSessionKey } from "../../routing/session-key.js";
 import { ModelSelectionLockedError } from "../../sessions/model-overrides.js";
@@ -31,6 +32,7 @@ import {
   readSessionUpstreamLink,
   type SessionUpstreamLink,
 } from "../../sessions/session-upstream-links.js";
+import { getSessionRepositoryWorkspaceStore } from "../../state/session-repository-workspaces.js";
 import { authorizeGatewaySessionCreation, resolveCreatorSandbox } from "../operator-role-policy.js";
 import { buildDashboardSessionKey } from "../session-create-service.js";
 import {
@@ -39,8 +41,10 @@ import {
 } from "../session-request-agent.js";
 import { SessionMutationAuthorizationChangedError } from "../session-sharing.js";
 import { asWorkerInferenceControl } from "../worker-environments/inference-control.js";
+import { forkSessionRepositoryWorkspace } from "../worker-environments/session-repository-checkpoints.js";
 import { resolveVisibleActiveSessionRunState } from "./session-active-runs.js";
 import { emitSessionsChanged } from "./session-change-event.js";
+import { prepareSessionForkFilesystemRoot } from "./session-create-root.js";
 import { resolveOperatorSessionCreation } from "./session-creation-provenance.js";
 import {
   loadAccessorSessionEntryForGatewayTarget,
@@ -72,10 +76,16 @@ async function resolveEditorMediaAttachments(
   const seen = new Set<string>();
   const attachments: Array<{ mimeType: string; data: string }> = [];
   for (const ref of refs) {
-    // Transcript paths are untrusted hints; only the basename is read through the
+    // Transcript references are untrusted hints; only an inbound id is read through the
     // media store (its traversal guards and byte cap stay authoritative), so
     // dedupe on that resolved id — path aliases must not repeat the same read.
-    const id = path.basename(ref.path);
+    let id: string;
+    try {
+      id = parseInboundMediaUri(ref.path)?.id ?? path.basename(ref.path);
+    } catch {
+      // A corrupt URI is only a failed attachment hint, never a failed history cut.
+      continue;
+    }
     if (seen.has(id)) {
       continue;
     }
@@ -491,7 +501,22 @@ async function mutateSessionAtMessage(
         });
         return;
       }
+      const forkWorkspace =
+        action === "fork"
+          ? prepareSessionForkFilesystemRoot({
+              cfg,
+              parent: current.entry,
+              targetAgentId: current.target.agentId,
+              sessionKey: targetKey,
+              sandboxRequired: sandbox === "required",
+            })
+          : undefined;
+      if (forkWorkspace && !forkWorkspace.ok) {
+        respond(false, undefined, forkWorkspace.error);
+        return;
+      }
       let result: MessageCutMutationResult;
+      let forkRepositoryWorkspaceId: string | undefined;
       const mutationParams = {
         agentId: current.target.agentId,
         commitGuard,
@@ -500,12 +525,46 @@ async function mutateSessionAtMessage(
         storePath: current.storePath,
       };
       try {
+        if (action === "fork" && current.entry.repositoryWorkspaceId) {
+          const repositories = getSessionRepositoryWorkspaceStore();
+          const source = repositories.get(current.entry.repositoryWorkspaceId);
+          const assertRepositoryCurrent = () => {
+            commitGuard();
+            const sourceEntry = loadAccessorSessionEntryForGatewayTarget({
+              key: current.canonicalKey,
+              cfg,
+              agentId: current.target.agentId,
+            }).entry;
+            if (
+              !source ||
+              source.agentId !== current.target.agentId ||
+              source.sessionKey !== current.canonicalKey ||
+              sourceEntry?.sessionId !== initialSessionId ||
+              sourceEntry.lifecycleRevision !== initialLifecycleRevision ||
+              sourceEntry.repositoryWorkspaceId !== source.workspaceId ||
+              repositories.get(source.workspaceId)?.revision !== source.revision
+            ) {
+              throw new Error("Repository workspace changed before session fork");
+            }
+          };
+          assertRepositoryCurrent();
+          const forked = await forkSessionRepositoryWorkspace({
+            sourceWorkspaceId: current.entry.repositoryWorkspaceId,
+            agentId: current.target.agentId,
+            sessionKey: targetKey,
+            assertCurrent: assertRepositoryCurrent,
+          });
+          forkRepositoryWorkspaceId = forked.workspaceId;
+          mutationParams.commitGuard = assertRepositoryCurrent;
+        }
         result = await (action === "fork"
           ? forkSessionAtMessage(
               {
                 ...mutationParams,
                 entryId,
                 targetKey,
+                repositoryWorkspaceId: forkRepositoryWorkspaceId,
+                forkWorkspace: forkWorkspace?.value,
                 creation: { ...creation, sandbox },
               },
               expectedState,
@@ -527,6 +586,25 @@ async function mutateSessionAtMessage(
           errorShape(ErrorCodes.UNAVAILABLE, `Failed to ${action} the local session. Try again.`),
         );
         return;
+      } finally {
+        if (forkRepositoryWorkspaceId) {
+          const forkEntry = () =>
+            loadAccessorSessionEntryForGatewayTarget({
+              key: targetKey,
+              cfg,
+              agentId: current.target.agentId,
+            }).entry;
+          if (forkEntry()?.repositoryWorkspaceId !== forkRepositoryWorkspaceId) {
+            await getSessionRepositoryWorkspaceStore().delete({
+              workspaceId: forkRepositoryWorkspaceId,
+              assertCurrent: () => {
+                if (forkEntry()?.repositoryWorkspaceId === forkRepositoryWorkspaceId) {
+                  throw new Error("Repository fork was committed before cleanup");
+                }
+              },
+            });
+          }
+        }
       }
       if (result.status !== "created") {
         respondMessageCutError(result, action, entryId, respond);

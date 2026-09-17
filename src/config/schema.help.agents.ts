@@ -69,6 +69,14 @@ export const AGENT_FIELD_HELP: Record<string, string> = {
   "agents.defaults.model.primary": "Primary model (provider/model).",
   "agents.defaults.model.fallbacks":
     "Ordered fallback models (provider/model). Used when the primary model fails.",
+  "agents.defaults.embeddedAgent.cyberFailover":
+    "Automatic Daybreak escalation for replay-safe OpenAI cyber-policy refusals in the embedded runtime.",
+  "agents.defaults.embeddedAgent.cyberFailover.mode":
+    'Enable automatic escalation ("auto", default) or keep provider refusals terminal ("off").',
+  "agents.defaults.embeddedAgent.cyberFailover.model":
+    "Provider/model target used for automatic cyber-policy escalation.",
+  "agents.defaults.embeddedAgent.cyberFailover.cooloffMs":
+    "How long an unavailable escalation target is skipped for the current session.",
   "agents.defaults.utilityModel":
     "Optional lower-cost model (provider/model or alias) for short internal tasks such as generated titles and progress narration. Unset derives the primary provider's declared small model when available (otherwise the primary model); set to an empty string to disable utility routing.",
   "agents.entries.*.utilityModel":
@@ -210,6 +218,8 @@ export const AGENT_FIELD_HELP: Record<string, string> = {
   "commands.allowFrom":
     "Defines elevated command allow rules by channel and sender for owner-level command surfaces. Use narrow provider-specific identities so privileged commands are not exposed to broad chat audiences.",
   mcp: "Global MCP server definitions managed by OpenClaw. Embedded OpenClaw and other runtime adapters can consume these servers without storing them inside runtime-owned project settings.",
+  "mcp.sessionIdleTtlMs":
+    "Optional idle eviction for OpenClaw session MCP runtimes in milliseconds. Unset or 0 keeps runtimes alive until session cleanup or Gateway shutdown. Positive values round down; active leases and pending acquisitions prevent eviction. Run-owned runtimes still retire when their one-shot run ends.",
   "mcp.servers":
     "Named MCP server definitions. OpenClaw stores them in its own config and runtime adapters decide which transports are supported at execution time.",
   "mcp.servers.*.codex":

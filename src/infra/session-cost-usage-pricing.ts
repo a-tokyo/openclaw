@@ -4,6 +4,7 @@ import { normalizeOptionalString } from "@openclaw/normalization-core/string-coe
 import type { NormalizedUsage, UsageLike } from "../agents/usage.js";
 import { normalizeUsage } from "../agents/usage.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { prepareModelPricingContext } from "../model-catalog/pricing.js";
 import { countToolResults, extractToolCallNames } from "../utils/transcript-tools.js";
 import { resolveModelCostConfig } from "../utils/usage-format.js";
 import type {
@@ -216,41 +217,57 @@ export function createUsageCostResolver(params?: {
   };
 }
 
+type UsageCostEstimateEntry = ParsedTranscriptEntry & { usage: NormalizedUsage };
+
+function needsUsageCostEstimate(
+  entry: ParsedTranscriptEntry | null,
+): entry is UsageCostEstimateEntry {
+  // Recorded estimates include request-time service tiers the current catalog cannot recover.
+  return (
+    Boolean(entry?.usage) &&
+    !(
+      (entry?.costTotal ?? 0) > 0 ||
+      entry?.costBreakdown?.totalOrigin === "provider-billed" ||
+      shouldPreserveRecordedZeroCost(entry?.costBreakdown)
+    )
+  );
+}
+
+function estimateUsageCostEntry(
+  entry: UsageCostEstimateEntry,
+  resolveCost: UsageCostResolver,
+): ParsedTranscriptEntry {
+  const cost = resolveCost({ provider: entry.provider, model: entry.model });
+  const { totalTokens } = computeUsageTokenTotals(entry.usage);
+  if (!isModelPricingKnown(cost) && totalTokens > 0) {
+    entry.costTotal = undefined;
+    entry.costBreakdown = undefined;
+  } else if (entry.costTotal === undefined || totalTokens > 0) {
+    const estimated = cost ? calculateUsageCost(entry.usage, cost) : undefined;
+    entry.costBreakdown = estimated && Number.isFinite(estimated.total) ? estimated : undefined;
+    entry.costTotal = entry.costBreakdown?.total;
+  }
+  return entry;
+}
+
 export function parseUsageCostTranscriptEntry(
   parsed: Record<string, unknown>,
   resolveCost: UsageCostResolver,
 ): ParsedTranscriptEntry | null {
   const entry = parseTranscriptEntry(parsed);
-  if (!entry?.usage) {
+  return needsUsageCostEstimate(entry) ? estimateUsageCostEntry(entry, resolveCost) : entry;
+}
+
+/** Diagnostic readers prepare only when a record actually needs an estimate. */
+export async function parseUsageCostTranscriptEntryAsync(
+  parsed: Record<string, unknown>,
+  resolveCost: UsageCostResolver,
+  config?: OpenClawConfig,
+): Promise<ParsedTranscriptEntry | null> {
+  const entry = parseTranscriptEntry(parsed);
+  if (!needsUsageCostEstimate(entry)) {
     return entry;
   }
-  const cost = resolveCost({ provider: entry.provider, model: entry.model });
-  const usageTotals = computeUsageTokenTotals(entry.usage);
-  const pricingKnown = isModelPricingKnown(cost);
-  // Provider billing is authoritative even when catalog tiers would estimate a different total.
-  const preserveRecordedCost =
-    entry.costBreakdown?.totalOrigin === "provider-billed" ||
-    shouldPreserveRecordedZeroCost(entry.costBreakdown);
-  if (preserveRecordedCost) {
-    return entry;
-  }
-  if (
-    !pricingKnown &&
-    (entry.costTotal === undefined || entry.costTotal === 0) &&
-    usageTotals.totalTokens > 0
-  ) {
-    entry.costTotal = undefined;
-    entry.costBreakdown = undefined;
-  } else if (
-    cost?.tieredPricing?.length ||
-    entry.costTotal === undefined ||
-    (entry.costTotal === 0 && pricingKnown && usageTotals.totalTokens > 0)
-  ) {
-    const estimated = cost ? calculateUsageCost(entry.usage, cost) : undefined;
-    // Repricing replaces the total and its allocation together, or summaries lose
-    // the input/output/cache breakdown while still displaying the correct total.
-    entry.costBreakdown = estimated && Number.isFinite(estimated.total) ? estimated : undefined;
-    entry.costTotal = entry.costBreakdown?.total;
-  }
-  return entry;
+  await prepareModelPricingContext(config);
+  return estimateUsageCostEntry(entry, resolveCost);
 }

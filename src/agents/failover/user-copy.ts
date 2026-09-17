@@ -1,10 +1,12 @@
 import { stableStringify } from "@openclaw/normalization-core";
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
 import { truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
+import { formatCommandErrorForUser } from "../../process/command-error.js";
 import {
   extractErrorHttpStatus,
   extractLeadingHttpStatus,
   formatRawAssistantErrorForUi,
+  formatTransportErrorCopy,
   isCloudflareOrHtmlErrorPage,
   isGenericProviderInternalError,
   MALFORMED_STREAMING_FRAGMENT_ERROR_MESSAGE,
@@ -13,11 +15,12 @@ import {
 } from "../../shared/assistant-error-format.js";
 import { formatExecDeniedUserMessage } from "../exec-approval-result.js";
 import type { CliTimeoutContext, FallbackAttemptRecord } from "../failover-error.js";
+import { ERROR_PREFIX_RE, renderFormatErrorCopy } from "./assistant-request-failure-copy.js";
+import { classifyFailoverReasonCore } from "./classify-core.js";
 import {
-  classifyFailoverReason,
   isPeriodicUsageLimitErrorMessage,
   isProviderCompletedErrorFinishReasonMessage,
-} from "./classify.js";
+} from "./message-patterns.js";
 import {
   classifyProviderRequestFacets,
   type ProviderRequestFacet,
@@ -54,16 +57,10 @@ const RATE_LIMIT_RETRY_MESSAGE =
 const MODEL_CAPACITY_ERROR_RE = /\b(?:selected\s+)?model\s+(?:is\s+)?at capacity\b/i;
 const RATE_LIMIT_SPECIFIC_HINT_RE =
   /\bmin(ute)?s?\b|\bhours?\b|\bseconds?\b|\btry again in\b|\bresets?\b|\bplan\b|\bquota\b/i;
-const ERROR_PREFIX_RE =
-  /^(?:error|(?:[a-z][\w-]*\s+)?api\s*error|openai\s*error|anthropic\s*error|gateway\s*error|codex\s*error|request failed|failed|exception)(?:\s+\d{3})?[:\s-]+/i;
 const CONTEXT_OVERFLOW_ERROR_HEAD_RE =
   /^(?:context overflow:|request_too_large\b|request size exceeds\b|request exceeds the maximum size\b|context length exceeded\b|maximum context length\b|prompt is too long\b|exceeds model context window\b)/i;
 const NON_ERROR_PROVIDER_PAYLOAD_MAX_LENGTH = 16_384;
 const NON_ERROR_PROVIDER_PAYLOAD_PREFIX_RE = /^codex\s*error(?:\s+\d{3})?[:\s-]+/i;
-export const PROVIDER_SCHEMA_REJECTION_USER_TEXT =
-  "LLM request failed: provider rejected the request schema or tool payload.";
-const PROVIDER_OUTPUT_TOKEN_LIMIT_RE =
-  /^['"]?max_(?:tokens|output_tokens|completion_tokens|new_tokens)['"]?\s*(?:[:=]\s*)?\(?(\d[\d,]*)\)?\s+exceeds?\b.{0,120}?\b(?:maximum|max|limit)\b(?:\s+(?:output\s+)?tokens?)?(?:\s+(?:is|of)|\s*[:=])?\s*\(?(\d[\d,]*)\)?(?:\D|$)/i;
 
 /** Format billing copy with optional provider/model and credential context. */
 export function formatBillingErrorMessage(
@@ -87,20 +84,6 @@ export function formatBillingErrorMessage(
 }
 
 const BILLING_ERROR_USER_MESSAGE = formatBillingErrorMessage();
-
-/** Surface only bounded numeric limit facts, never arbitrary provider-controlled error text. */
-export function renderFormatErrorCopy(raw: string): string {
-  const trimmed = raw.trim();
-  const normalized =
-    extractErrorHttpStatus(trimmed)?.rest ?? trimmed.replace(ERROR_PREFIX_RE, "").trim();
-  const candidate = extractErrorHttpStatus(normalized)?.rest ?? normalized;
-  const match = candidate.length <= 300 ? candidate.match(PROVIDER_OUTPUT_TOKEN_LIMIT_RE) : null;
-  const [, value, maximum] = match ?? [];
-  if (!value || !maximum) {
-    return PROVIDER_SCHEMA_REJECTION_USER_TEXT;
-  }
-  return `LLM request rejected: configured maxTokens is ${value}, above the provider maximum of ${maximum}. Lower maxTokens and try again.`;
-}
 
 function extractProviderRateLimitMessage(raw: string): string | undefined {
   const withoutPrefix = raw.replace(ERROR_PREFIX_RE, "").trim();
@@ -175,54 +158,6 @@ export function renderRateLimitOrOverloadedCopy(params: {
   );
 }
 
-export function formatTransportErrorCopy(raw: string): string | undefined {
-  if (!raw || isCloudflareOrHtmlErrorPage(raw)) {
-    return undefined;
-  }
-  const lower = normalizeLowercaseStringOrEmpty(raw);
-  if (
-    /\beconnrefused\b/i.test(raw) ||
-    lower.includes("connection refused") ||
-    lower.includes("actively refused")
-  ) {
-    return "LLM request failed: connection refused by the provider endpoint.";
-  }
-  if (
-    /\beconnreset\b|\beconnaborted\b|\benetreset\b|\bepipe\b/i.test(raw) ||
-    lower.includes("socket hang up") ||
-    lower.includes("connection reset") ||
-    lower.includes("connection aborted")
-  ) {
-    return "LLM request failed: network connection was interrupted.";
-  }
-  if (
-    /\benotfound\b|\beai_again\b/i.test(raw) ||
-    lower.includes("getaddrinfo") ||
-    lower.includes("no such host") ||
-    lower.includes("dns")
-  ) {
-    return "LLM request failed: DNS lookup for the provider endpoint failed.";
-  }
-  if (
-    /\benetunreach\b|\behostunreach\b|\behostdown\b/i.test(raw) ||
-    lower.includes("network is unreachable") ||
-    lower.includes("host is unreachable")
-  ) {
-    return "LLM request failed: the provider endpoint is unreachable from this host.";
-  }
-  if (
-    lower.includes("fetch failed") ||
-    lower.includes("connection error") ||
-    lower.includes("network request failed")
-  ) {
-    return "LLM request failed: network connection error.";
-  }
-  if (raw.includes("网络错误") || raw.includes("网络异常") || raw.includes("连接错误")) {
-    return "LLM request failed: provider reported a network error.";
-  }
-  return undefined;
-}
-
 export function formatDiskSpaceErrorCopy(raw: string): string | undefined {
   const lower = normalizeLowercaseStringOrEmpty(raw);
   return /\benospc\b/i.test(raw) ||
@@ -266,7 +201,7 @@ export function isLikelyHttpErrorText(raw: string): boolean {
   return Boolean(
     status &&
     status.code >= 400 &&
-    (classifyFailoverReason(raw, { providerPlugin: null }) !== null ||
+    (classifyFailoverReasonCore(raw) !== null ||
       classifyProviderRequestFacets({ status: status.code, message: raw }) !== null),
   );
 }
@@ -301,6 +236,10 @@ export function renderSanitizedUserFacingText(
       ? formatRawAssistantErrorForUi(trimmed)
       : sanitized;
   }
+  const commandError = formatCommandErrorForUser(trimmed);
+  if (commandError) {
+    return commandError;
+  }
   const execDenied = formatExecDeniedUserMessage(trimmed);
   if (execDenied) {
     return execDenied;
@@ -312,7 +251,7 @@ export function renderSanitizedUserFacingText(
   if (/incorrect role information|roles must alternate/i.test(trimmed)) {
     return "Message ordering conflict - please try again. If this persists, use /new to start a fresh session.";
   }
-  const reason = classifyFailoverReason(trimmed, { providerPlugin: null });
+  const reason = classifyFailoverReasonCore(trimmed);
   const status = extractLeadingHttpStatus(trimmed);
   const rawPayload = isRawApiErrorPayload(trimmed);
   if (
@@ -326,6 +265,19 @@ export function renderSanitizedUserFacingText(
   }
   if (reason === "billing" || reason === "rate_limit" || reason === "overloaded") {
     return renderFailoverBaseCopy(reason, { raw: trimmed }) ?? trimmed;
+  }
+  // Reason-level provider copy is surface-independent: the channel reply path renders
+  // it from failover facts, while session transcripts, run status, and the TUI read
+  // this renderer. Facets stay null so the rate-limit/overload branches above keep
+  // provider retry detail; labeled statuses ("unexpected status 401 ...") never carry
+  // a leading code, so the status is re-read from the full error grammar here.
+  const providerRequestCopy = renderProviderRequestFailureCopy({
+    classification: reason ? { kind: "reason", reason } : null,
+    facet: null,
+    status: extractErrorHttpStatus(trimmed)?.code,
+  });
+  if (providerRequestCopy) {
+    return providerRequestCopy;
   }
   if (isGenericProviderInternalError(trimmed)) {
     return formatRawAssistantErrorForUi(trimmed);
@@ -562,7 +514,7 @@ export function renderMissingApiKeyReplyCopy(params?: {
     return null;
   }
   if (provider === "openai" && params?.providerGuidance) {
-    return "⚠️ Missing API key for OpenAI on the gateway. Use `openai/gpt-5.6-sol` with the OpenAI OAuth profile, or set `OPENAI_API_KEY` for direct OpenAI API-key runs.";
+    return "⚠️ Missing API key for OpenAI on the gateway. Use `openai/gpt-6-astra` with the OpenAI OAuth profile, or set `OPENAI_API_KEY` for direct OpenAI API-key runs.";
   }
   if (provider === "openai") {
     return '⚠️ Missing API key for provider "openai". Run `openclaw doctor --fix` to repair stale OpenAI model/session routes, restart the gateway if doctor asks, then try again. If doctor has nothing to repair or the error persists, re-auth with `openclaw models auth login --provider openai` or run `openclaw configure`.';

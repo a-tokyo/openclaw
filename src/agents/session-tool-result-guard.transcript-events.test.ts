@@ -5,13 +5,20 @@ import type { AgentMessage } from "openclaw/plugin-sdk/agent-core";
 import { SessionManager } from "openclaw/plugin-sdk/agent-sessions";
 import { upsertSessionEntry } from "openclaw/plugin-sdk/session-store-runtime";
 import { closeOpenClawAgentDatabasesForTest } from "openclaw/plugin-sdk/sqlite-runtime-testing";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, assert, describe, expect, it, vi } from "vitest";
+import { transformMessages } from "../../packages/ai/src/transcript-transform.js";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
+import { makeTextToolResult } from "../../test/helpers/text-tool-result.js";
+import { makeUserMessage } from "../../test/helpers/user-message.js";
 import {
   appendTranscriptMessage,
+  loadSessionEntry,
   listSessionPendingInputs,
+  persistCompactionBoundaryWithSessionEntrySync,
 } from "../config/sessions/session-accessor.js";
 import { applyAssistantDeliveryDirectives } from "../config/sessions/transcript-assistant-delivery.js";
+import { withOwnedSessionTranscriptWrites } from "../config/sessions/transcript-write-context.js";
+import { createAssistantMessageEventStream } from "../llm/utils/event-stream.js";
 import {
   initializeGlobalHookRunner,
   resetGlobalHookRunner,
@@ -27,8 +34,18 @@ import {
   createUserTurnTranscriptRecorder,
   type UserTurnTranscriptRecorder,
 } from "../sessions/user-turn-transcript.js";
+import { createAssistantErrorTranscript } from "./assistant-error-transcript.js";
+import { normalizeAssistantReplayContent } from "./embedded-agent-runner/replay-history.js";
 import { runAgentHarnessBeforeMessageWriteHook } from "./harness/hook-helpers.js";
 import { guardSessionManager } from "./session-tool-result-guard-wrapper.js";
+import { installSessionToolResultGuard } from "./session-tool-result-guard.js";
+import { makeAgentAssistantMessage } from "./test-helpers/agent-message-fixtures.js";
+import { makeProviderModelFixture } from "./test-helpers/provider-model-fixture.js";
+import {
+  prepareCodeModeSourceAppend,
+  takeCodeModeResponseSource,
+  wrapStreamFnCodeModeSource,
+} from "./transcript-code-mode-source.js";
 
 const listeners: Array<() => void> = [];
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
@@ -60,10 +77,42 @@ afterEach(() => {
 });
 
 describe("guardSessionManager transcript updates", () => {
+  it("refreshes the deferred error owner when a session manager serves a new run", async () => {
+    const { sessionManager, target } = await openPersistedSessionManager();
+    const first = createAssistantErrorTranscript({ runId: "run-first" });
+    const second = createAssistantErrorTranscript({ runId: "run-second" });
+    guardSessionManager(sessionManager, { runId: "run-first", assistantErrorTranscript: first });
+    sessionManager.appendMessage(makeAgentAssistantMessage({ content: [], stopReason: "error" }));
+    await first.settle(false);
+    guardSessionManager(sessionManager, { runId: "run-second", assistantErrorTranscript: second });
+    sessionManager.appendMessage(makeAgentAssistantMessage({ content: [], stopReason: "error" }));
+    await second.settle(true);
+    await first.settle(true);
+    const messages = SessionManager.open(target)
+      .getBranch()
+      .filter((entry) => entry.type === "message");
+    expect(messages).toHaveLength(1);
+    expect(messages[0]?.message).toMatchObject({
+      stopReason: "error",
+      __openclaw: { runId: "run-second" },
+    });
+  });
+
   it("persists compaction item identity under each current run across reload", async () => {
     const { sessionManager, root, target } = await openPersistedSessionManager();
     for (const runId of ["run-first", "run-second"]) {
-      const guarded = guardSessionManager(sessionManager, { runId });
+      const guarded = guardSessionManager(sessionManager, {
+        runId,
+        withCompactionPersistence: (prepared) =>
+          persistCompactionBoundaryWithSessionEntrySync(target, {
+            prepared,
+            transcriptByteCompactionLatch: {
+              activeBytes: 2048,
+              sessionId: target.sessionId,
+              maxBytes: 1024,
+            },
+          }),
+      });
       const keptId = guarded.appendMessage({ role: "user", content: runId, timestamp: 1 });
       guarded.appendCompaction("summary", keptId, 100, { source: "hook" }, true, {
         itemId: `compaction-${runId}`,
@@ -84,6 +133,34 @@ describe("guardSessionManager transcript updates", () => {
         fromHook: true,
       },
     ]);
+    expect(loadSessionEntry(target)?.compactionCount).toBe(2);
+  });
+
+  it("leaves the session manager unchanged when atomic compaction persistence rejects the boundary", async () => {
+    const { sessionManager, root, target } = await openPersistedSessionManager();
+    const keptId = sessionManager.appendMessage(makeUserMessage("keep", 1));
+    const guarded = guardSessionManager(sessionManager, {
+      withCompactionPersistence: (prepared) =>
+        persistCompactionBoundaryWithSessionEntrySync(target, {
+          prepared: { ...prepared, event: { ...prepared.event, id: keptId } },
+          transcriptByteCompactionLatch: {
+            activeBytes: 2048,
+            sessionId: target.sessionId,
+            maxBytes: 1024,
+          },
+        }),
+    });
+
+    expect(() => guarded.appendCompaction("summary", keptId, 100)).toThrow(
+      `Session transcript entry was not persisted: ${keptId}: transcript-event-not-appended`,
+    );
+    expect(sessionManager.getLeafId()).toBe(keptId);
+    expect(sessionManager.getBranch().filter((entry) => entry.type === "compaction")).toEqual([]);
+    expect(
+      SessionManager.open(target, root)
+        .getBranch()
+        .filter((entry) => entry.type === "compaction"),
+    ).toEqual([]);
   });
 
   it("consumes a steered source under its own custody and does not repeat its approval hook", async () => {
@@ -154,11 +231,7 @@ describe("guardSessionManager transcript updates", () => {
       expect(listSessionPendingInputs(target)).toEqual({ items: [], total: 0 });
       expect(approvalHook).toHaveBeenCalledOnce();
 
-      const unstagedId = guarded.appendMessage({
-        role: "user",
-        content: "Unstaged source",
-        timestamp: 3,
-      });
+      const unstagedId = guarded.appendMessage(makeUserMessage("Unstaged source", 3));
       expect(approvalHook).toHaveBeenCalledTimes(2);
       expect(guarded.getEntry(unstagedId)).toMatchObject({
         message: { role: "user", content: "[approved] Unstaged source" },
@@ -168,6 +241,53 @@ describe("guardSessionManager transcript updates", () => {
       ambient.finishPendingInput?.("interrupted");
       resetGlobalHookRunner();
     }
+  });
+
+  it("combines explicit redaction with one fresh SQLite admission across replay", async () => {
+    const { root, target, sessionEntry, sessionManager } = await openPersistedSessionManager();
+    const message = {
+      role: "user" as const,
+      content: "private-note=fixture-only-redaction-value",
+      idempotencyKey: "redacted-admission:user",
+      timestamp: 1,
+    };
+    const assertOriginalInputCommit = vi.fn(() => {
+      expect(
+        SessionManager.open(target, root)
+          .getBranch()
+          .filter((entry) => entry.type === "message"),
+      ).toHaveLength(0);
+    });
+    const recorder = createUserTurnTranscriptRecorder({
+      message,
+      target: { ...target, sessionEntry },
+      assertOriginalInputCommit,
+    });
+    const admitted = vi.fn();
+    assert(recorder.setAdmissionHandler);
+    recorder.setAdmissionHandler(admitted);
+    const guarded = guardSessionManager(sessionManager, {
+      agentId: target.agentId,
+      sessionKey: target.sessionKey,
+      config: { logging: { redactPatterns: [String.raw`private-note=([^\s]+)`] } },
+      preparedUserTurnMessage: message,
+      preparedUserTurnTranscriptRecorder: recorder,
+    });
+
+    const entryId = guarded.appendMessage({ ...message });
+    expect(guarded.appendMessage({ ...message })).toBe(entryId);
+    expect(assertOriginalInputCommit).toHaveBeenCalledOnce();
+    expect(admitted).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ entryId, idempotencyKey: message.idempotencyKey }),
+    );
+    closeOpenClawAgentDatabasesForTest();
+    const persisted = SessionManager.open(target, root)
+      .getBranch()
+      .filter((entry) => entry.type === "message");
+    expect(persisted).toMatchObject([
+      { id: entryId, message: { role: "user", content: "private-note=***" } },
+    ]);
+    expect(JSON.stringify(persisted)).not.toContain(message.content);
   });
 
   it.each([
@@ -313,72 +433,6 @@ describe("guardSessionManager transcript updates", () => {
     },
   );
 
-  it("persists and broadcasts memory-maintenance messages as hidden", async () => {
-    const updates: InternalSessionTranscriptUpdate[] = [];
-    listeners.push(onInternalSessionTranscriptUpdate((update) => updates.push(update)));
-
-    const { sessionManager: sm, target } = await openPersistedSessionManager();
-
-    const guarded = guardSessionManager(sm, {
-      agentId: target.agentId,
-      sessionKey: target.sessionKey,
-      trigger: "memory",
-    });
-    const appendMessage = guarded.appendMessage.bind(guarded) as unknown as (
-      message: AgentMessage,
-    ) => void;
-
-    appendMessage({
-      role: "assistant",
-      content: [{ type: "text", text: "NO_REPLY" }],
-      timestamp: Date.now(),
-    } as AgentMessage);
-
-    const persisted = sm.getEntries().find((entry) => entry.type === "message") as
-      | { message?: AgentMessage }
-      | undefined;
-    expect(persisted?.message).toMatchObject({ display: false, role: "assistant" });
-    expect(updates[0]?.message).toMatchObject({ display: false, role: "assistant" });
-  });
-
-  it("keeps the user-turn recorder attached when hiding memory maintenance", () => {
-    const sm = SessionManager.inMemory();
-    const markRuntimePersisted = vi.fn();
-    const recorder = {
-      markBlocked: vi.fn(),
-      markRuntimePersisted,
-    } as unknown as UserTurnTranscriptRecorder;
-    const runtimeMessage = attachRuntimeUserTurnTranscriptContext(
-      {
-        role: "user",
-        content: "Pre-compaction memory flush",
-        timestamp: Date.now(),
-      },
-      {
-        message: {
-          role: "user",
-          content: "Pre-compaction memory flush",
-          timestamp: Date.now(),
-        },
-        recorder,
-      },
-    );
-    const guarded = guardSessionManager(sm, {
-      agentId: "main",
-      sessionKey: "agent:main:memory",
-      trigger: "memory",
-    });
-
-    guarded.appendMessage(runtimeMessage as Parameters<typeof guarded.appendMessage>[0]);
-
-    expect(markRuntimePersisted).toHaveBeenCalledTimes(1);
-    expect(markRuntimePersisted.mock.calls[0]?.[0]).toMatchObject({
-      display: false,
-      role: "user",
-    });
-    expect(markRuntimePersisted.mock.calls[0]?.[2]).toEqual({ appended: true });
-  });
-
   it("drops selected mentions when a write hook mutates their text in place", async () => {
     const { target, sessionManager } = await openPersistedSessionManager();
     const message = {
@@ -416,29 +470,6 @@ describe("guardSessionManager transcript updates", () => {
     } finally {
       resetGlobalHookRunner();
     }
-  });
-
-  it("does not hide ordinary messages that mention memory flushes", () => {
-    const sm = SessionManager.inMemory();
-    const guarded = guardSessionManager(sm, {
-      agentId: "main",
-      sessionKey: "agent:main:user",
-      trigger: "user",
-    });
-    const appendMessage = guarded.appendMessage.bind(guarded) as unknown as (
-      message: AgentMessage,
-    ) => void;
-
-    appendMessage({
-      role: "user",
-      content: "Why did the memory flush leak?",
-      timestamp: Date.now(),
-    } as AgentMessage);
-
-    const persisted = sm.getEntries().find((entry) => entry.type === "message") as
-      | { message?: AgentMessage }
-      | undefined;
-    expect(persisted?.message).not.toHaveProperty("display", false);
   });
 
   it("broadcasts the SQLite target for appended non-tool-result messages", async () => {
@@ -659,4 +690,226 @@ describe("guardSessionManager transcript updates", () => {
       ]);
     },
   );
+});
+
+describe("deferred assistant error transcript", () => {
+  async function setup() {
+    const { sessionManager: manager, target } = await openPersistedSessionManager();
+    const owner = createAssistantErrorTranscript({ runId: "run-test" });
+    installSessionToolResultGuard(manager, { assistantErrorTranscript: owner });
+    return { target, owner, manager };
+  }
+
+  it.each([false, true])("persists only the last failure when terminal=%s", async (terminal) => {
+    const { target, owner, manager } = await setup();
+    for (let attempt = 1; attempt <= 10; attempt++) {
+      manager.appendMessage(
+        makeAgentAssistantMessage({
+          content: [{ type: "text", text: `Partial attempt ${attempt}` }],
+          stopReason: "error",
+          errorMessage: `provider rate limit ${attempt}`,
+        }),
+      );
+      expect(SessionManager.open(target).getBranch()).toHaveLength(0);
+    }
+    if (!terminal) {
+      manager.appendMessage(
+        makeAgentAssistantMessage({ content: [{ type: "text", text: "Recovered" }] }),
+      );
+    }
+    await owner.settle(terminal);
+    await owner.settle(terminal);
+    const messages = SessionManager.open(target)
+      .getBranch()
+      .filter((entry) => entry.type === "message");
+    expect(messages).toHaveLength(1);
+    expect(messages[0]?.message).toMatchObject(
+      terminal
+        ? {
+            content: [{ type: "text", text: "Partial attempt 10" }],
+            stopReason: "error",
+            errorMessage: "provider rate limit 10",
+          }
+        : { content: [{ type: "text", text: "Recovered" }] },
+    );
+  });
+
+  it("preserves failed-attempt tool calls before their persisted results through recovery and replay", async () => {
+    const { target, owner, manager } = await setup();
+    const model = makeProviderModelFixture({
+      id: "test-model",
+      api: "openai-responses",
+      provider: "openai",
+      baseUrl: "https://example.invalid",
+    });
+    const toolCall = {
+      type: "toolCall" as const,
+      id: "call-exec",
+      name: "exec",
+      arguments: { code: "const API_TOKEN = computeToken(); return API_TOKEN;" },
+    };
+    const failed = makeAgentAssistantMessage({
+      content: [{ type: "text", text: "I" }, toolCall],
+      stopReason: "error",
+      errorMessage: "provider rate limit",
+    });
+    const stream = createAssistantMessageEventStream();
+    stream.push({ type: "error", reason: "error", error: failed });
+    const response = await wrapStreamFnCodeModeSource(() => stream, new Set(["exec"]))(model, {
+      messages: [],
+    });
+    const emitted = await response.result();
+    manager.appendMessage(
+      emitted,
+      prepareCodeModeSourceAppend({}, emitted, takeCodeModeResponseSource(emitted)),
+    );
+    manager.appendMessage({
+      role: "toolResult",
+      toolCallId: toolCall.id,
+      toolName: toolCall.name,
+      content: [{ type: "text", text: "Persisted result" }],
+      isError: false,
+      timestamp: 1,
+    });
+    owner.clear();
+    manager.appendMessage(
+      makeAgentAssistantMessage({
+        content: [{ type: "text", text: "Recovered" }],
+        timestamp: 2,
+      }),
+    );
+    await owner.settle(false);
+    closeOpenClawAgentDatabasesForTest();
+    const messages = SessionManager.open(target).buildSessionContext().messages;
+    expect(messages).toMatchObject([
+      { role: "assistant", content: [toolCall], stopReason: "toolUse" },
+      {
+        role: "toolResult",
+        toolCallId: toolCall.id,
+        content: [{ type: "text", text: "Persisted result" }],
+      },
+      { role: "assistant", content: [{ type: "text", text: "Recovered" }] },
+    ]);
+    expect(messages[0]).not.toHaveProperty("errorMessage");
+    const normalized = normalizeAssistantReplayContent(messages);
+    const replay = transformMessages(
+      normalized.filter(
+        (message) =>
+          message.role === "assistant" || message.role === "user" || message.role === "toolResult",
+      ),
+      model,
+    );
+    expect(replay).toEqual(normalized);
+  });
+
+  it.each([
+    {
+      label: "canonical media",
+      facts: {
+        __openclaw: {
+          media: [{ url: "https://example.invalid/report.pdf", contentType: "application/pdf" }],
+        },
+      },
+    },
+    { label: "managed attachment", facts: { openclawDelivery: { mediaUrls: ["./report.pdf"] } } },
+    {
+      label: "display override",
+      facts: {
+        openclawDisplayContent: [
+          { type: "text", text: "Here" },
+          { type: "attachment", url: "https://example.invalid/report.pdf" },
+        ],
+      },
+    },
+  ])("preserves $label facts without partial text when recovery succeeds", async ({ facts }) => {
+    const { target, owner, manager } = await setup();
+    const failed = {
+      ...makeAgentAssistantMessage({
+        content: [{ type: "text", text: "Here" }],
+        stopReason: "error",
+        errorMessage: "retry",
+      }),
+      ...facts,
+    };
+    manager.appendMessage(failed);
+    owner.clear();
+    manager.appendMessage(
+      makeAgentAssistantMessage({ content: [{ type: "text", text: "Recovered" }] }),
+    );
+    await owner.settle(false);
+    const messages = SessionManager.open(target).buildSessionContext().messages;
+    expect(messages).toMatchObject([
+      {
+        role: "assistant",
+        content: [],
+        stopReason: "stop",
+        ...facts,
+        ...(facts.openclawDisplayContent
+          ? { openclawDisplayContent: [facts.openclawDisplayContent[1]] }
+          : {}),
+      },
+      { role: "assistant", content: [{ type: "text", text: "Recovered" }] },
+    ]);
+  });
+
+  it("keeps terminal partial text and its error without duplicating tool facts or usage", async () => {
+    const { target, owner, manager } = await setup();
+    const displayText = { type: "text", text: "Displayed partial answer" };
+    const attachment = { type: "attachment", url: "https://example.invalid/report.pdf" };
+    const failed = {
+      ...makeAgentAssistantMessage({
+        content: [
+          { type: "text", text: "Partial answer" },
+          { type: "toolCall", id: "call-terminal", name: "read", arguments: {} },
+        ],
+        stopReason: "error",
+        errorMessage: "terminal failure",
+      }),
+      openclawDisplayContent: [displayText, attachment],
+    };
+    failed.usage = { ...failed.usage, output: 7, totalTokens: 7 };
+    manager.appendMessage(failed);
+    manager.appendMessage(makeTextToolResult("call-terminal", "read", "Result", false, 1));
+    await owner.settle(true);
+    const messages = SessionManager.open(target).buildSessionContext().messages;
+    expect(messages).toMatchObject([
+      {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "call-terminal" }],
+        openclawDisplayContent: [attachment],
+        usage: { output: 7 },
+      },
+      { role: "toolResult", toolCallId: "call-terminal" },
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "Partial answer" }],
+        openclawDisplayContent: [displayText],
+        stopReason: "error",
+        errorMessage: "terminal failure",
+        usage: { output: 0 },
+      },
+    ]);
+  });
+
+  it("revalidates the captured writer before committing a terminal failure", async () => {
+    const { target, owner, manager } = await setup();
+    let active = true;
+    await withOwnedSessionTranscriptWrites(
+      {
+        sessionTarget: target,
+        assertCommitAllowed: () => {
+          if (!active) {
+            throw new Error("writer retired");
+          }
+        },
+        withTranscriptWrite: async (operation) => await operation(),
+      },
+      async () => {
+        manager.appendMessage(makeAgentAssistantMessage({ content: [], stopReason: "error" }));
+      },
+    );
+    active = false;
+    await expect(owner.settle(true)).rejects.toThrow("writer retired");
+    expect(SessionManager.open(target).getBranch()).toHaveLength(0);
+  });
 });

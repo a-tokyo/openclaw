@@ -1,4 +1,4 @@
-import type { AssistantMediaContext } from "../../../app/assistant-media.ts";
+import { fetchControlUiResource, subscribeBrowserAuthRestored } from "../../../app/browser-http.ts";
 import { t } from "../../../i18n/index.ts";
 import { formatUiExternalText } from "../../../lib/format-error.ts";
 import {
@@ -6,11 +6,13 @@ import {
   isLocalAssistantAttachmentSource,
 } from "./chat-message-local-media.ts";
 import {
+  clearChatMediaResourceRefresh,
   isChatMediaResourceCurrent,
   notifyChatMediaResourceSubscribers,
   observeChatMediaResource,
   scheduleChatMediaResourceRefresh,
   type ChatMediaResource,
+  type ImageRenderOptions,
 } from "./chat-message-media.ts";
 
 type AssistantAttachmentAvailability =
@@ -44,28 +46,13 @@ export const ASSISTANT_ATTACHMENT_MEDIA_TICKET_MAX_REFRESH_RETRIES = 2;
 
 export function resolveAssistantAttachmentAvailability(
   source: string,
-  resourceBasePath: string | undefined,
-  authToken: string | null | undefined,
-  onRequestUpdate: (() => void) | undefined,
-  context?: AssistantMediaContext,
+  options: ImageRenderOptions = {},
   allowImage = false,
 ): AssistantAttachmentAvailability {
   if (!isLocalAssistantAttachmentSource(source)) {
     return { status: "available" };
   }
-  const normalizedAuthToken = authToken?.trim() ?? "";
-  const cacheKey = assistantAttachmentCacheKey(
-    source,
-    resourceBasePath,
-    normalizedAuthToken,
-    context,
-  );
-  const resource = observeChatMediaResource<AssistantAttachmentAvailability>(
-    "assistant-attachment",
-    cacheKey,
-    onRequestUpdate,
-    source,
-  );
+  const resource = observeAssistantAttachment(source, options);
   const cached = resource.value;
   let refreshingAvailability: Extract<
     AssistantAttachmentAvailability,
@@ -136,6 +123,7 @@ export function resolveAssistantAttachmentAvailability(
   };
   if (typeof fetch === "function") {
     const headers = new Headers({ Accept: "application/json" });
+    const normalizedAuthToken = options.authToken?.trim();
     if (normalizedAuthToken) {
       headers.set("Authorization", `Bearer ${normalizedAuthToken}`);
     }
@@ -150,16 +138,19 @@ export function resolveAssistantAttachmentAvailability(
     );
     const attachmentUrl = buildAssistantAttachmentUrl(
       source,
-      resourceBasePath,
+      options.resourceBasePath,
       refreshingAvailability?.mediaTicket,
-      context,
+      options,
     );
-    const pending = fetch(`${attachmentUrl}&meta=1${allowImage ? "&allow=1" : ""}`, {
-      method: allowImage ? "POST" : "GET",
-      headers,
-      credentials: "same-origin",
-      signal: controller.signal,
-    })
+    const pending = fetchControlUiResource(
+      `${attachmentUrl}&meta=1${allowImage ? "&allow=1" : ""}`,
+      {
+        method: allowImage ? "POST" : "GET",
+        headers,
+        credentials: "same-origin",
+        signal: controller.signal,
+      },
+    )
       .then(async (res): Promise<AssistantAttachmentAvailability> => {
         if (res.status === 408 || res.status === 429 || res.status >= 500) {
           throw new Error("Attachment metadata temporarily unavailable");
@@ -244,47 +235,32 @@ export function resolveAssistantAttachmentAvailability(
 
 export function retryAssistantAttachmentAvailability(
   source: string,
-  resourceBasePath: string | undefined,
-  authToken: string | null | undefined,
-  onRequestUpdate: (() => void) | undefined,
-  context?: AssistantMediaContext,
+  options: ImageRenderOptions = {},
   allowImage = false,
 ): void {
   if (!isLocalAssistantAttachmentSource(source)) {
-    onRequestUpdate?.();
+    options.onRequestUpdate?.();
     return;
   }
-  const normalizedAuthToken = authToken?.trim() ?? "";
-  const cacheKey = assistantAttachmentCacheKey(
-    source,
-    resourceBasePath,
-    normalizedAuthToken,
-    context,
-  );
-  const resource = observeChatMediaResource<AssistantAttachmentAvailability>(
-    "assistant-attachment",
-    cacheKey,
-    onRequestUpdate,
-    source,
-  );
+  const resource = observeAssistantAttachment(source, options);
+  resetAssistantAttachmentAvailability(resource);
+  if (allowImage) {
+    resolveAssistantAttachmentAvailability(source, options, true);
+  }
+  notifyChatMediaResourceSubscribers(resource);
+  options.onRequestUpdate?.();
+}
+
+function resetAssistantAttachmentAvailability(
+  resource: ChatMediaResource<AssistantAttachmentAvailability>,
+): void {
   resource.abortController?.abort();
   resource.abortController = undefined;
   resource.pending = undefined;
   resource.value = undefined;
+  resource.retainUntil = undefined;
   resource.retryAttempted = false;
-  scheduleAssistantAttachmentRefresh(resource, { status: "checking" });
-  if (allowImage) {
-    resolveAssistantAttachmentAvailability(
-      source,
-      resourceBasePath,
-      authToken,
-      onRequestUpdate,
-      context,
-      true,
-    );
-  }
-  notifyChatMediaResourceSubscribers(resource);
-  onRequestUpdate?.();
+  clearChatMediaResourceRefresh(resource);
 }
 
 function createUnavailableAssistantAttachment(
@@ -303,21 +279,31 @@ function createUnavailableAssistantAttachment(
   };
 }
 
-function assistantAttachmentCacheKey(
-  source: string,
-  resourceBasePath: string | undefined,
-  authToken: string,
-  context: AssistantMediaContext | undefined,
-): string {
-  // Identical paths can have different project/protection policy in different sessions.
-  return JSON.stringify([
-    resourceBasePath ?? "",
-    authToken,
-    context?.sessionKey,
-    context?.agentId,
-    context?.policyKey,
+function observeAssistantAttachment(source: string, options: ImageRenderOptions) {
+  const cacheScope = JSON.stringify([
+    options.connectionEpoch ?? 0,
+    options.resourceBasePath ?? "",
+    options.authToken?.trim() ?? "",
+    options.sessionKey,
+    options.agentId,
     source,
   ]);
+  const resource = observeChatMediaResource<AssistantAttachmentAvailability>(
+    "assistant-attachment",
+    JSON.stringify([cacheScope, options.policyKey]),
+    options.onRequestUpdate,
+    source,
+    cacheScope,
+  );
+  if (resource.subscribers.size > 0 && !resource.releaseAuthRecovery) {
+    resource.releaseAuthRecovery = subscribeBrowserAuthRestored(() => {
+      if (isChatMediaResourceCurrent(resource) && resource.value?.status === "unavailable") {
+        resetAssistantAttachmentAvailability(resource);
+        notifyChatMediaResourceSubscribers(resource);
+      }
+    });
+  }
+  return resource;
 }
 
 function setAssistantAttachmentAvailability(
@@ -328,6 +314,10 @@ function setAssistantAttachmentAvailability(
     return;
   }
   resource.value = availability;
+  resource.retainUntil =
+    availability.status === "available"
+      ? (availability.mediaTicketExpiresAt ?? Number.POSITIVE_INFINITY)
+      : undefined;
   scheduleAssistantAttachmentRefresh(resource, availability);
 }
 

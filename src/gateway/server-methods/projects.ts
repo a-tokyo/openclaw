@@ -28,6 +28,7 @@ import {
 } from "../../projects/project-clone.js";
 import {
   listProjectRegistry,
+  listWorkspaceProjects,
   ProjectCheckoutError,
   registerProjectRegistry,
   removeProjectRegistry,
@@ -35,6 +36,7 @@ import {
 } from "../../projects/project-registry.js";
 import { parseAgentSessionKey } from "../../routing/session-key.js";
 import { isTrustedSecretSurfaceUnavailableError } from "../../secrets/runtime-degraded-state.js";
+import { getSessionRepositoryWorkspaceStore } from "../../state/session-repository-workspaces.js";
 import { listProfiles, resolveUserProfileId } from "../../state/user-profiles.js";
 import {
   CONTROL_UI_GITHUB_CREDENTIAL_UNAVAILABLE_MESSAGE,
@@ -47,7 +49,7 @@ import { loadCombinedSessionStoreForGatewayCore } from "../session-utils.js";
 import type { GatewayRequestHandlers } from "./types.js";
 import { assertValidParams } from "./validation.js";
 
-type ProjectRegistryEntry = ReturnType<typeof listProjectRegistry>[number];
+type ProjectRegistryEntry = Awaited<ReturnType<typeof listProjectRegistry>>[number];
 type ProjectWorktreeService = Pick<
   ManagedWorktreeService,
   "listRegistryRecords" | "resolveRepositoryIdentity"
@@ -193,6 +195,28 @@ function listProjectRecents(
   const seen = new Set<string>();
   const recents: ProjectRecent[] = [];
   for (const [sessionKey, entry] of candidates) {
+    if (entry.repositoryWorkspaceId) {
+      const repository = getSessionRepositoryWorkspaceStore().get(entry.repositoryWorkspaceId);
+      const sessionAgentId = parseAgentSessionKey(sessionKey)?.agentId;
+      if (
+        !repository ||
+        repository.sessionKey !== sessionKey ||
+        (sessionAgentId && repository.agentId !== sessionAgentId) ||
+        seen.has(repository.url)
+      ) {
+        continue;
+      }
+      seen.add(repository.url);
+      recents.push({
+        kind: "repository",
+        url: repository.url,
+        displayName: path.posix.basename(repository.url, ".git"),
+      });
+      if (recents.length === 8) {
+        break;
+      }
+      continue;
+    }
     const projectId = normalizeOptionalString(entry.projectId);
     const explicitProject = projectId ? projectsById.get(projectId) : undefined;
     const worktreeRoot = normalizeOptionalString(entry.worktree?.repoRoot);
@@ -395,9 +419,8 @@ function findProjectCheckoutReference(
   repoRoot: string,
 ): string | undefined {
   const normalizedRoot = path.resolve(repoRoot);
-  const workspaceReference = listProjectRegistry(cfg).find(
-    (candidate) =>
-      candidate.source === "workspace" && path.resolve(candidate.repoRoot) === normalizedRoot,
+  const workspaceReference = listWorkspaceProjects(cfg).find(
+    (candidate) => path.resolve(candidate.repoRoot) === normalizedRoot,
   );
   const worktreeReference = listRegistryWorktrees(process.env).find(
     (worktree) => !worktree.removedAt && path.resolve(worktree.repoRoot) === normalizedRoot,
@@ -433,7 +456,7 @@ export function createProjectsHandlers(service: ProjectWorktreeService): Gateway
       if (!assertValidParams(params, validateProjectsListParams, "projects.list", respond)) {
         return;
       }
-      const registryProjects = listProjectRegistry(context.getRuntimeConfig());
+      const registryProjects = await listProjectRegistry(context.getRuntimeConfig());
       const projects = registryProjects.map(sanitizeProjectRecord);
       const profileId = client?.authenticatedUserProfile?.profileId;
       const canonicalProfileId = profileId
@@ -645,7 +668,7 @@ export function createProjectsHandlers(service: ProjectWorktreeService): Gateway
           return;
         }
       } else {
-        removed = removeProjectRegistry(params.id);
+        removed = await removeProjectRegistry(project);
       }
       if (!removed) {
         respondUnknownProject();

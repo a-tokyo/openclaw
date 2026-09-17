@@ -10,10 +10,18 @@ import type { BrowserTabTarget } from "../../../components/browser/browser-targe
 import { BROWSER_PANEL_TOGGLE_EVENT } from "../../../components/panel-toggle-contract.ts";
 import { latestBrowserTabCards } from "../../../lib/chat/browser-tab-preview.ts";
 import type { MessageGroup } from "../../../lib/chat/chat-types.ts";
+import { groupMessages } from "../chat-thread-grouping.ts";
 import { renderActivityGroup } from "./chat-message-group.ts";
 import { renderToolPreview } from "./widget-card.ts";
 
 const hosts: HTMLElement[] = [];
+
+function messageEntries(messages: Array<{ toolCallId: string }>): MessageGroup["messages"] {
+  return groupMessages(
+    messages.map((message) => ({ kind: "message", key: message.toolCallId, message })),
+  ).flatMap((item) => (item.kind === "group" ? item.messages : []));
+}
+
 afterEach(() => {
   for (const host of hosts.splice(0)) {
     host.remove();
@@ -162,7 +170,15 @@ describe("browser tab card", () => {
       toolCallId: id,
       toolName: "browser",
       content: "ok",
-      details: { browserTab: { profile: "managed", target: "host", targetId: "tab-1", title: id } },
+      details: {
+        browserTab: {
+          profile: "managed",
+          target: "host",
+          targetId: "tab-1",
+          url: "https://example.com",
+          title: id,
+        },
+      },
     });
     const host = container();
     const messages = [message("old"), message("new")];
@@ -174,7 +190,7 @@ describe("browser tab card", () => {
         visibleContent: "text",
         isStreaming: false,
         timestamp: 1,
-        messages: messages.map((result) => ({ key: result.toolCallId, message: result })),
+        messages: messageEntries(messages),
       };
       render(
         renderActivityGroup([group], {
@@ -207,43 +223,58 @@ describe("browser tab card", () => {
     await vi.waitFor(() => expect(next[0]?.shadowRoot?.querySelector("img")).not.toBeNull());
   });
 
-  it("keeps one card per distinct tab", async () => {
-    const gateway = gatewayContext();
-    const message = (id: string, targetId: string) => ({
-      role: "toolResult",
-      toolCallId: id,
-      toolName: "browser",
-      content: "ok",
-      details: { browserTab: { profile: "managed", target: "host", targetId, title: id } },
-    });
-    const messages = [message("old", "tab-1"), message("new", "tab-1"), message("other", "tab-2")];
-    const host = container();
-    const group: MessageGroup = {
-      kind: "group",
-      key: "browser-results",
-      role: "tool",
-      visibleContent: "text",
-      isStreaming: false,
-      timestamp: 1,
-      messages: messages.map((result) => ({ key: result.toolCallId, message: result })),
-    };
-    render(
-      renderActivityGroup([group], {
-        showReasoning: false,
-        latestBrowserTabs: latestBrowserTabCards(messages, []),
-        isToolMessageExpanded: () => false,
-      }),
-      host,
-    );
-    const elements = [...host.querySelectorAll("openclaw-browser-tab-card")];
-    for (const element of elements) {
-      element.context = gateway.context;
-      await element.updateComplete;
-    }
-    expect(
-      elements.map((element) => element.shadowRoot?.querySelector(".title")?.textContent),
-    ).toEqual(["new", "other"]);
-  });
+  it.each(["https://example.com/new", "about:blank", undefined])(
+    "uses the latest successful result per tab before deciding to preview %s",
+    async (latestUrl) => {
+      const gateway = gatewayContext();
+      const message = (id: string, targetId: string, url: string | undefined) => ({
+        role: "toolResult",
+        toolCallId: id,
+        toolName: "browser",
+        content: "ok",
+        details: {
+          browserTab: {
+            profile: "managed",
+            target: "host",
+            targetId,
+            url,
+            title: id,
+          },
+        },
+      });
+      const messages = [
+        message("old", "tab-1", "https://example.com/old"),
+        message("new", "tab-1", latestUrl),
+        message("other", "tab-2", "https://example.com/other"),
+      ];
+      const host = container();
+      const group: MessageGroup = {
+        kind: "group",
+        key: "browser-results",
+        role: "tool",
+        visibleContent: "text",
+        isStreaming: false,
+        timestamp: 1,
+        messages: messageEntries(messages),
+      };
+      render(
+        renderActivityGroup([group], {
+          showReasoning: false,
+          latestBrowserTabs: latestBrowserTabCards(messages, []),
+          isToolMessageExpanded: () => false,
+        }),
+        host,
+      );
+      const elements = [...host.querySelectorAll("openclaw-browser-tab-card")];
+      for (const element of elements) {
+        element.context = gateway.context;
+        await element.updateComplete;
+      }
+      expect(
+        elements.map((element) => element.shadowRoot?.querySelector(".title")?.textContent),
+      ).toEqual(latestUrl === "https://example.com/new" ? ["new", "other"] : ["other"]);
+    },
+  );
 
   it("discards a pending image when browser access disappears", async () => {
     const gateway = gatewayContext();

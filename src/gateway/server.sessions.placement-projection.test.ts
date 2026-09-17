@@ -1,4 +1,14 @@
 import { expect, test, vi } from "vitest";
+import type { EnvironmentSummary } from "../../packages/gateway-protocol/src/index.js";
+import { i18n } from "../../ui/src/i18n/index.ts";
+import { projectDevicePlacements } from "../../ui/src/pages/new-session/device-placement.ts";
+import { readDraftEnvironments } from "../../ui/src/pages/new-session/discovery.ts";
+import { listRegisteredAgentHarnesses, registerAgentHarness } from "../agents/harness/registry.js";
+import { restoreRegisteredAgentHarnesses } from "../agents/harness/registry.test-support.js";
+import { NODE_WORKER_SUPERVISOR_PROTOCOL_FEATURE } from "../infra/node-runner-inventory.js";
+import { updateNodeRunnerInventory } from "./node-registry-private.js";
+import { NodeRegistry, type NodeSessionConnectParams } from "./node-registry.js";
+import { createOperatorWsClient } from "./server/ws-connection/authenticated-request-dispatch.test-support.js";
 import type { GatewaySessionRow } from "./session-utils.types.js";
 import { writeSessionStore } from "./test-helpers.js";
 import {
@@ -10,6 +20,135 @@ import type { WorkerSessionPlacementReader } from "./worker-environments/placeme
 import type { WorkerSessionPlacementRecord } from "./worker-environments/placement-store.js";
 
 const { createSessionStoreDir } = setupGatewaySessionsHandlerTestHarness();
+
+test.each([
+  { state: "invocable", disabledReason: undefined },
+  {
+    state: "pending-approval",
+    disabledReason:
+      "Ask an administrator to approve the pending runtime.repository.v1 request, or pick another device.",
+  },
+  {
+    state: "unauthorized",
+    disabledReason:
+      "Authorize runtime.repository.v1 in the Gateway node command policy, or pick another device.",
+  },
+  {
+    state: "undeclared",
+    disabledReason:
+      "Make runtime.repository.v1 available on this device, then reconnect, or pick another device.",
+  },
+] as const)(
+  "sessions.list carries automatic runtime requirements through the recovery picker: $state",
+  async ({ state, disabledReason }) => {
+    const registered = listRegisteredAgentHarnesses();
+    const command = "runtime.repository.v1";
+    const config = {
+      gateway: {
+        nodes: {
+          commands: {
+            allow: [command],
+            deny: state === "unauthorized" ? [command] : [],
+          },
+        },
+      },
+    };
+    const registry = new NodeRegistry({ getConfig: () => config });
+    const client = createOperatorWsClient({
+      clientInfo: { id: "node-host", mode: "node" },
+      socket: { readyState: 1, bufferedAmount: 0, send: vi.fn() },
+    });
+    const connect: NodeSessionConnectParams = {
+      ...client.connect,
+      caps: ["session.host"],
+      commands: state === "invocable" || state === "unauthorized" ? [command] : [],
+      declaredCommands: state === "undeclared" ? [] : [command],
+    };
+    const node = registry.register(
+      { ...client, connect },
+      { pairingIdentity: "node-host", pairingGeneration: "node-host-generation" },
+    );
+    const connected = vi.spyOn(registry, "listConnectedForPairingStates").mockReturnValue([node]);
+    registerAgentHarness({
+      id: "repository-device",
+      label: "Repository device",
+      autoSelection: { providerIds: ["repository-provider"] },
+      supports: () => ({ supported: true }),
+      cloudPlacement: {
+        mode: "remote-exec",
+        devicePlacement: {
+          requiredNodeCommands: ["runtime.repository.v1"],
+          consumesWorkerSlot: false,
+        },
+      },
+      runAttempt: async () => {
+        throw new Error("projection must not execute the runtime");
+      },
+    });
+    try {
+      await i18n.setLocale("en");
+      updateNodeRunnerInventory({
+        registry,
+        nodeId: node.nodeId,
+        connId: node.connId,
+        declaration: {
+          protocolFeatures: [NODE_WORKER_SUPERVISOR_PROTOCOL_FEATURE],
+          workerHost: { enabled: true, capacity: { total: 1, available: 1 } },
+        },
+      });
+      await createSessionStoreDir();
+      await writeSessionStore({
+        entries: {
+          "agent:main:repository": {
+            sessionId: "repository-session",
+            updatedAt: 200,
+            repositoryWorkspaceId: "repository-workspace",
+            providerOverride: "repository-provider",
+            modelOverride: "repository-model",
+          },
+        },
+      });
+      const result = await directSessionReq<{ sessions: GatewaySessionRow[] }>("sessions.list", {});
+      expect(result.ok).toBe(true);
+      const runtime = result.payload?.sessions.find(
+        (row) => row.sessionId === "repository-session",
+      )?.agentRuntime;
+      expect(runtime).toMatchObject({
+        id: "repository-device",
+        cloudPlacementExecutionMode: "remote-exec",
+        devicePlacement: {
+          requiredNodeCommands: ["runtime.repository.v1"],
+          consumesWorkerSlot: false,
+        },
+      });
+      const catalog = await directSessionReq<{ environments: EnvironmentSummary[] }>(
+        "environments.list",
+        { runtimeId: runtime?.id },
+        {
+          client: createOperatorWsClient(),
+          context: { nodeRegistry: registry, getRuntimeConfig: () => config },
+        },
+      );
+      expect(catalog.ok).toBe(true);
+      expect(
+        catalog.payload?.environments.find((environment) => environment.id === "node:node-host")
+          ?.requiredNodeCommand,
+      ).toEqual({ command, state });
+      const devices = projectDevicePlacements(
+        readDraftEnvironments(catalog.payload?.environments),
+        runtime?.devicePlacement,
+      );
+      const device = devices.find((option) => option.deviceId === "node-host");
+      expect(device).toBeDefined();
+      expect(device?.selectable).toBe(state === "invocable");
+      expect(device?.disabledReason).toBe(disabledReason);
+    } finally {
+      connected.mockRestore();
+      registry.unregister(node.connId);
+      restoreRegisteredAgentHarnesses(registered);
+    }
+  },
+);
 
 function activePlacementRecord(): Extract<WorkerSessionPlacementRecord, { state: "active" }> {
   return {
@@ -75,7 +214,11 @@ test.each([
       totalBytes: 1_000,
       observedAtMs: 350,
     };
-    const identity = { providerId: "machine0", profileId: "team" };
+    const identity = {
+      providerId: "machine0",
+      profileId: "team",
+      machine: { class: "medium", os: "linux", osLabel: "Linux", cpu: 4, memoryGb: 16 },
+    };
     const getEnvironment = vi.fn((environmentId: string) =>
       ownerEpoch !== undefined && environmentId === placement.environmentId
         ? { ...identity, ownerEpoch, state: "attached" }
@@ -87,7 +230,12 @@ test.each([
       {
         context: {
           workerSessionPlacementService: { getMany },
-          workerEnvironmentService: { get: getEnvironment, inventoryVersion: () => 0 },
+          workerEnvironmentService: {
+            get: getEnvironment,
+            readMachineShape: () => identity.machine,
+            machineShapeVersion: () => 0,
+            inventoryVersion: () => 0,
+          },
           workerPlacementDiskSpaceReader: { read: () => diskSpace, version: () => 1 },
           workerPlacementRunnerAvailabilityReader: {
             read: () => ({ kind: "device", status: "offline" }),
@@ -161,6 +309,8 @@ test.each(["provisioning", "syncing", "starting"] as const)(
               ownerEpoch: 0,
               state: "provisioning",
             }),
+            readMachineShape: () => undefined,
+            machineShapeVersion: () => 0,
             inventoryVersion: () => 0,
           },
         },
@@ -319,6 +469,8 @@ test.each([
                     ownerEpoch,
                     state: "destroyed",
                   },
+            readMachineShape: () => undefined,
+            machineShapeVersion: () => 0,
             inventoryVersion: () => 0,
           },
         },
@@ -371,6 +523,8 @@ test("sessions.describe requires worker teardown before failed-placement restart
             state: "failed",
             leaseId: "lease-live",
           }),
+          readMachineShape: () => undefined,
+          machineShapeVersion: () => 0,
           inventoryVersion: () => 0,
         },
       },

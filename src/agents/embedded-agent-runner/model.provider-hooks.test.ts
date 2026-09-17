@@ -2,8 +2,10 @@ import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type { Model } from "../../llm/types.js";
+import { setCurrentPluginMetadataSnapshot } from "../../plugins/current-plugin-metadata.test-support.js";
+import { createPluginMetadataSnapshotFixture } from "../../plugins/plugin-metadata.test-support.js";
 import { resolveAgentToolSurfacePlan } from "../tool-surface-plan.js";
-import { DEFAULT_PROVIDER_RUNTIME_HOOKS, normalizeResolvedModel } from "./model.provider-hooks.js";
+import { normalizeResolvedModel, resolveRuntimeHooks } from "./model.provider-hooks.js";
 
 vi.mock("../../plugins/provider-runtime.js", () => ({
   applyProviderResolvedTransportWithPlugin: () => undefined,
@@ -13,13 +15,6 @@ vi.mock("../../plugins/provider-runtime.js", () => ({
   prepareProviderDynamicModel: async () => {},
   runProviderDynamicModel: () => undefined,
   shouldPreferProviderRuntimeResolvedModel: () => false,
-}));
-
-vi.mock("../../plugins/current-plugin-metadata-snapshot.js", () => ({
-  getCurrentPluginMetadataSnapshot: () => ({
-    manifestRegistry: { plugins: [] },
-    owners: { providerEndpoints: [], providerRequests: new Map() },
-  }),
 }));
 
 function model(overrides: Partial<Model> = {}): Model {
@@ -50,11 +45,34 @@ function toolSearchEnabled(resolvedModel: Model, config: OpenClawConfig = {}): b
   }).toolSearchControlsEnabled;
 }
 
+it("preserves hook selection precedence and stable default tables", () => {
+  const defaults = resolveRuntimeHooks();
+  const target = resolveRuntimeHooks({ skipAgentDiscovery: true });
+  const skipped = resolveRuntimeHooks({ skipProviderRuntimeHooks: true });
+  const explicit = { ...defaults };
+
+  expect(resolveRuntimeHooks()).toBe(defaults);
+  expect(resolveRuntimeHooks({ skipAgentDiscovery: true })).toBe(target);
+  expect(target).not.toBe(defaults);
+  expect(resolveRuntimeHooks({ runtimeHooks: explicit, skipAgentDiscovery: true })).toBe(explicit);
+  expect(
+    resolveRuntimeHooks({
+      runtimeHooks: explicit,
+      skipAgentDiscovery: true,
+      skipProviderRuntimeHooks: true,
+    }),
+  ).toBe(skipped);
+});
+
 describe("resolved model Tool Search policy", () => {
   beforeAll(() => {
     vi.stubEnv("OPENCLAW_BUNDLED_PLUGINS_DIR", path.resolve("extensions"));
+    setCurrentPluginMetadataSnapshot(createPluginMetadataSnapshotFixture());
   });
-  afterAll(() => vi.unstubAllEnvs());
+  afterAll(() => {
+    setCurrentPluginMetadataSnapshot(undefined);
+    vi.unstubAllEnvs();
+  });
 
   it.each([
     { provider: "ollama", api: "ollama", id: "qwen3.5:4b", expected: true },
@@ -86,7 +104,7 @@ describe("resolved model Tool Search policy", () => {
       provider: original.provider,
       model: local,
       runtimeHooks: {
-        ...DEFAULT_PROVIDER_RUNTIME_HOOKS,
+        ...resolveRuntimeHooks(),
         normalizeProviderTransportWithPlugin: () => ({
           api: "openai-responses",
           baseUrl: "https://hosted.example/v1",

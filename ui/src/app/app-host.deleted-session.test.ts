@@ -1,5 +1,4 @@
 /* @vitest-environment jsdom */
-
 import type { RouteLocation, RouterState } from "@openclaw/uirouter";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../../test/helpers/promise.js";
@@ -20,6 +19,7 @@ import { createStorageMock } from "../test-helpers/storage.ts";
 import { selectShellRouteState } from "./app-host-route-state.ts";
 import { resetAppHostTestGlobals } from "./app-host.test-support.ts";
 import { createChatAttachmentHandoff } from "./chat-attachment-handoff.ts";
+import { createChatSubmissions } from "./chat-submissions.ts";
 import type { ApplicationContext } from "./context.ts";
 import "./app-host.ts";
 
@@ -28,7 +28,7 @@ type DeletedSessionShell = {
   activeSessionKey: string;
   routeState: { routeId?: RouteId; location?: RouteLocation };
   didConsiderNativeRouteRestore: boolean;
-  replaceChatWithCurrentSession: () => void;
+  recoverNotFoundRoute: () => void;
   updateRouteState: (state: ReturnType<typeof selectShellRouteState>) => void;
   observeDeletedSessions: (state: ApplicationContext["sessions"]["state"]) => void;
   recoverDeletedActiveSession: (state: ApplicationContext["sessions"]["state"]) => void;
@@ -51,6 +51,7 @@ function createSessionRecoveryShell(params: {
     context: {
       basePath: "",
       chatAttachmentHandoff: createChatAttachmentHandoff(),
+      chatSubmissions: createChatSubmissions(),
       agents: {
         state: {
           agentsList: {
@@ -362,6 +363,7 @@ describe("OpenClaw shell deleted-session recovery", () => {
       context: {
         agents: { state: { agentsList: null } },
         chatAttachmentHandoff: createChatAttachmentHandoff(),
+        chatSubmissions: createChatSubmissions(),
         gateway: {
           snapshot: {
             assistantAgentId: "main",
@@ -408,7 +410,7 @@ describe("OpenClaw shell deleted-session recovery", () => {
       sessionKeys: [mainKey],
     });
 
-    shell.replaceChatWithCurrentSession();
+    shell.recoverNotFoundRoute();
 
     expect(setSessionKey).toHaveBeenCalledExactlyOnceWith(mainKey);
     expect(replace).toHaveBeenCalledExactlyOnceWith("chat", { pathname: "/chat/main" });
@@ -422,7 +424,7 @@ describe("OpenClaw shell deleted-session recovery", () => {
       sessionKeys: [mainKey, researchKey],
     });
 
-    shell.replaceChatWithCurrentSession();
+    shell.recoverNotFoundRoute();
 
     expect(setSessionKey).toHaveBeenCalledExactlyOnceWith(researchKey);
     expect(replace).toHaveBeenCalledExactlyOnceWith("chat", { pathname: "/chat/research" });
@@ -435,7 +437,7 @@ describe("OpenClaw shell deleted-session recovery", () => {
       sessionKeys: [mainKey],
     });
 
-    shell.replaceChatWithCurrentSession();
+    shell.recoverNotFoundRoute();
 
     expect(setSessionKey).toHaveBeenCalledExactlyOnceWith(mainKey);
     expect(replace).toHaveBeenCalledExactlyOnceWith("chat", { pathname: "/chat/main" });
@@ -448,7 +450,7 @@ describe("OpenClaw shell deleted-session recovery", () => {
       sessionKeys: [mainKey],
     });
 
-    shell.replaceChatWithCurrentSession();
+    shell.recoverNotFoundRoute();
 
     expect(setSessionKey).not.toHaveBeenCalled();
     expect(replace).not.toHaveBeenCalled();
@@ -461,7 +463,7 @@ describe("OpenClaw shell deleted-session recovery", () => {
       sessionKeys: [existingKey],
     });
 
-    shell.replaceChatWithCurrentSession();
+    shell.recoverNotFoundRoute();
 
     expect(setSessionKey).not.toHaveBeenCalled();
     expect(replace).toHaveBeenCalledExactlyOnceWith("chat", {
@@ -480,7 +482,7 @@ describe("OpenClaw shell deleted-session recovery", () => {
       location: { pathname: "/chat/main/unrelated-missing", search: "", hash: "" },
     };
 
-    shell.replaceChatWithCurrentSession();
+    shell.recoverNotFoundRoute();
 
     expect(setSessionKey).not.toHaveBeenCalled();
     expect(replace).toHaveBeenCalledExactlyOnceWith("chat", {
@@ -495,7 +497,7 @@ describe("OpenClaw shell deleted-session recovery", () => {
       sessionKeys: [deletedKey, mainKey],
     });
 
-    shell.replaceChatWithCurrentSession();
+    shell.recoverNotFoundRoute();
 
     expect(setSessionKey).toHaveBeenCalledExactlyOnceWith(mainKey);
     expect(replace).toHaveBeenCalledExactlyOnceWith("chat", { pathname: "/chat/main" });

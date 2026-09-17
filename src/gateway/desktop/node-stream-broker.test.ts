@@ -2,6 +2,7 @@ import http from "node:http";
 import net from "node:net";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { WebSocket } from "ws";
+import { createDeferred } from "../../../test/helpers/promise.js";
 import { createSuiteLogPathTracker } from "../../logging/log-test-helpers.js";
 import { flushLogger, resetLogger, setLoggerOverride } from "../../logging/logger.js";
 import { createDiagnosticLogRecordCapture } from "../../logging/test-helpers/diagnostic-log-capture.js";
@@ -47,7 +48,13 @@ async function startBrokerServer(params: {
       connId === params.session.connId && (await (params.pairingCurrent?.() ?? true)),
   };
   const server = http.createServer();
+  const upgradedSocketsClosed: Promise<void>[] = [];
   server.on("upgrade", (req, socket, head) => {
+    upgradedSocketsClosed.push(
+      new Promise<void>((resolve) => {
+        socket.once("close", () => resolve());
+      }),
+    );
     void params.broker.handleUpgrade(req, socket, head, registry as never);
   });
   await new Promise<void>((resolve) => {
@@ -57,12 +64,13 @@ async function startBrokerServer(params: {
   if (!address || typeof address === "string") {
     throw new Error("expected broker test address");
   }
-  cleanups.push(
-    async () =>
-      await new Promise<void>((resolve) => {
-        server.close(() => resolve());
-      }),
-  );
+  cleanups.push(async () => {
+    await new Promise<void>((resolve) => {
+      server.close(() => resolve());
+    });
+    // HTTP close excludes upgraded sockets; their late diagnostics belong to this test.
+    await Promise.all(upgradedSocketsClosed);
+  });
   return `ws://127.0.0.1:${address.port}`;
 }
 
@@ -185,10 +193,7 @@ describe("node desktop stream tickets", () => {
 
   it("buffers early RFB bytes while the pairing binding is rechecked", async () => {
     let pairingChecks = 0;
-    let releaseRecheck!: () => void;
-    const recheck = new Promise<void>((resolve) => {
-      releaseRecheck = resolve;
-    });
+    const { promise: recheck, resolve: releaseRecheck } = createDeferred();
     const broker = createNodeDesktopStreamBroker();
     const session = { connId: "conn-1", pairingGeneration: "generation-1" };
     const baseUrl = await startBrokerServer({
@@ -222,10 +227,7 @@ describe("node desktop stream tickets", () => {
 
   it("rejects a stream error during the asynchronous pairing handoff", async () => {
     let pairingChecks = 0;
-    let releaseRecheck!: () => void;
-    const recheck = new Promise<void>((resolve) => {
-      releaseRecheck = resolve;
-    });
+    const { promise: recheck, resolve: releaseRecheck } = createDeferred();
     const broker = createNodeDesktopStreamBroker();
     const session = { connId: "conn-1", pairingGeneration: "generation-1" };
     const baseUrl = await startBrokerServer({
@@ -305,45 +307,51 @@ describe("node desktop stream tickets", () => {
     await expect(minted.attached).rejects.toThrow("stale");
   });
 
-  it("keeps a redeemed ticket cancellable while metadata is pending", async () => {
-    const logCapture = createDiagnosticLogRecordCapture();
-    logCaptures.push(logCapture);
-    const broker = createNodeDesktopStreamBroker();
-    const session = { connId: "conn-1", pairingGeneration: "generation-1" };
-    const baseUrl = await startBrokerServer({ broker, session });
-    const minted = broker.mint({ nodeId: "node-1", ...session });
-    const ws = new WebSocket(`${baseUrl}${minted.attachPath}`);
-    cleanups.push(async () => ws.terminate());
-    await new Promise<void>((resolve, reject) => {
-      ws.once("open", resolve);
-      ws.once("error", reject);
-    });
-    const closed = new Promise<void>((resolve) => {
-      ws.once("close", () => resolve());
-    });
+  it.each(["cancelled", "expired"] as const)(
+    "rejects a redeemed ticket that is %s while metadata is pending",
+    async (outcome) => {
+      const logCapture = createDiagnosticLogRecordCapture();
+      logCaptures.push(logCapture);
+      const broker = createNodeDesktopStreamBroker({ now: () => 1_000 });
+      const session = { connId: "conn-1", pairingGeneration: "generation-1" };
+      const baseUrl = await startBrokerServer({ broker, session });
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      const minted = broker.mint({ nodeId: "node-1", ...session });
+      const ws = new WebSocket(`${baseUrl}${minted.attachPath}`);
+      cleanups.push(async () => ws.terminate());
+      await new Promise<void>((resolve, reject) => {
+        ws.once("open", resolve);
+        ws.once("error", reject);
+      });
+      const closed = new Promise<{ code: number; reason: string }>((resolve) => {
+        ws.once("close", (code, reason) => resolve({ code, reason: reason.toString() }));
+      });
 
-    minted.cancel();
+      if (outcome === "cancelled") {
+        minted.cancel();
+      } else {
+        vi.advanceTimersByTime(60_000);
+      }
 
-    await expect(minted.attached).rejects.toThrow("cancelled");
-    await expect(closed).resolves.toBeUndefined();
-    await expect
-      .poll(async () => {
-        await logCapture.flush();
-        return logCapture.records.filter((record) => record.message === "node stream closed");
-      })
-      .toHaveLength(1);
-    expect(logCapture.records[0]?.attributes).toMatchObject({
-      trigger: "attach-rejected",
-      closeCode: 1008,
-    });
-  });
+      await expect(minted.attached).rejects.toThrow(`node desktop stream ticket ${outcome}`);
+      await expect(closed).resolves.toEqual({ code: 1008, reason: "node desktop attach rejected" });
+      vi.useRealTimers();
+      await expect
+        .poll(async () => {
+          await logCapture.flush();
+          return logCapture.records.filter((record) => record.message === "node stream closed");
+        })
+        .toHaveLength(1);
+      expect(logCapture.records[0]?.attributes).toMatchObject({
+        trigger: "attach-rejected",
+        closeCode: 1008,
+      });
+    },
+  );
 
   it("rejects when the raw upgrade socket closes during pairing authorization", async () => {
     let pairingChecks = 0;
-    let releaseCheck!: () => void;
-    const check = new Promise<void>((resolve) => {
-      releaseCheck = resolve;
-    });
+    const { promise: check, resolve: releaseCheck } = createDeferred();
     const broker = createNodeDesktopStreamBroker();
     const session = { connId: "conn-1", pairingGeneration: "generation-1" };
     const baseUrl = await startBrokerServer({

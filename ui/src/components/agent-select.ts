@@ -6,10 +6,11 @@ import { ref } from "lit/directives/ref.js";
 import type { AgentIdentityResult, GatewayAgentRow } from "../api/types.ts";
 import { t } from "../i18n/index.ts";
 import { resolveAgentTextAvatar } from "../lib/agents/display.ts";
-import { deriveAvatarInitial, resolveAgentAvatarUrl } from "../lib/avatar.ts";
+import { resolveAgentAvatarUrl } from "../lib/avatar.ts";
 import { IdentityAvatarController } from "../lib/identity-avatar-loader.ts";
 import { OpenClawLightDomElement } from "../lit/openclaw-element.ts";
 import { icons } from "./icons.ts";
+import { renderAgentIdentityAvatar } from "./identity-avatar-view.ts";
 import { syncDropdownItemRadio } from "./web-awesome.ts";
 
 export type AgentSelectOption = {
@@ -27,34 +28,35 @@ export function renderAgentSelectAvatar(
   option: AgentSelectOption,
   identity: AgentIdentityResult | null = null,
   imageUrl?: string | null,
+  onImageError?: () => void,
 ) {
   const resolvedImageUrl =
     imageUrl === undefined && option.agent
       ? resolveAgentAvatarUrl(option.agent, identity)
       : (imageUrl ?? null);
-  if (resolvedImageUrl) {
-    return html`<img class="agent-select__avatar" src=${resolvedImageUrl} alt="" loading="lazy" />`;
-  }
-  if (option.icon) {
+  if (option.icon && !resolvedImageUrl) {
     return html`<span class="agent-select__avatar agent-select__avatar--icon" aria-hidden="true"
       >${option.icon}</span
     >`;
   }
-  const text = option.agent ? resolveAgentTextAvatar(option.agent, identity) : null;
-  const fallback = deriveAvatarInitial(option.label) || "?";
-  return html`
-    <span
-      class="agent-select__avatar agent-select__avatar--text"
-      data-avatar=${text ?? fallback}
-      aria-hidden="true"
-    ></span>
-  `;
+  return renderAgentIdentityAvatar(
+    {
+      id: option.agent?.id ?? option.value,
+      avatar: resolvedImageUrl,
+      textAvatar: option.agent ? resolveAgentTextAvatar(option.agent, identity) : null,
+    },
+    "agent-select__avatar",
+    onImageError,
+  );
 }
 
 export function renderAgentSelectCopy(option: AgentSelectOption) {
   return html`
     <span class="agent-select__option-copy">
-      <span class="agent-select__option-label">${option.label}</span>
+      <span class="agent-select__option-heading">
+        <span class="agent-select__option-label">${option.label}</span>
+        ${option.badge ? html`<span class="agent-select__badge">${option.badge}</span>` : nothing}
+      </span>
       ${
         option.description
           ? html`<span class="agent-select__option-description">${option.description}</span>`
@@ -72,6 +74,7 @@ export class AgentSelect extends OpenClawLightDomElement {
   @property({ attribute: false }) menuLabel = "";
   @property({ attribute: false }) identityById: Record<string, AgentIdentityResult> = {};
   @property({ attribute: false }) disabled = false;
+  @property({ attribute: false }) variant: "default" | "compact" = "default";
   @property({ attribute: false }) onSelect: (value: string) => void = () => {};
   @property({ attribute: false }) onCreateAgent: (() => void) | null = null;
 
@@ -91,7 +94,12 @@ export class AgentSelect extends OpenClawLightDomElement {
     const identity = agentId ? (this.identityById[agentId] ?? null) : null;
     const url = option.agent ? resolveAgentAvatarUrl(option.agent, identity) : null;
     const imageUrl = url ? this.avatarLoader.resolve(url) : null;
-    return renderAgentSelectAvatar(option, identity, imageUrl);
+    return renderAgentSelectAvatar(
+      option,
+      identity,
+      imageUrl,
+      url ? this.avatarLoader.imageErrorHandler(url) : undefined,
+    );
   }
 
   private readonly handleSelect = (event: WebAwesomeSelectEvent) => {
@@ -156,11 +164,19 @@ export class AgentSelect extends OpenClawLightDomElement {
 
     return html`
       <wa-dropdown
-        class="agent-select"
+        class="agent-select ${this.variant === "compact" ? "agent-select--compact" : ""}"
         placement="bottom-start"
         aria-label=${this.accessibleLabel || triggerLabel}
         @wa-select=${this.handleSelect}
         @wa-after-show=${this.handleAfterShow}
+        @keydown=${(event: KeyboardEvent) => {
+          // SAFETY: This handler is bound to the wa-dropdown host.
+          const dropdown = event.currentTarget as HTMLElement & { open: boolean };
+          if (event.key === "Escape" && dropdown.open) {
+            // Web Awesome closes at document; claim the key before the shell's earlier listener.
+            event.preventDefault();
+          }
+        }}
       >
         <button
           slot="trigger"
@@ -205,11 +221,6 @@ export class AgentSelect extends OpenClawLightDomElement {
               <span slot="icon">${this.renderAvatar(option)}</span>
               ${renderAgentSelectCopy(option)}
               <span slot="details" class="agent-select__option-state" aria-hidden="true">
-                ${
-                  option.badge
-                    ? html`<span class="agent-select__badge">${option.badge}</span>`
-                    : nothing
-                }
                 ${
                   selected
                     ? html`<span class="agent-select__option-check">${icons.check}</span>`

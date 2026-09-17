@@ -1,8 +1,35 @@
 // @vitest-environment jsdom
+
 import { expectDefined } from "@openclaw/normalization-core";
+import { render } from "lit";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
+import type { ChatAttachment } from "../../../lib/chat/chat-types.ts";
 import * as payloads from "../attachment-payload-store.ts";
-import { ChatAttachmentReadLifecycle, handleChatAttachmentPaste } from "./chat-attachments.ts";
+import {
+  chatAttachmentFromDataUrl,
+  ChatAttachmentReadLifecycle,
+  handleChatAttachmentPaste,
+  renderAttachmentPreview,
+} from "./chat-attachments.ts";
+
+it("admits same-name image payloads with independent identities", () => {
+  const sources = ["data:image/png;base64,YmVmb3Jl", "data:image/png;base64,YWZ0ZXIh"];
+  const attachments = sources.map((source) => {
+    const attachment = expectDefined(
+      chatAttachmentFromDataUrl(source, "capture.png"),
+      "admitted image attachment",
+    );
+    onTestFinished(() => payloads.releaseChatAttachmentPayload(attachment.id));
+    return attachment;
+  });
+
+  expect(attachments[0]?.id).not.toBe(attachments[1]?.id);
+  expect(attachments.map(({ fileName, sizeBytes }) => ({ fileName, sizeBytes }))).toEqual([
+    { fileName: "capture.png", sizeBytes: 6 },
+    { fileName: "capture.png", sizeBytes: 6 },
+  ]);
+  expect(attachments.map(payloads.getChatAttachmentDataUrl)).toEqual(sources);
+});
 
 class StubFileReader {
   static failNames = new Set<string>();
@@ -255,5 +282,53 @@ describe("chat attachment read failures", () => {
     });
     await toastHost.updateComplete;
     expect(toastHost.querySelector(".app-toast")).toBeNull();
+  });
+});
+
+describe("attachment removal names", () => {
+  it("names full filenames and removes only the activated ID, including duplicate names", () => {
+    const names = [
+      "budget.csv",
+      "notes.txt",
+      "notes.txt",
+      undefined,
+      "   ",
+      "تقرير-الميزانية.txt",
+      "long-".repeat(50) + "report.txt",
+    ];
+    let attachments: ChatAttachment[] = names.map((fileName, index) => ({
+      id: "named-" + index,
+      mimeType: "text/plain",
+      fileName,
+    }));
+    const originals = [...attachments];
+    const container = document.createElement("div");
+    const released = vi.spyOn(payloads, "releaseChatAttachmentPayload");
+    const redraw = () =>
+      render(
+        renderAttachmentPreview({
+          attachments,
+          getAttachments: () => attachments,
+          onAttachmentsChange: (next) => {
+            attachments = next;
+            redraw();
+          },
+        }),
+        container,
+      );
+    redraw();
+    const buttons = [...container.querySelectorAll<HTMLButtonElement>(".chat-attachment-remove")];
+    const labels = names.map((name) => (name?.trim() ? "Remove " + name : "Remove attachment"));
+    expect(buttons.map((button) => button.getAttribute("aria-label"))).toEqual(labels);
+    expect(
+      buttons.map((button) => (button.parentElement as HTMLElement & { content: string }).content),
+    ).toEqual(labels);
+    buttons[2]?.click();
+    expect(attachments.map(({ id }) => id)).toEqual(
+      originals.filter((_, index) => index !== 2).map(({ id }) => id),
+    );
+    expect(released).toHaveBeenCalledExactlyOnceWith("named-2");
+    render(null, container);
+    released.mockRestore();
   });
 });

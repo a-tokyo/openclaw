@@ -11,7 +11,7 @@ import {
   type SystemAgentTurnRunner,
 } from "./agent-turn.js";
 import type { SystemAgentApprovalClassifier } from "./approval-intent.js";
-import type { SystemAgentAssistantPlanner, SystemAgentAssistantTurn } from "./assistant.js";
+import type { SystemAgentAssistantTurn } from "./assistant.js";
 import {
   ChatTurnRouter,
   redactSensitiveCommandText,
@@ -44,7 +44,6 @@ export { SystemAgentWizardAnswerError } from "./chat-wizard-host.js";
 export type SystemAgentChatEngineOptions = {
   yes?: boolean;
   deps?: SystemAgentCommandDeps;
-  planWithAssistant?: SystemAgentAssistantPlanner;
   planGreeting?: SystemAgentGreetingPlanner;
   runAgentTurn?: SystemAgentTurnRunner;
   classifyApproval?: SystemAgentApprovalClassifier;
@@ -102,7 +101,6 @@ export class SystemAgentChatEngine {
         rebindVerifiedInference: (next) => this.rebindVerifiedInference(next),
         getVerifiedInference: () => this.verifiedInference,
         loadOverview: async () => await this.loadOverview(),
-        getHistory: () => this.history,
         verifyConfigAfterWrite: async () => await this.verifyConfigAfterWrite(),
       },
     );
@@ -225,7 +223,9 @@ export class SystemAgentChatEngine {
     const overview = await (this.options.deps?.loadOverview ?? loadSystemAgentOverview)({
       agentId: route.agentId,
     });
-    return { ...overview, defaultModel: route.modelLabel };
+    return route.modelTarget === "utility"
+      ? { ...overview, setupModel: route.modelLabel }
+      : { ...overview, defaultModel: route.modelLabel };
   }
 
   async planGreeting(params: {

@@ -142,8 +142,8 @@ export function createFinishedBarrier() {
 export function createStartedCronServiceWithFinishedBarrier(params: {
   storePath: string;
   logger: ReturnType<typeof createNoopLogger>;
-  runSkillCollectionReview?: CronServiceDeps["runSkillCollectionReview"];
   requestHeartbeatAndWait?: CronServiceDeps["requestHeartbeatAndWait"];
+  resolveHeartbeatTimeoutMs?: CronServiceDeps["resolveHeartbeatTimeoutMs"];
   onEvent?: CronServiceDeps["onEvent"];
 }): {
   cron: CronService;
@@ -165,10 +165,8 @@ export function createStartedCronServiceWithFinishedBarrier(params: {
     enqueueSystemEvent,
     requestHeartbeat,
     requestHeartbeatAndWait,
+    resolveHeartbeatTimeoutMs: params.resolveHeartbeatTimeoutMs,
     runIsolatedAgentJob: vi.fn(async () => ({ status: "ok" as const })),
-    ...(params.runSkillCollectionReview
-      ? { runSkillCollectionReview: params.runSkillCollectionReview }
-      : {}),
     onEvent: (event) => {
       finished.onEvent(event);
       params.onEvent?.(event);
@@ -278,7 +276,6 @@ export function createMockCronStateForJobs(params: {
     op: Promise.resolve(),
     warnedDisabled: false,
     warnedInvalidPersistedJobKeys: new Set<string>(),
-    reportedUnavailableReaperAgentIds: new Set<string>(),
     pendingQuarantineConfigJobs: [],
     lastQuarantineFailureWarnKey: null,
     deps: {

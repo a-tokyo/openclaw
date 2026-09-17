@@ -3,8 +3,8 @@ import { mkdtemp, rm } from "node:fs/promises";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
+import { type RawData, WebSocketServer } from "openclaw/plugin-sdk/websocket-runtime";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { WebSocketServer, type RawData } from "ws";
 import { CodexAppServerClient } from "./client.js";
 import * as processRegistration from "./transport-process-registration.js";
 import { createWebSocketTransport } from "./transport-websocket.js";
@@ -106,7 +106,7 @@ describe("Codex app-server websocket transport", () => {
     });
     server.once("connection", (socket) => {
       socket.once("ping", () => resolvePing?.());
-      resolveConnected?.();
+      socket.once("message", () => resolveConnected?.());
     });
     await new Promise<void>((resolve) => {
       server.once("listening", resolve);
@@ -124,10 +124,8 @@ describe("Codex app-server websocket transport", () => {
       headers: {},
     });
     transports.push(transport);
+    transport.stdin.write("{}\n");
     await connected;
-    await new Promise<void>((resolve) => {
-      setImmediate(resolve);
-    });
 
     await vi.advanceTimersByTimeAsync(20_000);
     await expect(receivedPing).resolves.toBeUndefined();
@@ -150,7 +148,7 @@ describe("Codex app-server websocket transport", () => {
     });
     server.once("connection", (socket) => {
       socket.once("ping", () => resolvePing?.());
-      resolveConnected?.();
+      socket.once("message", () => resolveConnected?.());
     });
     await new Promise<void>((resolve) => {
       server.once("listening", resolve);
@@ -171,10 +169,8 @@ describe("Codex app-server websocket transport", () => {
     const exited = new Promise<unknown>((resolve) => {
       transport.once("exit", (code) => resolve(code));
     });
+    transport.stdin.write("{}\n");
     await connected;
-    await new Promise<void>((resolve) => {
-      setImmediate(resolve);
-    });
 
     await vi.advanceTimersByTimeAsync(20_000);
     await expect(receivedPing).resolves.toBeUndefined();

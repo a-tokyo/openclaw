@@ -78,6 +78,11 @@ runs:
             exit 1
             ;;
         esac
+        image_corepack_home="$(node "$GITHUB_ACTION_PATH/seed-pnpm-from-image.mjs" "$package_manager")"
+        if [[ -n "$image_corepack_home" ]]; then
+          export COREPACK_HOME="$image_corepack_home"
+          echo "COREPACK_HOME=$COREPACK_HOME" >> "$GITHUB_ENV"
+        fi
         if [ -n "${PNPM_HOME:-}" ]; then
           mkdir -p "$PNPM_HOME"
           corepack enable --install-directory "$PNPM_HOME"
@@ -129,4 +134,7 @@ runs:
       shell: bash
       env:
         PROJECT_DIR: ${{ steps.setup-pnpm.outputs.project-dir }}
-      run: echo "pnpm-version=$(cd "$PROJECT_DIR" && pnpm -v)" >> "$GITHUB_OUTPUT"
+      run: |
+        set -euo pipefail
+        pnpm_version="$(cd "$PROJECT_DIR" && pnpm -v)"
+        echo "pnpm-version=$pnpm_version" >> "$GITHUB_OUTPUT"

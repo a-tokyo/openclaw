@@ -1,4 +1,4 @@
-import { html, type TemplateResult } from "lit";
+import { html, nothing, type TemplateResult } from "lit";
 import { icons } from "../components/icons.ts";
 import { t } from "../i18n/index.ts";
 import { containsRedactedSentinel } from "../lib/config-form-utils.ts";
@@ -31,13 +31,14 @@ export function renderMapField(
     validateKey: (key: string) => boolean;
   },
   renderNode: ConfigNodeRenderer,
-): TemplateResult {
+): TemplateResult | typeof nothing {
   const {
     schema,
     value,
     path,
     hints,
     rawAvailable,
+    maskSensitive,
     unsupported,
     disabled,
     reservedKeys,
@@ -55,7 +56,7 @@ export function renderMapField(
     schema,
     label: t("configForm.customEntries"),
     disabled,
-    identity: draftId,
+    identity: JSON.stringify(path.filter((segment) => typeof segment === "string")),
     sourceIdentity: params.sourceIdentity ?? value,
     existingKeys: [...new Set([...Object.keys(value), ...reservedKeys])],
     validateKey,
@@ -73,6 +74,9 @@ export function renderMapField(
           }),
         )
       : entries;
+  if (searchCriteria && hasSearchCriteria(searchCriteria) && visibleEntries.length === 0) {
+    return nothing;
+  }
 
   return html`
     <div class="cfg-block cfg-map">
@@ -207,7 +211,6 @@ export function renderMapField(
                       anySchema
                         ? renderFieldRow({
                             label: key,
-                            tags: [],
                             showLabel: false,
                             stacked: true,
                             control: renderJsonTextareaControl({
@@ -215,7 +218,6 @@ export function renderMapField(
                               path: valuePath,
                               ariaLabel: `${key}: ${t("configForm.jsonValue")}`,
                               sourceValue: entryValue,
-                              rowIdentity: params.rowIdentity,
                               fallback: jsonValue(entryValue),
                               rows: 2,
                               sensitiveState,
@@ -231,12 +233,14 @@ export function renderMapField(
                             path: valuePath,
                             hints,
                             rawAvailable,
+                            maskSensitive,
                             unsupported,
                             disabled,
+                            compact: params.compact,
+                            commitOnBlur: params.commitOnBlur,
                             isRequired: true,
                             sourceIdentity: entryValue,
                             controlIdentity: value,
-                            rowIdentity: params.rowIdentity,
                             searchCriteria,
                             showLabel: false,
                             revealSensitive,

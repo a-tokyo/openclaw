@@ -128,7 +128,7 @@ async function fixture(
   capability?.bind(admitted);
   const snapshot = options.managed
     ? {
-        ...buildSkillSnapshot(workspace, { entries: loadSkillLibrarySelection(pins) }),
+        ...(await buildSkillSnapshot(workspace, { entries: loadSkillLibrarySelection(pins) })),
         librarySelections: pins,
       }
     : undefined;
@@ -194,7 +194,8 @@ async function fixture(
         const request = await decodeClaudeCliNodeRunParams(frame.paramsJSON);
         let seq = 0;
         endpoint = createNodeDuplexEndpoint({
-          sendFrame: (text) => {
+          sendFrame: (payload) => {
+            const text = JSON.stringify(payload);
             expect(Buffer.byteLength(text)).toBeLessThanOrEqual(16 * 1024);
             progress(text, seq++);
           },

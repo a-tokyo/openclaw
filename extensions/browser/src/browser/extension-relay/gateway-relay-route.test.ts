@@ -90,6 +90,10 @@ function fakeSocket() {
       writes.push(chunk);
       return true;
     },
+    end: (chunk: string, callback: () => void) => {
+      writes.push(chunk);
+      callback();
+    },
     destroy: () => {
       destroyed = true;
     },
@@ -162,7 +166,7 @@ function primeProfile() {
 }
 
 async function mockSuccessfulUpgrade() {
-  const wsMod = await import("ws");
+  const wsMod = await import("openclaw/plugin-sdk/websocket-runtime");
   const ws = Object.assign(new EventEmitter(), {
     readyState: 1,
     close: vi.fn(),

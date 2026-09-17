@@ -6,6 +6,7 @@ import type { NodeRegistry, NodeSession } from "../node-registry.js";
 import { DesktopCredentialsRequiredError } from "./host-source-errors.js";
 import type { NodeDesktopStreamBroker } from "./node-stream-broker.js";
 import { mintDesktopObserverToken } from "./observe-bridge.js";
+import type { DesktopObserveRequester } from "./observe-requester.js";
 import type { RfbPreauthDescriptor } from "./rfb-preauth.js";
 import type { DesktopSessionRegistry } from "./session-registry.js";
 
@@ -155,6 +156,7 @@ export function createNodeDesktopService(params: {
     async observe(request: {
       nodeId: string;
       control: boolean;
+      requester?: DesktopObserveRequester;
       credentials?: { username?: string; password?: string };
     }): Promise<NodeDesktopObserveResult> {
       const node = params.nodeRegistry.get(request.nodeId);
@@ -162,11 +164,16 @@ export function createNodeDesktopService(params: {
         throw new Error("node desktop is unavailable; reconnect and approve the node capability");
       }
       const pairingGeneration = node.pairingGeneration;
+      const isRequesterCurrent = () =>
+        !request.requester?.signal?.aborted && request.requester?.isCurrent() !== false;
       const isAuthorized = () =>
         params.nodeRegistry.get(request.nodeId) === node &&
         node.pairingGeneration === pairingGeneration &&
         commandAllowed(node);
       const assertAuthorized = () => {
+        if (!isRequesterCurrent()) {
+          throw new Error("Desktop observer connection is no longer current");
+        }
         if (!isAuthorized()) {
           throw new Error(
             "node desktop is not enabled; explicitly allow and approve desktop.stream for this node",
@@ -191,6 +198,9 @@ export function createNodeDesktopService(params: {
       if (!active.reservation) {
         throw new Error("node desktop observer limit reached");
       }
+      const signal = request.requester?.signal
+        ? AbortSignal.any([active.controller.signal, request.requester.signal])
+        : active.controller.signal;
       session.active.add(active);
       try {
         active.ticket = params.streamBroker.mint({
@@ -206,11 +216,14 @@ export function createNodeDesktopService(params: {
           params: { ticket: active.ticket.ticket, attachPath: active.ticket.attachPath },
           timeoutMs: 0,
           onProgress: () => {},
-          signal: active.controller.signal,
+          signal,
           // Pairing resolution yields before dispatch. Recheck this exact desktop
           // owner and live command policy at the transport's final admission edge.
           isDispatchAuthorized: () =>
-            !active.stopped && sessions.get(request.nodeId) === session && isAuthorized(),
+            !active.stopped &&
+            sessions.get(request.nodeId) === session &&
+            isRequesterCurrent() &&
+            isAuthorized(),
         });
         const invocationFinished = active.invocation.then((result) => {
           throw invocationError(result);
@@ -263,6 +276,7 @@ export function createNodeDesktopService(params: {
           sourceKey,
           ownerEpoch: session.ownerEpoch,
           control: request.control,
+          requester: request.requester,
           attachment,
           preauth,
         });

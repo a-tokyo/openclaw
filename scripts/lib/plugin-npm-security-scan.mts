@@ -110,10 +110,18 @@ const RELEASE_2026_9_1_REQUIRED_REVIEWED_SOURCE_FINDING_COUNTS = new Map<string,
   ["@openclaw/voice-call:dangerous-exec:src/tunnel.ts", 1],
 ]);
 
-const CURRENT_REQUIRED_REVIEWED_SOURCE_FINDING_COUNTS = new Map<string, number>([
+const RELEASE_2026_9_2_REQUIRED_REVIEWED_SOURCE_FINDING_COUNTS = new Map<string, number>([
   ...RELEASE_2026_9_1_REQUIRED_REVIEWED_SOURCE_FINDING_COUNTS,
   ["@openclaw/llama-cpp-provider:dangerous-exec:src/hardware.ts", 1],
 ]);
+
+// The bounded async Codex version probe no longer produces this syntactic finding.
+// Keep shipped inventories intact; a new direct call must be reviewed again.
+const CURRENT_REQUIRED_REVIEWED_SOURCE_FINDING_COUNTS = new Map(
+  [...RELEASE_2026_9_2_REQUIRED_REVIEWED_SOURCE_FINDING_COUNTS].filter(
+    ([key]) => key !== "@openclaw/codex:dangerous-exec:src/doctor.ts",
+  ),
+);
 
 type ReviewedReleaseLayout = {
   id: string;
@@ -134,7 +142,7 @@ const CURRENT_REVIEWED_RELEASE_LAYOUT = {
   ]),
 };
 
-const CURRENT_OPTIONAL_REVIEWED_PACKED_FINDING_COUNTS = new Map<string, number>([
+const FROZEN_RELEASE_2026_9_OPTIONAL_REVIEWED_PACKED_FINDING_COUNTS = new Map<string, number>([
   ["@openclaw/acpx:dangerous-exec:dist/mcp-proxy.mjs", 1],
   ["@openclaw/acpx:dangerous-exec:dist/service-<hash>.js", 1],
   ["@openclaw/acpx:dangerous-exec:src/runtime-internals/mcp-proxy.test.ts", 3],
@@ -143,6 +151,7 @@ const CURRENT_OPTIONAL_REVIEWED_PACKED_FINDING_COUNTS = new Map<string, number>(
   ["@openclaw/codex:dangerous-exec:dist/session-catalog-<hash>.js", 1],
   ["@openclaw/codex:dangerous-exec:dist/transport-stdio-<hash>.js", 1],
   ["@openclaw/codex:dangerous-exec:src/app-server/attempt-startup-retry.test.ts", 6],
+  ["@openclaw/codex:dangerous-exec:src/app-server/run-attempt-one-shot-cleanup.test.ts", 3],
   ["@openclaw/codex:dangerous-exec:src/app-server/sandbox-exec-server.http.test.ts", 1],
   ["@openclaw/codex:dangerous-exec:src/app-server/transport-orphan.test-helper.ts", 1],
   ["@openclaw/codex:dangerous-exec:src/app-server/transport-orphan.test.ts", 3],
@@ -159,6 +168,62 @@ const CURRENT_OPTIONAL_REVIEWED_PACKED_FINDING_COUNTS = new Map<string, number>(
   ["@openclaw/slack:dynamic-code-execution:dist/outbound-payload.test-harness-<hash>.js", 1],
   ["@openclaw/voice-call:dangerous-exec:dist/runtime-entry-<hash>.js", 1],
 ]);
+
+const CURRENT_OPTIONAL_REVIEWED_PACKED_FINDING_COUNTS = new Map(
+  FROZEN_RELEASE_2026_9_OPTIONAL_REVIEWED_PACKED_FINDING_COUNTS,
+);
+CURRENT_OPTIONAL_REVIEWED_PACKED_FINDING_COUNTS.set(
+  "@openclaw/codex:dangerous-exec:src/doctor.test.ts",
+  1,
+);
+
+// Freeze the shipped 9.4 inventory before reviewing fixtures added for 9.5.
+const RELEASE_2026_9_4_OPTIONAL_REVIEWED_PACKED_FINDING_COUNTS = new Map(
+  CURRENT_OPTIONAL_REVIEWED_PACKED_FINDING_COUNTS,
+);
+// The composition fixture runs the real shell bridge under its owned temporary
+// workspace to prove denied canonical destinations cannot receive mutations.
+CURRENT_OPTIONAL_REVIEWED_PACKED_FINDING_COUNTS.set(
+  "@openclaw/codex:dangerous-exec:src/app-server/sandbox-exec-server.fs-bridge-composition.test.ts",
+  1,
+);
+
+// The native catalog fixture launches the pinned app-server with a temporary home,
+// child-only environment, and denied outbound proxies; it always joins the child.
+CURRENT_OPTIONAL_REVIEWED_PACKED_FINDING_COUNTS.set(
+  "@openclaw/codex:dangerous-exec:src/session-catalog-native.test.ts",
+  1,
+);
+
+// Process-inspection fixtures added after 9.4 deliberately run bounded child commands.
+// Keep their exact reviewed counts out of the already-shipped inventories above.
+CURRENT_OPTIONAL_REVIEWED_PACKED_FINDING_COUNTS.set(
+  "@openclaw/codex:dangerous-exec:src/app-server/transport-process-snapshot.test.ts",
+  3,
+);
+CURRENT_OPTIONAL_REVIEWED_PACKED_FINDING_COUNTS.set(
+  "@openclaw/codex:dangerous-exec:src/app-server/transport-procfs.test-support.ts",
+  3,
+);
+CURRENT_OPTIONAL_REVIEWED_PACKED_FINDING_COUNTS.set(
+  "@openclaw/codex:dangerous-exec:src/app-server/test-support/transport-process-blocked-command.test-support.mjs",
+  2,
+);
+CURRENT_OPTIONAL_REVIEWED_PACKED_FINDING_COUNTS.set(
+  "@openclaw/codex:dangerous-exec:src/app-server/test-support/transport-process-starvation.test-support.mjs",
+  1,
+);
+// These packed test fixtures deliberately launch bounded child processes to
+// exercise the native session catalog, logbook CLI, and 1Password process
+// cleanup paths. Keep their exact counts reviewed without broadening runtime
+// source admission or any already-shipped release inventory.
+for (const [key, count] of [
+  ["@openclaw/codex:dangerous-exec:src/session-catalog-native.test.ts", 1],
+  ["@openclaw/logbook:dangerous-exec:src/analyze.test.ts", 1],
+  ["@openclaw/onepassword:dangerous-exec:src/secret-ref-resolver.test.ts", 4],
+] as const) {
+  CURRENT_OPTIONAL_REVIEWED_PACKED_FINDING_COUNTS.set(key, count);
+}
 
 const CURRENT_SECURITY_INVENTORY_POLICY: PluginSecurityInventoryPolicy = {
   layout: CURRENT_REVIEWED_RELEASE_LAYOUT,
@@ -195,6 +260,14 @@ const FROZEN_RELEASE_OPTIONAL_REVIEWED_PACKED_FINDING_COUNTS = new Map<string, n
   ["@openclaw/voice-call:dangerous-exec:dist/runtime-entry-<hash>.js", 1],
 ]);
 
+const FROZEN_EXTENDED_STABLE_2026_7_33_OPTIONAL_REVIEWED_PACKED_FINDING_COUNTS = new Map(
+  FROZEN_RELEASE_OPTIONAL_REVIEWED_PACKED_FINDING_COUNTS,
+);
+FROZEN_EXTENDED_STABLE_2026_7_33_OPTIONAL_REVIEWED_PACKED_FINDING_COUNTS.set(
+  "@openclaw/acpx:dangerous-exec:src/runtime-internals/mcp-proxy.test.ts",
+  3,
+);
+
 const FROZEN_EXTENDED_STABLE_2026_6_33_LAYOUT = {
   id: "extended-stable-2026.6.33",
   findings: new Map<string, number>([
@@ -203,20 +276,57 @@ const FROZEN_EXTENDED_STABLE_2026_6_33_LAYOUT = {
   ]),
 };
 
+const FROZEN_EXTENDED_STABLE_2026_7_33_LAYOUT = {
+  id: "extended-stable-2026.7.33",
+  findings: FROZEN_EXTENDED_STABLE_2026_6_33_LAYOUT.findings,
+};
+
 const FROZEN_RELEASE_SECURITY_INVENTORY_POLICIES = new Map<string, PluginSecurityInventoryPolicy>([
   [
     "release/2026.9.1",
     {
       ...CURRENT_SECURITY_INVENTORY_POLICY,
+      optionalPackedFindingCounts: FROZEN_RELEASE_2026_9_OPTIONAL_REVIEWED_PACKED_FINDING_COUNTS,
       requiredSourceFindingCounts: RELEASE_2026_9_1_REQUIRED_REVIEWED_SOURCE_FINDING_COUNTS,
     },
   ],
-  ["release/2026.9.2", CURRENT_SECURITY_INVENTORY_POLICY],
+  [
+    "release/2026.9.2",
+    {
+      ...CURRENT_SECURITY_INVENTORY_POLICY,
+      optionalPackedFindingCounts: FROZEN_RELEASE_2026_9_OPTIONAL_REVIEWED_PACKED_FINDING_COUNTS,
+      requiredSourceFindingCounts: RELEASE_2026_9_2_REQUIRED_REVIEWED_SOURCE_FINDING_COUNTS,
+    },
+  ],
+  [
+    "release/2026.9.3",
+    {
+      ...CURRENT_SECURITY_INVENTORY_POLICY,
+      optionalPackedFindingCounts: FROZEN_RELEASE_2026_9_OPTIONAL_REVIEWED_PACKED_FINDING_COUNTS,
+    },
+  ],
+  [
+    "release/2026.9.4",
+    {
+      ...CURRENT_SECURITY_INVENTORY_POLICY,
+      optionalPackedFindingCounts: RELEASE_2026_9_4_OPTIONAL_REVIEWED_PACKED_FINDING_COUNTS,
+    },
+  ],
+  ["release/2026.9.5", CURRENT_SECURITY_INVENTORY_POLICY],
   [
     "extended-stable/2026.6.33",
     {
       layout: FROZEN_EXTENDED_STABLE_2026_6_33_LAYOUT,
       optionalPackedFindingCounts: FROZEN_RELEASE_OPTIONAL_REVIEWED_PACKED_FINDING_COUNTS,
+      requiredSourceFindingCounts: FROZEN_RELEASE_REQUIRED_REVIEWED_SOURCE_FINDING_COUNTS,
+    },
+  ],
+  [
+    "extended-stable/2026.7.33",
+    {
+      layout: FROZEN_EXTENDED_STABLE_2026_7_33_LAYOUT,
+      optionalPackedFindingCounts:
+        FROZEN_EXTENDED_STABLE_2026_7_33_OPTIONAL_REVIEWED_PACKED_FINDING_COUNTS,
       requiredSourceFindingCounts: FROZEN_RELEASE_REQUIRED_REVIEWED_SOURCE_FINDING_COUNTS,
     },
   ],

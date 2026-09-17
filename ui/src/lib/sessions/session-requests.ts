@@ -1,4 +1,8 @@
-import type { SessionsDeleteResult } from "../../../../packages/gateway-protocol/src/index.js";
+import type {
+  SessionsDeleteResult,
+  SessionsPatchManyParams,
+  SessionsPatchManyResult,
+} from "../../../../packages/gateway-protocol/src/index.js";
 import { SESSION_ARCHIVE_REQUEST_OPTIONS } from "../../../../src/shared/session-archive-timeout.ts";
 import { SIDEBAR_SESSION_ROSTER_LIMIT } from "../../../../src/shared/session-list-limits.ts";
 import type {
@@ -32,6 +36,29 @@ import type {
 export const DEFAULT_SESSION_LIST_QUERY = {
   limit: SIDEBAR_SESSION_ROSTER_LIMIT,
 } as const satisfies SessionListOptions;
+
+export function dashboardSessionListQuery(agentId?: string | null): SessionListOptions {
+  const normalizedAgentId = agentId?.trim();
+  return {
+    ...DEFAULT_SESSION_LIST_QUERY,
+    hasBoard: true,
+    archivedFilter: "all",
+    ...(normalizedAgentId ? { agentId: normalizedAgentId } : {}),
+  };
+}
+
+/** Progress cards resolve an explicit cross-session target independently of
+ *  dashboard gallery membership: the Gateway filters hasBoard against each
+ *  session's own board inventory, so a running target without its own board
+ *  would disappear from a gallery-filtered roster and render as paused. */
+export function sessionProgressTargetQuery(agentId?: string | null): SessionListOptions {
+  const normalizedAgentId = agentId?.trim();
+  return {
+    ...DEFAULT_SESSION_LIST_QUERY,
+    archivedFilter: "all",
+    ...(normalizedAgentId ? { agentId: normalizedAgentId } : {}),
+  };
+}
 
 /** Starting page size for the Sessions page's explicit, user-editable limit
  *  field, kept separate from the roster page so tuning one never moves the other. */
@@ -185,6 +212,19 @@ export function requestSessionPatch(
   return patch.archived === true
     ? client.request<SessionsPatchResult>("sessions.patch", params, SESSION_ARCHIVE_REQUEST_OPTIONS)
     : client.request<SessionsPatchResult>("sessions.patch", params);
+}
+
+export function requestSessionPatchMany(
+  client: SessionRequestClient,
+  params: SessionsPatchManyParams,
+): Promise<SessionsPatchManyResult> {
+  return params.patch.archived === true
+    ? client.request<SessionsPatchManyResult>(
+        "sessions.patchMany",
+        params,
+        SESSION_ARCHIVE_REQUEST_OPTIONS,
+      )
+    : client.request<SessionsPatchManyResult>("sessions.patchMany", params);
 }
 
 export function requestSessionDelete(

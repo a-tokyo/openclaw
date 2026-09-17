@@ -55,13 +55,44 @@ import type {
   GatewaySessionStoreCache,
   GatewaySessionStoreDiscoveryCache,
 } from "./session-utils-store-lookup.js";
-import { prepareTalkSessionTarget, assertTalkSessionStorageTarget } from "./talk-session-target.js";
-import type { PreparedTalkSessionTarget } from "./talk-session-target.types.js";
+import { prepareTalkSessionTarget, assertTalkSessionStorageTarget } from "./talk/session-target.js";
+import type { PreparedTalkSessionTarget } from "./talk/session-target.types.js";
 
 type AuthorizedSessionMutationTarget = SessionMutationTarget & {
   resolved: Omit<SessionSharingTarget, "entry" | "storeKeys"> | null;
   sessionId: string | null;
+  lifecycleRevision?: string;
 };
+
+type ExpectedSessionMutationTarget = Readonly<{
+  agentId: string;
+  sessionKey: string;
+  storePath: string;
+  sessionId: string;
+}>;
+
+function sessionMutationTargetChanged(method: string, sessionKey: string) {
+  return new SessionMutationAuthorizationChangedError(
+    errorShape(ErrorCodes.INVALID_REQUEST, `session changed before ${method}; retry the request`, {
+      details: { code: "SESSION_MUTATION_AUTHORIZATION_CHANGED", method, sessionKey },
+    }),
+  );
+}
+
+function expectedSessionMutationTargetError(
+  expected: ExpectedSessionMutationTarget | undefined,
+  target: SessionSharingTarget | null,
+  method: string,
+): ErrorShape | null {
+  return expected &&
+    (!target ||
+      target.agentId !== expected.agentId ||
+      target.canonicalKey !== expected.sessionKey ||
+      target.storePath !== expected.storePath ||
+      target.entry.sessionId?.trim() !== expected.sessionId)
+    ? sessionMutationTargetChanged(method, expected.sessionKey).error
+    : null;
+}
 
 const AGENT_RUN_START_METHODS = new Set([
   "agent",
@@ -109,6 +140,8 @@ export function resolveSessionMutationAuthorization(params: {
   method: string;
   requestParams: unknown;
   context: GatewayRequestContext;
+  /** Trusted prepared identity; never adopt a later target while capturing authority. */
+  expectedTarget?: ExpectedSessionMutationTarget;
 }): { authorization?: SessionMutationAuthorization; error: ErrorShape | null } {
   const authorizesAgentRun =
     AGENT_RUN_START_METHODS.has(params.method) ||
@@ -117,10 +150,15 @@ export function resolveSessionMutationAuthorization(params: {
       params.requestParams !== null &&
       "action" in params.requestParams &&
       params.requestParams.action === "resume");
-  if (isGatewayAdmin(params.client) && !authorizesAgentRun) {
+  // Progress belongs to the current conversation, not merely its stable session ID.
+  // Capture this boundary for admins too so delayed writes cannot revive a reset card.
+  const bindsProgressLifecycle = params.method === "progressCard.put";
+  const adminBypass = isGatewayAdmin(params.client) && !authorizesAgentRun;
+  if (adminBypass && !bindsProgressLifecycle && !params.expectedTarget) {
     return { error: null };
   }
   if (
+    !adminBypass &&
     isGatewayClientProfilePending(params.client) &&
     isSessionProfileDependentMethod(params.method)
   ) {
@@ -141,6 +179,7 @@ export function resolveSessionMutationAuthorization(params: {
   let lookupCaches: ReturnType<typeof createLookupCaches> | undefined;
   const resolveAuthorizedTarget = (
     targetRef: SessionMutationTarget,
+    targetCount: number,
   ): { target: SessionSharingTarget | null } | { error: ErrorShape } => {
     try {
       return {
@@ -149,6 +188,7 @@ export function resolveSessionMutationAuthorization(params: {
           sessionKey: targetRef.sessionKey,
           agentId: targetRef.agentId,
           ...(lookupCaches ??= createLookupCaches()),
+          exactRead: targetCount === 1,
         }),
       };
     } catch (error) {
@@ -188,6 +228,7 @@ export function resolveSessionMutationAuthorization(params: {
   const directTargets =
     talkTargets ?? resolveDirectSessionTargets(params.method, params.requestParams);
   const hidesForeignSessions =
+    !adminBypass &&
     directTargets.length > 0 &&
     gatewayClientSessionCreator(params.client) &&
     operatorSessionCap(params.client, getCfg()) === "none";
@@ -197,7 +238,7 @@ export function resolveSessionMutationAuthorization(params: {
     : (talkTargets?.filter((target) => isIncognitoSessionKey(target.sessionKey)) ??
       resolveDirectIncognitoTargets(params.method, params.requestParams));
   for (const targetRef of protectedTargets) {
-    const resolved = resolveAuthorizedTarget(targetRef);
+    const resolved = resolveAuthorizedTarget(targetRef, protectedTargets.length);
     if ("error" in resolved) {
       return { error: resolved.error };
     }
@@ -229,6 +270,11 @@ export function resolveSessionMutationAuthorization(params: {
       context: params.context,
       getCfg,
     });
+  if (params.expectedTarget && targetRefs?.length !== 1) {
+    return {
+      error: sessionMutationTargetChanged(params.method, params.expectedTarget.sessionKey).error,
+    };
+  }
   if (!targetRefs) {
     if (isRequiredSessionTargetMethod(params.method)) {
       return {
@@ -251,12 +297,13 @@ export function resolveSessionMutationAuthorization(params: {
   }
   const authorizedTargets: AuthorizedSessionMutationTarget[] = [];
   for (const targetRef of targetRefs) {
-    const resolved = resolveAuthorizedTarget(targetRef);
+    const resolved = resolveAuthorizedTarget(targetRef, targetRefs.length);
     if ("error" in resolved) {
       return { error: resolved.error };
     }
     const target = resolved.target;
     const error =
+      expectedSessionMutationTargetError(params.expectedTarget, target, params.method) ??
       (target && authorizesAgentRun
         ? authorizeSessionAgentRun({
             cfg: getCfg(),
@@ -290,25 +337,14 @@ export function resolveSessionMutationAuthorization(params: {
           }
         : null,
       sessionId: target?.entry.sessionId?.trim() || null,
+      ...(bindsProgressLifecycle ? { lifecycleRevision: target?.entry.lifecycleRevision } : {}),
     });
   }
   return {
     error: null,
     authorization: (() => {
       const targetChanged = (sessionKey: string) =>
-        new SessionMutationAuthorizationChangedError(
-          errorShape(
-            ErrorCodes.INVALID_REQUEST,
-            `session changed before ${params.method}; retry the request`,
-            {
-              details: {
-                code: "SESSION_MUTATION_AUTHORIZATION_CHANGED",
-                method: params.method,
-                sessionKey,
-              },
-            },
-          ),
-        );
+        sessionMutationTargetChanged(params.method, sessionKey);
       const assertTalkTargetCurrent = (cfg: OpenClawConfig) => {
         if (!talkInput || !talkSessionTarget) {
           return;
@@ -354,6 +390,7 @@ export function resolveSessionMutationAuthorization(params: {
           sessionKey: targetRef.sessionKey,
           agentId: targetRef.agentId,
           ...currentLookupCaches,
+          exactRead: !currentLookupCaches || authorizedTargets.length === 1,
         });
         // The guarded ensure may mint this row/id. Its result permits only that
         // materialization, never a replacement of an already admitted session.
@@ -381,7 +418,9 @@ export function resolveSessionMutationAuthorization(params: {
               current.canonicalKey === expectedResolved.canonicalKey &&
               current.storeKey === expectedResolved.storeKey &&
               current.storePath === expectedResolved.storePath &&
-              (current.entry.sessionId?.trim() || null) === expectedSessionId);
+              (current.entry.sessionId?.trim() || null) === expectedSessionId &&
+              (!bindsProgressLifecycle ||
+                current.entry.lifecycleRevision === expected.lifecycleRevision));
         if (!sameResolvedTarget) {
           throw targetChanged(targetRef.sessionKey);
         }
@@ -495,6 +534,7 @@ export function canReceiveSessionEvent(params: {
   const lookup: Omit<Parameters<typeof resolveSessionSharingTarget>[0], "sessionKey"> = {
     cfg,
     agentId: params.agentId,
+    exactRead: sessionKeys.length === 1,
     storeCache: new Map(),
     targetDiscoveryCache: new Map(),
   };

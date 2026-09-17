@@ -2,6 +2,10 @@
 import { asSafeIntegerInRange } from "@openclaw/normalization-core/number-coercion";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
+import type {
+  PluginCatalogEntry,
+  PluginsListResult,
+} from "../../packages/gateway-protocol/src/schema/plugins.js";
 import { MANIFEST_KEY } from "../compat/legacy-names.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type { PluginInstallRecord } from "../config/types.plugins.js";
@@ -22,9 +26,9 @@ import {
   resolveOfficialExternalPluginId,
   resolveOfficialExternalPluginInstall,
   resolveOfficialExternalPluginInstallSources,
-  type HostedOfficialExternalPluginCatalogLoadResult,
   type OfficialExternalPluginCatalogEntry,
 } from "./official-external-plugin-catalog.js";
+import type { OfficialCatalogResult } from "./official-external-plugin-catalog.types.js";
 import {
   getPluginCache,
   getPluginMetadataSnapshotCache,
@@ -34,41 +38,42 @@ import {
 } from "./plugin-cache.js";
 import type { PluginMetadataSnapshot } from "./plugin-metadata-snapshot.js";
 
-export type ManagedPluginCatalogEntry = {
-  id: string;
-  name: string;
-  packageName?: string;
-  description?: string;
-  version?: string;
-  kind?: string[];
-  origin?: string;
-  installed: boolean;
-  enabled: boolean;
-  state: "enabled" | "disabled" | "not-installed" | "error";
-  featured?: boolean;
-  featuredAt?: number;
-  order?: number;
-  hasIcon?: boolean;
-  install?: { source: "clawhub"; packageName: string } | { source: "official"; pluginId: string };
-  error?: string;
-  category?: string;
-  removable?: boolean;
-};
+export type ManagedPluginCatalogEntry = PluginCatalogEntry;
+export type ManagedPluginCatalog = PluginsListResult;
 
-export type ManagedPluginCatalog = {
-  plugins: ManagedPluginCatalogEntry[];
-  diagnostics: unknown[];
-  mutationAllowed: boolean;
-};
+export type ManagedPluginIconSource = { kind: "file"; path: string; rootPath: string };
 
-export type OfficialCatalogResult = Pick<
-  HostedOfficialExternalPluginCatalogLoadResult,
-  "entries"
-> & {
-  error?: string;
-  hostedFeaturedAuthoritative?: boolean;
-};
+export function resolvePluginIconSource(params: {
+  metadata: PluginMetadataSnapshot;
+  pluginId: string;
+}): ManagedPluginIconSource | undefined {
+  const normalizedPluginId = params.metadata.normalizePluginId(params.pluginId);
+  const manifest = params.metadata.byPluginId.get(normalizedPluginId);
+  const localIconPath = normalizeOptionalString(manifest?.iconPath);
+  if (localIconPath && manifest) {
+    return { kind: "file", path: localIconPath, rootPath: manifest.rootDir };
+  }
+  return undefined;
+}
 
+export function resolvePluginActivityIconSource(params: {
+  metadata: PluginMetadataSnapshot;
+  pluginId: string;
+  toolName?: string;
+}): ManagedPluginIconSource | undefined {
+  const pluginId = params.metadata.normalizePluginId(params.pluginId);
+  const manifest = params.metadata.byPluginId.get(pluginId);
+  if (!manifest) {
+    return undefined;
+  }
+  const overrides = manifest.toolActivityIconPaths;
+  const override =
+    params.toolName && overrides && Object.hasOwn(overrides, params.toolName)
+      ? overrides[params.toolName]
+      : undefined;
+  const iconPath = override ?? manifest.activityIconPath;
+  return iconPath ? { kind: "file", path: iconPath, rootPath: manifest.rootDir } : undefined;
+}
 export function getManagedPluginCache(metadata?: PluginMetadataSnapshot) {
   if (metadata) {
     return getPluginMetadataSnapshotCache(metadata);
@@ -91,9 +96,11 @@ export function withManagedPluginCache<
   return (params) => withPluginCache(getManagedPluginCache(params.metadata), () => run(params));
 }
 
-/** Clear the process-stable hosted catalog snapshot after an explicit owner reload. */
-export function clearManagedPluginOfficialCatalogCache(): void {
-  getManagedPluginCache().officialCatalog = undefined;
+/** Clear process-stable catalog snapshots after an explicit owner reload. */
+export function clearManagedPluginCatalogCache(): void {
+  const cache = getManagedPluginCache();
+  cache.officialCatalog = undefined;
+  cache.pluginVersionCategories = undefined;
 }
 
 function mergeCatalogMetadata(
@@ -168,12 +175,10 @@ export function prepareCatalogEntries(entries: readonly OfficialExternalPluginCa
  */
 function overlayBundledOfficialPluginCatalogMetadata(
   entries: readonly OfficialExternalPluginCatalogEntry[],
-  bundledEntries: readonly OfficialExternalPluginCatalogEntry[] = listOfficialExternalPluginCatalogEntries(),
-  options: { hostedFeaturedAuthoritative: boolean } = {
-    hostedFeaturedAuthoritative: false,
-  },
+  options: { hostedFeaturedAuthoritative: boolean },
 ): OfficialExternalPluginCatalogEntry[] {
-  const bundledFacts = entries.length > 0 ? bundledEntries.map(prepareCatalogEntry) : [];
+  const bundledFacts =
+    entries.length > 0 ? listOfficialExternalPluginCatalogEntries().map(prepareCatalogEntry) : [];
   return entries.map((entry) => {
     const { clawhub, npmPackage } = prepareCatalogEntry(entry);
     const matches = bundledFacts.filter(
@@ -208,9 +213,17 @@ function overlayBundledOfficialPluginCatalogMetadata(
 export async function loadOfficialCatalog(): Promise<OfficialCatalogResult> {
   const cache = getManagedPluginCache();
   if (!cache.officialCatalog) {
-    const promise = Promise.resolve().then(() =>
-      loadConfiguredHostedOfficialExternalPluginCatalogEntries(),
-    );
+    const promise = loadConfiguredHostedOfficialExternalPluginCatalogEntries().then((result) => {
+      const hostedFeaturedAuthoritative =
+        result.source === "hosted" || result.source === "hosted-snapshot";
+      return {
+        entries: overlayBundledOfficialPluginCatalogMetadata(result.entries, {
+          hostedFeaturedAuthoritative,
+        }),
+        hostedFeaturedAuthoritative,
+        ...("error" in result ? { error: result.error } : {}),
+      };
+    });
     cache.officialCatalog = promise;
     void promise.catch(() => {
       if (cache.officialCatalog === promise) {
@@ -218,16 +231,7 @@ export async function loadOfficialCatalog(): Promise<OfficialCatalogResult> {
       }
     });
   }
-  const result = await cache.officialCatalog;
-  const hostedFeaturedAuthoritative =
-    result.source === "hosted" || result.source === "hosted-snapshot";
-  return {
-    entries: overlayBundledOfficialPluginCatalogMetadata(result.entries, undefined, {
-      hostedFeaturedAuthoritative,
-    }),
-    hostedFeaturedAuthoritative,
-    ...("error" in result ? { error: result.error } : {}),
-  };
+  return cache.officialCatalog;
 }
 
 export function normalizeKinds(kind: string | readonly string[] | undefined): string[] | undefined {
@@ -258,8 +262,8 @@ export function normalizeFeaturedAt(value: unknown): number | undefined {
   return asSafeIntegerInRange(value, { min: 0 });
 }
 
-/** Coarse manifest-derived grouping so catalog UIs can shelve a large inventory. */
-export function derivePluginCategory(
+/** Preserve the shipped coarse category projection for older catalog clients. */
+export function deriveLegacyPluginCategory(
   manifest: PluginManifestRecord | undefined,
 ): string | undefined {
   if (!manifest) {

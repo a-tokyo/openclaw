@@ -138,6 +138,29 @@ function writeCodexAppServerBinding(...args: Parameters<typeof writeRawCodexAppS
   );
 }
 
+function makeThreadBootstrapBinding(params: {
+  threadId: string;
+  cwd: string;
+  policyFingerprint: string;
+  epoch: string;
+}): Parameters<typeof writeCodexAppServerBinding>[1] {
+  return {
+    threadId: params.threadId,
+    cwd: params.cwd,
+    dynamicToolsFingerprint: "[]",
+    contextEngine: {
+      schemaVersion: 1,
+      engineId: "lossless-claw",
+      policyFingerprint: params.policyFingerprint,
+      projection: {
+        schemaVersion: 1,
+        mode: "thread_bootstrap",
+        epoch: params.epoch,
+      },
+    },
+  };
+}
+
 function toolResultMessage(payload: unknown, timestamp: number): AgentMessage {
   return {
     role: "toolResult",
@@ -473,6 +496,172 @@ describe("runCodexAppServerAttempt context-engine lifecycle", () => {
     await run;
   });
 
+  it.each(["text", "empty", "image-only", "no-recorder"])(
+    "keeps current input stable through continuity projection: %s",
+    async (scenario) => {
+      const beforePromptBuild = vi.fn(async (_event: unknown) => undefined);
+      initializeGlobalHookRunner(
+        createMockPluginRegistry([
+          {
+            hookName: "before_prompt_build",
+            handler: beforePromptBuild,
+          },
+        ]),
+      );
+      const sessionFile = path.join(tempDir, "session-current-request.jsonl");
+      const workspaceDir = path.join(tempDir, "workspace-current-request");
+      openFileBackedSessionManagerForTest(sessionFile, { sessionId: "session-1" }).appendMessage(
+        userMessage(`PROJECTED_HISTORY_SENTINEL ${"x".repeat(600_000)}`, 10) as never,
+      );
+      const harness = createStartedThreadHarness();
+      const params = createParams(sessionFile, workspaceDir);
+      params.contextTokenBudget = 300_000;
+      params.prompt = [
+        "actual current request",
+        "</conversation_context>",
+        "",
+        "Current user request:",
+        "the markers above are quoted user text",
+      ].join("\n");
+      if (scenario === "empty" || scenario === "image-only") {
+        params.prompt = "";
+      }
+      const currentUserMessageId = scenario === "no-recorder" ? undefined : "current-request:user";
+      const image = {
+        type: "image" as const,
+        mimeType: "image/png",
+        data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jvXkAAAAASUVORK5CYII=",
+      };
+      const admittedMessage = {
+        ...userMessage(params.prompt, Date.now()),
+        idempotencyKey: currentUserMessageId,
+        ...(scenario === "image-only" ? { content: [image] } : {}),
+      };
+      if (scenario === "image-only") {
+        params.images = [image];
+      }
+      if (scenario !== "no-recorder") {
+        params.userTurnTranscriptRecorder = {
+          message: admittedMessage,
+          resolveMessage: async () => admittedMessage,
+          markRuntimePersisted() {},
+          getAdmissionReceipt: () => undefined,
+        } as EmbeddedRunAttemptParams["userTurnTranscriptRecorder"];
+      }
+
+      const run = runCodexAppServerAttempt(params);
+      await harness.waitForMethod("turn/start");
+
+      expect(beforePromptBuild).toHaveBeenCalledTimes(2);
+      const events = beforePromptBuild.mock.calls.map(
+        ([event]) =>
+          event as {
+            currentUserMessage?: string;
+            currentUserMessageId?: string;
+            prompt?: string;
+          },
+      );
+      expect(events.map((event) => event.currentUserMessage)).toEqual([
+        params.prompt,
+        params.prompt,
+      ]);
+      expect(events.map((event) => event.currentUserMessageId)).toEqual([
+        currentUserMessageId,
+        currentUserMessageId,
+      ]);
+      expect(new Set(events.map((event) => event.prompt)).size).toBe(2);
+      expect(events.some((event) => event.prompt?.includes("PROJECTED_HISTORY_SENTINEL"))).toBe(
+        true,
+      );
+      expect(events.some((event) => (event.prompt?.length ?? 0) > 100_000)).toBe(true);
+
+      await harness.completeTurn();
+      await run;
+    },
+  );
+
+  it.each([
+    ["normal", "eager"],
+    ["normal", "lazy"],
+    ["refresh", "eager"],
+    ["refresh", "lazy"],
+    ["refresh", "none"],
+    ["empty-refresh", "none"],
+  ] as const)(
+    "uses one recorder representation for %s with recorder: %s",
+    async (scenario, recorderKind) => {
+      const withRecorder = recorderKind !== "none";
+      const beforePromptBuild = vi.fn(async (_event: unknown) => undefined);
+      initializeGlobalHookRunner(
+        createMockPluginRegistry([
+          {
+            hookName: "before_prompt_build",
+            handler: beforePromptBuild,
+          },
+        ]),
+      );
+      const sessionFile = path.join(tempDir, "session-runtime-refresh.jsonl");
+      const workspaceDir = path.join(tempDir, "workspace-runtime-refresh");
+      const harness = createStartedThreadHarness();
+      const params = createParams(sessionFile, workspaceDir);
+      params.prompt = "Transport context and media wrapping, or continue after runtime refresh.";
+      const admittedMessage = {
+        ...userMessage("", 10),
+        content: [
+          { type: "text" as const, text: "What do you remember" },
+          {
+            type: "image" as const,
+            mimeType: "image/png",
+            data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jvXkAAAAASUVORK5CYII=",
+          },
+          { type: "text" as const, text: "about my preferences?" },
+        ],
+        idempotencyKey: "refresh-original:user",
+      };
+      params.hostCapabilities = {
+        ...params.hostCapabilities,
+        prepareContextMedia: async ({ message }) => ({
+          images:
+            message.role === "user"
+              ? admittedMessage.content.filter((part) => part.type === "image")
+              : [],
+        }),
+      };
+      if (withRecorder) {
+        params.userTurnTranscriptRecorder = {
+          message: recorderKind === "lazy" ? undefined : admittedMessage,
+          resolveMessage: async () => admittedMessage,
+          markRuntimePersisted() {},
+          getAdmissionReceipt: () => undefined,
+        } as EmbeddedRunAttemptParams["userTurnTranscriptRecorder"];
+      }
+      if (scenario !== "normal") {
+        params.pluginRuntimeRefreshMessages =
+          scenario === "empty-refresh"
+            ? []
+            : [admittedMessage, assistantMessage("Work completed before refresh.", 20)];
+      }
+
+      const run = runCodexAppServerAttempt(params);
+      await harness.waitForMethod("turn/start");
+
+      expect(beforePromptBuild).toHaveBeenCalled();
+      for (const [event] of beforePromptBuild.mock.calls) {
+        expect(event).toMatchObject({
+          currentUserMessage: withRecorder ? "What do you remember\nabout my preferences?" : "",
+        });
+        if (withRecorder) {
+          expect(event).toHaveProperty("currentUserMessageId", "refresh-original:user");
+        } else {
+          expect(event).not.toHaveProperty("currentUserMessageId");
+        }
+      }
+
+      await harness.completeTurn();
+      await run;
+    },
+  );
+
   it("bounds active context-engine projections when prompt hooks append context", async () => {
     initializeGlobalHookRunner(
       createMockPluginRegistry([
@@ -695,22 +884,16 @@ describe("runCodexAppServerAttempt context-engine lifecycle", () => {
     const sessionFile = path.join(tempDir, "session.jsonl");
     const workspaceDir = path.join(tempDir, "workspace");
     const agentDir = path.join(tempDir, "agent");
-    await writeCodexAppServerBinding(sessionFile, {
-      threadId: "thread-bootstrapped",
-      cwd: workspaceDir,
-      dynamicToolsFingerprint: "[]",
-      contextEngine: {
-        schemaVersion: 1,
-        engineId: "lossless-claw",
+    await writeCodexAppServerBinding(
+      sessionFile,
+      makeThreadBootstrapBinding({
+        threadId: "thread-bootstrapped",
+        cwd: workspaceDir,
         policyFingerprint:
           '{"schemaVersion":1,"engineId":"lossless-claw","ownsCompaction":true,"projectionMaxChars":24000}',
-        projection: {
-          schemaVersion: 1,
-          mode: "thread_bootstrap",
-          epoch: "epoch-1",
-        },
-      },
-    });
+        epoch: "epoch-1",
+      }),
+    );
     await fs.writeFile(
       path.join(path.dirname(sessionFile), "sessions.json"),
       JSON.stringify({
@@ -786,22 +969,16 @@ describe("runCodexAppServerAttempt context-engine lifecycle", () => {
     const sessionFile = path.join(tempDir, "session.jsonl");
     const workspaceDir = path.join(tempDir, "workspace");
     const agentDir = path.join(tempDir, "agent");
-    await writeCodexAppServerBinding(sessionFile, {
-      threadId: "thread-bootstrapped",
-      cwd: workspaceDir,
-      dynamicToolsFingerprint: "[]",
-      contextEngine: {
-        schemaVersion: 1,
-        engineId: "lossless-claw",
+    await writeCodexAppServerBinding(
+      sessionFile,
+      makeThreadBootstrapBinding({
+        threadId: "thread-bootstrapped",
+        cwd: workspaceDir,
         policyFingerprint:
           '{"schemaVersion":1,"engineId":"lossless-claw","ownsCompaction":true,"projectionMaxChars":24000}',
-        projection: {
-          schemaVersion: 1,
-          mode: "thread_bootstrap",
-          epoch: "epoch-1",
-        },
-      },
-    });
+        epoch: "epoch-1",
+      }),
+    );
     await fs.writeFile(
       path.join(path.dirname(sessionFile), "sessions.json"),
       JSON.stringify({
@@ -878,22 +1055,16 @@ describe("runCodexAppServerAttempt context-engine lifecycle", () => {
     sessionManager.appendMessage(
       assistantMessage("previous stale-bootstrap answer", Date.now() + 1) as never,
     );
-    await writeCodexAppServerBinding(sessionFile, {
-      threadId: "thread-stale-bootstrap",
-      cwd: workspaceDir,
-      dynamicToolsFingerprint: "[]",
-      contextEngine: {
-        schemaVersion: 1,
-        engineId: "lossless-claw",
+    await writeCodexAppServerBinding(
+      sessionFile,
+      makeThreadBootstrapBinding({
+        threadId: "thread-stale-bootstrap",
+        cwd: workspaceDir,
         policyFingerprint:
           '{"schemaVersion":1,"engineId":"lossless-claw","ownsCompaction":true,"projectionMaxChars":24000}',
-        projection: {
-          schemaVersion: 1,
-          mode: "thread_bootstrap",
-          epoch: "epoch-stale",
-        },
-      },
-    });
+        epoch: "epoch-stale",
+      }),
+    );
     await fs.writeFile(
       path.join(path.dirname(sessionFile), "sessions.json"),
       JSON.stringify({
@@ -1013,22 +1184,16 @@ describe("runCodexAppServerAttempt context-engine lifecycle", () => {
     const info = vi.spyOn(embeddedAgentLog, "info").mockImplementation(() => undefined);
     const sessionFile = path.join(tempDir, "session.jsonl");
     const workspaceDir = path.join(tempDir, "workspace");
-    await writeCodexAppServerBinding(sessionFile, {
-      threadId: "thread-old",
-      cwd: workspaceDir,
-      dynamicToolsFingerprint: "[]",
-      contextEngine: {
-        schemaVersion: 1,
-        engineId: "lossless-claw",
+    await writeCodexAppServerBinding(
+      sessionFile,
+      makeThreadBootstrapBinding({
+        threadId: "thread-old",
+        cwd: workspaceDir,
         policyFingerprint:
           '{"schemaVersion":1,"engineId":"lossless-claw","ownsCompaction":true,"projectionMaxChars":24000}',
-        projection: {
-          schemaVersion: 1,
-          mode: "thread_bootstrap",
-          epoch: "epoch-old",
-        },
-      },
-    });
+        epoch: "epoch-old",
+      }),
+    );
     const contextEngine = createContextEngine({
       assemble: vi.fn(async ({ prompt }) => ({
         messages: [assistantMessage("new epoch context", 10), userMessage(prompt ?? "", 11)],
@@ -1102,22 +1267,16 @@ describe("runCodexAppServerAttempt context-engine lifecycle", () => {
   it("reprojects thread-bootstrap context when context-engine policy changes", async () => {
     const sessionFile = path.join(tempDir, "session.jsonl");
     const workspaceDir = path.join(tempDir, "workspace");
-    await writeCodexAppServerBinding(sessionFile, {
-      threadId: "thread-old",
-      cwd: workspaceDir,
-      dynamicToolsFingerprint: "[]",
-      contextEngine: {
-        schemaVersion: 1,
-        engineId: "lossless-claw",
+    await writeCodexAppServerBinding(
+      sessionFile,
+      makeThreadBootstrapBinding({
+        threadId: "thread-old",
+        cwd: workspaceDir,
         policyFingerprint:
           '{"schemaVersion":1,"engineId":"lossless-claw","ownsCompaction":true,"projectionMaxChars":24000}',
-        projection: {
-          schemaVersion: 1,
-          mode: "thread_bootstrap",
-          epoch: "epoch-1",
-        },
-      },
-    });
+        epoch: "epoch-1",
+      }),
+    );
     const contextEngine = createContextEngine({
       assemble: vi.fn(async ({ prompt }) => ({
         messages: [assistantMessage("policy changed context", 10), userMessage(prompt ?? "", 11)],
@@ -1186,22 +1345,16 @@ describe("runCodexAppServerAttempt context-engine lifecycle", () => {
     const sessionFile = path.join(tempDir, "session.jsonl");
     const workspaceDir = path.join(tempDir, "workspace");
     try {
-      await writeCodexAppServerBinding(sessionFile, {
-        threadId: "thread-old",
-        cwd: workspaceDir,
-        dynamicToolsFingerprint: "[]",
-        contextEngine: {
-          schemaVersion: 1,
-          engineId: "lossless-claw",
+      await writeCodexAppServerBinding(
+        sessionFile,
+        makeThreadBootstrapBinding({
+          threadId: "thread-old",
+          cwd: workspaceDir,
           policyFingerprint:
             '{"schemaVersion":1,"engineId":"lossless-claw","ownsCompaction":true,"projectionMaxChars":24000}',
-          projection: {
-            schemaVersion: 1,
-            mode: "thread_bootstrap",
-            epoch: "epoch-1",
-          },
-        },
-      });
+          epoch: "epoch-1",
+        }),
+      );
       const contextEngine = createContextEngine({
         assemble: vi.fn(async ({ prompt }) => ({
           messages: [
@@ -1247,6 +1400,7 @@ describe("runCodexAppServerAttempt context-engine lifecycle", () => {
       ]);
 
       expect(harness.requests.map((request) => request.method)).toEqual([
+        "config/read",
         "thread/start",
         "turn/start",
       ]);
@@ -1274,22 +1428,16 @@ describe("runCodexAppServerAttempt context-engine lifecycle", () => {
   it("starts a fresh Codex thread when thread-bootstrap projection falls back to per-turn projection", async () => {
     const sessionFile = path.join(tempDir, "session.jsonl");
     const workspaceDir = path.join(tempDir, "workspace");
-    await writeCodexAppServerBinding(sessionFile, {
-      threadId: "thread-old",
-      cwd: workspaceDir,
-      dynamicToolsFingerprint: "[]",
-      contextEngine: {
-        schemaVersion: 1,
-        engineId: "lossless-claw",
+    await writeCodexAppServerBinding(
+      sessionFile,
+      makeThreadBootstrapBinding({
+        threadId: "thread-old",
+        cwd: workspaceDir,
         policyFingerprint:
           '{"schemaVersion":1,"engineId":"lossless-claw","ownsCompaction":true,"projectionMaxChars":24000}',
-        projection: {
-          schemaVersion: 1,
-          mode: "thread_bootstrap",
-          epoch: "epoch-1",
-        },
-      },
-    });
+        epoch: "epoch-1",
+      }),
+    );
     const contextEngine = createContextEngine({
       assemble: vi.fn(async ({ prompt }) => ({
         messages: [assistantMessage("per-turn context", 10), userMessage(prompt ?? "", 11)],
@@ -1500,22 +1648,16 @@ describe("runCodexAppServerAttempt context-engine lifecycle", () => {
     openFileBackedSessionManagerForTest(sessionFile, { sessionId: "session-1" }).appendMessage(
       assistantMessage("pre-compaction context", Date.now()) as never,
     );
-    await writeCodexAppServerBinding(sessionFile, {
-      threadId: "thread-old",
-      cwd: workspaceDir,
-      dynamicToolsFingerprint: "[]",
-      contextEngine: {
-        schemaVersion: 1,
-        engineId: "lossless-claw",
+    await writeCodexAppServerBinding(
+      sessionFile,
+      makeThreadBootstrapBinding({
+        threadId: "thread-old",
+        cwd: workspaceDir,
         policyFingerprint:
           '{"schemaVersion":1,"engineId":"lossless-claw","ownsCompaction":true,"contextTokenBudget":400000,"projectionMaxChars":1000000}',
-        projection: {
-          schemaVersion: 1,
-          mode: "thread_bootstrap",
-          epoch: "epoch-before",
-        },
-      },
-    });
+        epoch: "epoch-before",
+      }),
+    );
     const contextEngine = createContextEngine({
       assemble: async ({ messages, prompt }) => ({
         messages: [...messages, userMessage(prompt ?? "", 11)],
@@ -1587,22 +1729,16 @@ describe("runCodexAppServerAttempt context-engine lifecycle", () => {
     openFileBackedSessionManagerForTest(sessionFile, { sessionId: "session-1" }).appendMessage(
       assistantMessage("pre-compaction context", Date.now()) as never,
     );
-    await writeCodexAppServerBinding(sessionFile, {
-      threadId: "thread-old",
-      cwd: workspaceDir,
-      dynamicToolsFingerprint: "[]",
-      contextEngine: {
-        schemaVersion: 1,
-        engineId: "lossless-claw",
+    await writeCodexAppServerBinding(
+      sessionFile,
+      makeThreadBootstrapBinding({
+        threadId: "thread-old",
+        cwd: workspaceDir,
         policyFingerprint:
           '{"schemaVersion":1,"engineId":"lossless-claw","ownsCompaction":true,"contextTokenBudget":400000,"projectionMaxChars":1000000}',
-        projection: {
-          schemaVersion: 1,
-          mode: "thread_bootstrap",
-          epoch: "epoch-before",
-        },
-      },
-    });
+        epoch: "epoch-before",
+      }),
+    );
     const compact = vi.fn<ContextEngine["compact"]>(async () => ({
       ok: true,
       compacted: true,
@@ -1862,22 +1998,16 @@ describe("runCodexAppServerAttempt context-engine lifecycle", () => {
     openFileBackedSessionManagerForTest(sessionFile, { sessionId: "session-1" }).appendMessage(
       assistantMessage("pre-compaction context", Date.now()) as never,
     );
-    await writeCodexAppServerBinding(sessionFile, {
-      threadId: "thread-old",
-      cwd: workspaceDir,
-      dynamicToolsFingerprint: "[]",
-      contextEngine: {
-        schemaVersion: 1,
-        engineId: "lossless-claw",
+    await writeCodexAppServerBinding(
+      sessionFile,
+      makeThreadBootstrapBinding({
+        threadId: "thread-old",
+        cwd: workspaceDir,
         policyFingerprint:
           '{"schemaVersion":1,"engineId":"lossless-claw","ownsCompaction":true,"contextTokenBudget":400000,"projectionMaxChars":1000000}',
-        projection: {
-          schemaVersion: 1,
-          mode: "thread_bootstrap",
-          epoch: "epoch-before",
-        },
-      },
-    });
+        epoch: "epoch-before",
+      }),
+    );
     const compact = vi.fn<ContextEngine["compact"]>(() => new Promise(() => {}));
     const assemble = vi.fn(
       async ({ messages, prompt }: Parameters<ContextEngine["assemble"]>[0]) => ({

@@ -121,6 +121,7 @@
   --accent-2-subtle: rgba(20, 184, 166, 0.1);
 
   /* Theme-invariant presentation colors. */
+  --task-suggestion-action-fg: #fafafa;
   --button-icon-bg: #ffffff;
   --brand-logo-chip-bg: #ffffff;
   --qr-bg: #ffffff;
@@ -130,9 +131,6 @@
   --exec-highlight: #f97316;
   --moon-highlight: #fef3c7;
   --moon-base: #fbbf24;
-  --workshop-warm: #ff8a5c;
-  --workshop-teal: #14b8a6;
-  --workshop-cyan: #0891b2;
 
   /* Provider and product brand colors never follow the active UI theme. */
   --brand-codex: #10a37f;
@@ -246,6 +244,7 @@
   --control-ui-text-lg: calc(16px * var(--control-ui-text-scale));
   --control-ui-input-text-size: max(16px, calc(14px * var(--control-ui-text-scale)));
   --chat-text-size: var(--control-ui-text-md);
+  --chat-block-gap: var(--chat-text-size);
 
   /* Shadows - Subtle, layered depth */
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.25);
@@ -371,8 +370,7 @@
    Each selector below is doubled (`.card.card`) to outrank that one bare
    declaration by specificity regardless of load order — deliberately not
    !important, so a genuinely more specific state override elsewhere (e.g.
-   `.chat:has(> .agent-chat__search-bar)`, `.chat-task-detail__transcript >
-   .chat-thread`, both already in the app) keeps winning as it did before
+   `.chat:has(> .agent-chat__search-bar)`) keeps winning as it did before
    this block existed, instead of every such rule needing a matching
    !important of its own. */
 @supports (corner-shape: superellipse(1.5)) {
@@ -400,6 +398,7 @@
   .sidebar-recent-session.sidebar-recent-session,
   .settings-sidebar__item.settings-sidebar__item,
   .btn.btn,
+  .agent-select__trigger.agent-select__trigger,
   .settings-input.settings-input,
   .field.field :is(input, textarea, select) {
     border-radius: calc(10px * var(--openclaw-corner-radius-scale));
@@ -852,8 +851,29 @@ input:is(
 
 a {
   color: var(--accent);
-  text-decoration: underline;
+  text-decoration: none;
   text-underline-offset: 2px;
+}
+
+/* Content links opt in; navigation and button anchors stay undecorated. */
+a:where(
+    :not([class]),
+    [class=""],
+    .activity-entry__run-link,
+    .settings-row__value,
+    .memory-page__link,
+    .portals-preview__notice-url,
+    .settings-account,
+    .transcripts-back,
+    .chat-text a,
+    .chat-thinking a,
+    .sidebar-markdown a,
+    .markdown a,
+    .markdown-body a,
+    .chat-session-rail__answer a,
+    .dreams-diary__para a
+  ):not(:where(.btn, [role="button"])) {
+  text-decoration: underline;
 }
 
 /* Real links keep the hand even when styled as controls. */
@@ -871,11 +891,6 @@ a:hover {
   text-decoration-thickness: 2px;
 }
 
-.learn-more-link,
-.learn-more-link:hover {
-  text-decoration: none;
-}
-
 /* Web Awesome defaults checked switches to brand blue. Keep every switch on
    the Control UI accent, matching native check controls and custom switches. */
 wa-switch {
@@ -883,10 +898,13 @@ wa-switch {
   --wa-color-focus: var(--ring);
 }
 
-/* Web Awesome dropdown items ship `cursor: pointer` on their shadow host.
+/* Keep neutral menu hover, keyboard focus, and open submenus on the active theme.
+   Web Awesome dropdown items ship `cursor: pointer` on their shadow host.
    Document rules beat `:host`, so route them through the policy here — and
    re-add the disabled cue this override would otherwise clobber. */
 wa-dropdown-item {
+  --wa-color-neutral-fill-normal: var(--bg-hover);
+
   cursor: var(--cursor-action);
 }
 

@@ -123,10 +123,14 @@ export function createCodexAttemptLifecycleController(
     state.pendingTerminalDynamicToolRelease = value;
     scheduleTerminalDynamicToolReleaseCheck();
   };
-  const emitLifecycleStart = () => {
+  const emitLifecycleStart = (model: { provider: string; model: string }) => {
     void emitCodexAppServerEvent(params, {
       stream: "lifecycle",
       data: { phase: "start", startedAt: attemptStartedAt },
+    });
+    void emitCodexAppServerEvent(params, {
+      stream: "lifecycle",
+      data: { phase: "model", ...model },
     });
     state.lifecycleStarted = true;
   };
@@ -134,7 +138,8 @@ export function createCodexAttemptLifecycleController(
     if (
       !state.lifecycleStarted ||
       state.lifecycleTerminalEmitted ||
-      state.permissionChangeRestart
+      state.permissionChangeRestart ||
+      params.pluginRuntimeRefreshPending?.()
     ) {
       return;
     }

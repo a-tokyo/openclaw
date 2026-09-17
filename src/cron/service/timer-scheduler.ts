@@ -1,5 +1,6 @@
 import pMap, { pMapSkip } from "p-map";
 import { formatErrorMessage } from "../../infra/errors.js";
+import { formatTimestamp } from "../../logging/timestamps.js";
 import {
   beginGatewayRootWorkAdmissionWhenOpen,
   GatewayDrainingError,
@@ -29,6 +30,8 @@ import {
   setCronRunCapacityListener,
   tryAcquireCronRunSlots,
 } from "./run-admission.js";
+import { skipCronJobsWithoutOwners } from "./run-owner.js";
+import { emitInterruptedCronRun } from "./run-recovery-events.js";
 import {
   recomputeUnownedCronSchedules,
   recoverNonTerminalCronRunReceipts,
@@ -96,7 +99,12 @@ export function armTimer(state: CronServiceState) {
   // tests that simulate long-running jobs. Runtime behavior is unchanged.
   setCronTimer(state, clampedDelay);
   state.deps.log.debug(
-    { nextAt, delayMs: clampedDelay, clamped: delay > MAX_CRON_TIMER_DELAY_MS },
+    {
+      nextAt,
+      nextAtIso: formatTimestamp(new Date(nextAt), { style: "long" }),
+      delayMs: clampedDelay,
+      clamped: delay > MAX_CRON_TIMER_DELAY_MS,
+    },
     "cron: timer armed",
   );
 }
@@ -197,8 +205,15 @@ async function onAdmittedTimer(state: CronServiceState) {
       if (leaseRecovery.repaired) {
         await ensureLoaded(state, { forceReload: true, skipRecompute: true });
       }
+      for (const interrupted of leaseRecovery.interruptedRuns) {
+        emitInterruptedCronRun(state, interrupted);
+      }
       const dueCheckNow = state.deps.nowMs();
-      const due = collectRunnableJobs(state, dueCheckNow);
+      const due = skipCronJobsWithoutOwners(
+        state,
+        collectRunnableJobs(state, dueCheckNow),
+        dueCheckNow,
+      );
 
       if (due.length === 0) {
         if (!state.store?.jobs.some((job) => needsCronTimerMaintenance(job, dueCheckNow))) {
@@ -253,6 +268,15 @@ async function onAdmittedTimer(state: CronServiceState) {
           }),
           releaseAdmission: admissionReleases[index]!,
         }));
+        if (reservedDue.length === 0 && allowEmptyCapacityRecheck) {
+          // Releasing an unused slot is not progress. Retry immediately only
+          // when the refreshed store removed a candidate from the due set;
+          // otherwise child ticks retain their parents and starve the event loop.
+          const stillDue = new Set(
+            collectRunnableJobs(state, state.deps.nowMs()).map((job) => job.id),
+          );
+          allowEmptyCapacityRecheck = admittedDue.some((job) => !stillDue.has(job.id));
+        }
         for (const releaseAdmission of admissionReleases.slice(reservedDue.length)) {
           releaseAdmission();
         }
@@ -536,14 +560,6 @@ async function onAdmittedTimer(state: CronServiceState) {
         if (reaperAgentIds.size > 0) {
           const nowMs = state.deps.nowMs();
           for (const agentId of reaperAgentIds) {
-            if (state.deps.isAgentAvailable?.(agentId) === false) {
-              if (!state.reportedUnavailableReaperAgentIds.has(agentId)) {
-                state.reportedUnavailableReaperAgentIds.add(agentId);
-                state.deps.log.debug({ agentId }, "cron-reaper: skipped unavailable agent");
-              }
-              continue;
-            }
-            state.reportedUnavailableReaperAgentIds.delete(agentId);
             const storePath = state.deps.resolveSessionStorePath
               ? state.deps.resolveSessionStorePath(agentId)
               : state.deps.sessionStorePath;
@@ -555,6 +571,7 @@ async function onAdmittedTimer(state: CronServiceState) {
                 agentId,
                 cronConfig: state.deps.cronConfig,
                 sessionStorePath: storePath,
+                isAgentAvailable: state.deps.isAgentAvailable,
                 nowMs,
                 log: state.deps.log,
               });

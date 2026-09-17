@@ -53,6 +53,7 @@ const readConfigFileSnapshot = vi.hoisted(() =>
     config: { gateway: { mode: "local", port: 19091 } } as Record<string, unknown>,
     sourceConfig: { gateway: { mode: "local", port: 19091 } } as Record<string, unknown>,
     parsed: { gateway: { mode: "local", port: 19091 } } as Record<string, unknown>,
+    includedPaths: [] as string[],
     legacyIssues: [] as Array<{ path: string; message: string }>,
     warnings: [] as Array<{ path: string; message: string }>,
     issues: [] as Array<{ path: string; message: string }>,
@@ -74,7 +75,10 @@ const addDoctorLegacyIssues = vi.hoisted(() =>
 );
 const note = vi.hoisted(() => vi.fn());
 
-vi.mock("../infra/state-migrations.doctor.js", () => ({
+vi.mock("../infra/state-migrations.doctor.js", async () => ({
+  ...(await vi.importActual<typeof import("../infra/state-migrations.doctor.js")>(
+    "../infra/state-migrations.doctor.js",
+  )),
   autoMigrateLegacyState,
 }));
 
@@ -119,6 +123,7 @@ const { runDoctorConfigPreflight } = await import("./doctor-config-preflight.js"
 describe("runDoctorConfigPreflight state migration input", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    readConfigFileSnapshot.mockReset();
     findDoctorLegacyConfigIssues.mockReset();
     findDoctorLegacyConfigIssues.mockReturnValue([]);
   });
@@ -132,9 +137,12 @@ describe("runDoctorConfigPreflight state migration input", () => {
 
     expect(autoMigrateLegacyState).toHaveBeenCalledWith({
       cfg: { gateway: { mode: "local", port: 19091 } },
+      configIncludedPaths: [],
       env: process.env,
+      log: undefined,
       recoverCorruptTargetStore: true,
       doctorOnlyStateMigrations: undefined,
+      onStepReceipt: expect.any(Function),
     });
   });
 
@@ -152,7 +160,7 @@ describe("runDoctorConfigPreflight state migration input", () => {
 
   it("does not skip a retired custom cron partition on a pristine state root", async () => {
     const sourceConfig = {
-      gateway: { mode: "local", port: 19091 },
+      gateway: { mode: "local", port: "not-a-port" },
       agents: {
         entries: { ops: {}, research: {} },
         defaults: {
@@ -164,7 +172,7 @@ describe("runDoctorConfigPreflight state migration input", () => {
       cron: { store: "/tmp/custom-cron/jobs.json" },
       talk: { agentId: "ops" },
     };
-    readConfigFileSnapshot.mockResolvedValueOnce({
+    readConfigFileSnapshot.mockResolvedValue({
       exists: true,
       valid: false,
       config: sourceConfig,
@@ -173,9 +181,10 @@ describe("runDoctorConfigPreflight state migration input", () => {
         agents: { list: [{ id: "ops", default: true }, { id: "research" }] },
         cron: { store: "/tmp/custom-cron/jobs.json" },
       },
+      includedPaths: [],
       legacyIssues: [{ path: "cron.store", message: "cron.store is retired" }],
       warnings: [],
-      issues: [{ path: "agents.ownership", message: "explicit ownership is required" }],
+      issues: [{ path: "gateway.port", message: "invalid port" }],
     });
 
     await runDoctorConfigPreflight({
@@ -198,6 +207,7 @@ describe("runDoctorConfigPreflight state migration input", () => {
 
   it("runs plugin state migrations with resolved legacy config before config repair removes retired paths", async () => {
     const parsedConfig = { $include: "memory-search.json" };
+    const includedPaths = ["/tmp/base.json", "/tmp/memory-search.json"];
     const resolvedConfig = {
       cron: { webhook: "https://example.invalid/cron-finished" },
       memory: {
@@ -213,12 +223,13 @@ describe("runDoctorConfigPreflight state migration input", () => {
         entries: { main: {} },
       },
     };
-    readConfigFileSnapshot.mockResolvedValueOnce({
+    readConfigFileSnapshot.mockResolvedValue({
       exists: true,
       valid: false,
       config: resolvedConfig,
       sourceConfig: resolvedConfig,
       parsed: parsedConfig,
+      includedPaths,
       legacyIssues: [
         {
           path: "memory.search.store.path",
@@ -267,9 +278,12 @@ describe("runDoctorConfigPreflight state migration input", () => {
         }),
       }),
       pluginDoctorConfig: resolvedConfig,
+      configIncludedPaths: includedPaths,
       env: process.env,
+      log: undefined,
       recoverCorruptTargetStore: undefined,
       doctorOnlyStateMigrations: undefined,
+      onStepReceipt: expect.any(Function),
     });
   });
 
@@ -289,12 +303,13 @@ describe("runDoctorConfigPreflight state migration input", () => {
         list: [{ id: "main" }],
       },
     };
-    readConfigFileSnapshot.mockResolvedValueOnce({
+    readConfigFileSnapshot.mockResolvedValue({
       exists: true,
       valid: false,
       config: resolvedConfig,
       sourceConfig: resolvedConfig,
       parsed: resolvedConfig,
+      includedPaths: [],
       legacyIssues: [
         {
           path: "memory.search.store.path",
@@ -325,15 +340,16 @@ describe("runDoctorConfigPreflight state migration input", () => {
   });
 
   it("runs config-independent state migration for invalid config", async () => {
-    findDoctorLegacyConfigIssues.mockReturnValueOnce([
+    findDoctorLegacyConfigIssues.mockReturnValue([
       { path: "cron.store", message: "cron.store is legacy." },
     ]);
-    readConfigFileSnapshot.mockResolvedValueOnce({
+    readConfigFileSnapshot.mockResolvedValue({
       exists: true,
       valid: false,
       config: { cron: { store: "/tmp/legacy-cron.json" } },
       sourceConfig: { cron: { store: "/tmp/legacy-cron.json" } },
       parsed: { cron: { store: "/tmp/legacy-cron.json" } },
+      includedPaths: [],
       legacyIssues: [],
       warnings: [],
       issues: [{ path: "gateway", message: "invalid" }],

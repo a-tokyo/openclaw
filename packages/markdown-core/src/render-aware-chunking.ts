@@ -1,6 +1,5 @@
 import { resolveIntegerOption } from "@openclaw/normalization-core/number-coercion";
 import { avoidTrailingHighSurrogateBreak } from "./chunk-text.js";
-// Markdown Core module implements render aware chunking behavior.
 import { annotateAssistantTranscriptRoleMessageBoundary } from "./ir-annotations.js";
 import { mergeAnnotationSpans, mergeStyleSpans } from "./ir-spans.js";
 import { appendMarkdownIR, sliceMarkdownIR, type MarkdownIR } from "./ir.js";
@@ -121,9 +120,6 @@ function splitMarkdownIRByRenderedLimit<TRendered>(
   options: RenderResolver<TRendered>,
 ): MarkdownIR[] {
   const currentTextLength = chunk.text.length;
-  if (currentTextLength <= 1) {
-    return [chunk];
-  }
 
   const splitLimit = findLargestChunkTextLengthWithinRenderedLimit(chunk, renderedLimit, options);
   if (splitLimit <= 0) {
@@ -148,9 +144,6 @@ function findLargestChunkTextLengthWithinRenderedLimit<TRendered>(
   options: RenderResolver<TRendered>,
 ): number {
   const currentTextLength = chunk.text.length;
-  if (currentTextLength <= 1) {
-    return currentTextLength;
-  }
 
   // Rendered length is not guaranteed to be monotonic after escaping/link or
   // file-reference rewriting, so test exact candidates from longest to shortest.

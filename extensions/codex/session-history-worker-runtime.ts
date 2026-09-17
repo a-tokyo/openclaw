@@ -1,18 +1,27 @@
+import { fileURLToPath } from "node:url";
 import type { AgentMessage } from "openclaw/plugin-sdk/agent-harness-runtime";
 import {
   captureCodexSessionTranscriptReadAdmission,
+  SessionTranscriptReadFenceError,
   validateCodexSessionTranscriptReadAdmission,
   validateCodexSessionTranscriptContextVersion,
 } from "openclaw/plugin-sdk/codex-session-transcript-runtime";
-import { WorkerTaskPool } from "openclaw/plugin-sdk/process-runtime";
+import {
+  resolveRuntimeWorkerArgv,
+  resolveRuntimeWorkerUrl,
+  WorkerTaskPool,
+} from "openclaw/plugin-sdk/process-runtime";
 import { isIncognitoSessionKey } from "openclaw/plugin-sdk/session-key-runtime";
 import type { TranscriptTurnAdmission } from "openclaw/plugin-sdk/session-transcript-runtime";
 import {
-  codexHistoryWorkerUrl,
   runCodexHistoryWorkerInput,
   type CodexHistoryWorkerInput,
   type CodexHistoryWorkerResult,
 } from "./session-history.worker.js";
+import {
+  codexHistoryRejectionReason,
+  type CodexHistoryReadResult,
+} from "./src/app-server/history-rejection.js";
 import type { JsonValue } from "./src/app-server/protocol.js";
 import {
   resolveCodexHistoryTarget,
@@ -20,8 +29,34 @@ import {
 } from "./src/app-server/session-history.js";
 import type { SettledTurnMessages } from "./src/app-server/settled-turn-evidence.js";
 
+const codexHistoryWorkerEntrypoint = {
+  currentModuleUrl: import.meta.url,
+  sourceWorkerName: "session-history.worker",
+  distWorkerPath: "extensions/codex/session-history.worker.js",
+  package: {
+    name: "@openclaw/codex",
+    distWorkerPath: "session-history.worker.js",
+  },
+} as const;
+
+function resolveCodexHistoryWorkerUrl(): URL {
+  const sourceUrl = resolveRuntimeWorkerUrl(codexHistoryWorkerEntrypoint);
+  const sourceNeedsBuiltFallback =
+    /\.[cm]?ts$/u.test(sourceUrl.pathname) &&
+    (typeof process.versions.bun === "string" || resolveRuntimeWorkerArgv(sourceUrl).length === 1);
+  if (!sourceNeedsBuiltFallback) {
+    return sourceUrl;
+  }
+  // oxlint-disable-next-line no-warning-comments -- removal awaits Bun Worker preload resolver support.
+  // TODO: Remove this fallback once Bun Workers apply resolver hooks from execArgv --import preloads.
+  return resolveRuntimeWorkerUrl({
+    ...codexHistoryWorkerEntrypoint,
+    root: fileURLToPath(new URL("../..", import.meta.url)),
+  });
+}
+
 const historyReads = new WorkerTaskPool<CodexHistoryWorkerInput, CodexHistoryWorkerResult>({
-  workerUrl: codexHistoryWorkerUrl,
+  workerUrl: resolveCodexHistoryWorkerUrl(),
   maxWorkers: 1,
 });
 
@@ -51,10 +86,23 @@ async function readHistory(
       : await historyReads.run(input, { timeoutMs: 60_000, signal });
   signal?.throwIfAborted();
   if (resolved.kind === "sqlite") {
-    if (input.admission) {
-      validateCodexSessionTranscriptReadAdmission(resolved.target, input.admission);
-    } else {
-      validateCodexSessionTranscriptContextVersion(resolved.target, result.version);
+    try {
+      if (input.admission) {
+        validateCodexSessionTranscriptReadAdmission(resolved.target, input.admission);
+      } else {
+        validateCodexSessionTranscriptContextVersion(resolved.target, result.version);
+      }
+    } catch (error) {
+      return {
+        ...result,
+        result: {
+          status: "rejected",
+          reason:
+            error instanceof SessionTranscriptReadFenceError
+              ? "snapshot_invalidated"
+              : codexHistoryRejectionReason(error),
+        },
+      };
     }
   }
   return result;
@@ -66,13 +114,15 @@ export async function readCodexHistoryMessagesInWorker(
   signal?: AbortSignal,
 ): Promise<AgentMessage[] | undefined> {
   const result = await readHistory(target, { kind: "messages" }, admission, signal);
-  return result.kind === "messages" ? result.messages : undefined;
+  return result.kind === "messages" && result.result.status === "ok"
+    ? result.result.value
+    : undefined;
 }
 
 export async function projectCodexSettledHistoryInWorker(
   target: CodexMirroredSessionHistoryTarget & SettledTurnMessages,
   signal?: AbortSignal,
-): Promise<JsonValue[] | undefined> {
+): Promise<CodexHistoryReadResult<JsonValue[]>> {
   const result = await readHistory(
     target,
     {
@@ -86,5 +136,7 @@ export async function projectCodexSettledHistoryInWorker(
     undefined,
     signal,
   );
-  return result.kind === "settled" ? result.data : undefined;
+  return result.kind === "settled"
+    ? result.result
+    : { status: "rejected", reason: "history_read_failed" };
 }

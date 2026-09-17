@@ -12,8 +12,9 @@ import path from "node:path";
 import process from "node:process";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { asRecord, isRecord } from "@openclaw/normalization-core/record-coerce";
-import { hasNonEmptyString } from "@openclaw/normalization-core/string-coerce";
+// The target cwd may be outside this checkout, without our tsconfig aliases.
+import { asRecord, isRecord } from "../../packages/normalization-core/src/record-coerce.ts";
+import { hasNonEmptyString } from "../../packages/normalization-core/src/string-coerce.ts";
 import { appendBoundedTail } from "../lib/bounded-output-tail.mjs";
 import {
   createBoundedResponseTooLargeError,
@@ -385,7 +386,7 @@ export async function resolveKitchenSinkRpcPort(
 function resolveOpenClawRunner(): OpenClawRunner {
   if (process.env.OPENCLAW_ENTRY) {
     return {
-      command: "node",
+      command: process.execPath,
       baseArgs: [process.env.OPENCLAW_ENTRY],
       label: process.env.OPENCLAW_ENTRY,
     };
@@ -393,7 +394,7 @@ function resolveOpenClawRunner(): OpenClawRunner {
   for (const candidate of ["dist/index.mjs", "dist/index.js"]) {
     const resolved = path.join(process.cwd(), candidate);
     if (fs.existsSync(resolved)) {
-      return { command: "node", baseArgs: [resolved], label: resolved };
+      return { command: process.execPath, baseArgs: [resolved], label: resolved };
     }
   }
   return { pnpm: true, baseArgs: ["openclaw"], label: "pnpm openclaw" };
@@ -569,10 +570,10 @@ export function runCommand(
       );
       forceKillTimer.unref();
     }, resolvedTimeoutMs);
-    child.stdout?.on("data", (chunk) => {
+    child.stdout?.setEncoding("utf8").on("data", (chunk) => {
       stdout = appendBoundedTail(stdout, chunk, outputCaptureChars);
     });
-    child.stderr?.on("data", (chunk) => {
+    child.stderr?.setEncoding("utf8").on("data", (chunk) => {
       stderr = appendBoundedTail(stderr, chunk, outputCaptureChars);
     });
     child.on("error", (error) => {
@@ -1143,7 +1144,7 @@ export function findDistCallGatewayModuleFiles(cwd = process.cwd()) {
   return fs.existsSync(distDir)
     ? fs
         .readdirSync(distDir)
-        .filter((name) => /^call(?:\.runtime)?-[A-Za-z0-9_-]+\.js$/u.test(name))
+        .filter((name) => /^call(?:\.runtime)?-[A-Za-z0-9_-]+\.m?js$/u.test(name))
         .toSorted((left, right) => left.localeCompare(right))
     : [];
 }
@@ -1324,9 +1325,10 @@ async function delayWithAbort(delayMs: number, signal?: AbortSignal) {
   }
 }
 
-function configureKitchenSink(env: KitchenSinkEnv, port: number) {
+export function configureKitchenSink(env: KitchenSinkEnv, port: number) {
   const configPath = env.OPENCLAW_CONFIG_PATH;
   const config = asRecord(fs.existsSync(configPath) ? readJson(configPath) : {});
+  const frozenTarget = env.OPENCLAW_FROZEN_PLUGIN_PRERELEASE_FIXTURE_DIALECT === "legacy";
   const gateway = asRecord(config.gateway);
   const plugins = asRecord(config.plugins);
   const pluginEntries = asRecord(plugins.entries);
@@ -1351,7 +1353,11 @@ function configureKitchenSink(env: KitchenSinkEnv, port: number) {
   config.plugins = {
     ...plugins,
     enabled: true,
-    allow: [...new Set([...(Array.isArray(plugins.allow) ? plugins.allow : []), PLUGIN_ID])],
+    ...(frozenTarget
+      ? {}
+      : {
+          allow: [...new Set([...(Array.isArray(plugins.allow) ? plugins.allow : []), PLUGIN_ID])],
+        }),
     entries: {
       ...pluginEntries,
       [PLUGIN_ID]: {
@@ -1379,8 +1385,7 @@ function configureKitchenSink(env: KitchenSinkEnv, port: number) {
       ...new Set([...(Array.isArray(tools.alsoAllow) ? tools.alsoAllow : []), ...EXPECTED_TOOLS]),
     ],
   };
-  config.tts = {
-    ...tts,
+  const ttsConfig = {
     provider: tts.provider ?? speechProvider,
     providers: {
       ...ttsProviders,
@@ -1389,6 +1394,12 @@ function configureKitchenSink(env: KitchenSinkEnv, port: number) {
       },
     },
   };
+  if (frozenTarget) {
+    const messages = asRecord(config.messages);
+    config.messages = { ...messages, tts: { ...asRecord(messages.tts), ...ttsConfig } };
+  } else {
+    config.tts = { ...tts, ...ttsConfig };
+  }
   writeJson(configPath, config);
 }
 

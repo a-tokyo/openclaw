@@ -8,6 +8,7 @@ import {
   loadTranscriptEvents,
   upsertSessionEntryCore,
 } from "../../config/sessions/session-accessor.js";
+import { createZeroUsageFixture } from "../test-helpers/usage-fixtures.js";
 import { SessionManager } from "./session-manager.js";
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
@@ -19,14 +20,7 @@ function buildAssistantMessage(text: string) {
     api: "messages" as const,
     provider: "anthropic" as const,
     model: "sonnet-4.6" as const,
-    usage: {
-      input: 0,
-      output: 0,
-      cacheRead: 0,
-      cacheWrite: 0,
-      totalTokens: 0,
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-    },
+    usage: createZeroUsageFixture(),
     stopReason: "stop" as const,
     timestamp: Date.now(),
   };
@@ -110,6 +104,9 @@ describe("SessionManager user idempotency", () => {
         "Session transcript keyed user is outside the current turn",
       );
       expect(sessionManager.getAppendParentId()).toBe("persisted-assistant");
+      expect(sessionManager.resolveCurrentTurnEntryId(() => true)).toBe(
+        excludeFromContext ? "persisted-assistant" : null,
+      );
       expect(
         (await loadTranscriptEvents(scope)).filter(
           (event) =>

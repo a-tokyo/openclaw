@@ -17,27 +17,28 @@ import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { coerceSecretRef } from "../config/types.secrets.js";
 import { getShellEnvAppliedKeys } from "../infra/shell-env.js";
 import { canResolveEnvSecretRefInReadOnlyPath } from "../plugin-sdk/secret-ref-readonly.internal.js";
+import { NON_ENV_SECRETREF_MARKER } from "../secrets/provider-credential-values.js";
 import { SecretSurfaceUnavailableError } from "../secrets/runtime-degraded-state.js";
 import { mintSecretSentinel } from "../secrets/sentinel.js";
+import { appendConfigPathSegment } from "../shared/dot-path.js";
 import { normalizeOptionalSecretInput } from "../utils/normalize-secret-input.js";
 import {
   isConfiguredAwsSdkAuthProfileForProvider,
   isStoredCredentialCompatibleWithAuthProvider,
 } from "./auth-profiles/order.js";
 import type { AuthProfileCredential, AuthProfileStore } from "./auth-profiles/types.js";
-import {
-  isAuthCooldownBypassedForProvider,
-  resolveProfileUnusableUntil,
-} from "./auth-profiles/usage-state.js";
+import { readInlineProviderApiKeyUsage } from "./auth-profiles/usage-state.js";
 import { resolveEnvApiKey, type EnvApiKeyResult } from "./model-auth-env.js";
 import {
   CUSTOM_LOCAL_AUTH_MARKER,
   isKnownEnvApiKeyMarker,
   isNonSecretApiKeyMarker,
-  NON_ENV_SECRETREF_MARKER,
   SECRETREF_ENV_HEADER_MARKER_PREFIX,
 } from "./model-auth-markers.js";
-import type { ResolvedProviderAuth } from "./model-auth-runtime-shared.js";
+import {
+  resolveDirectProviderCredentialMode,
+  type ResolvedProviderAuth,
+} from "./model-auth-runtime-shared.js";
 import { isLocalProviderBaseUrl } from "./model-provider-local.js";
 import type { ProviderAuthAliasLookupParams } from "./provider-auth-aliases.js";
 
@@ -100,10 +101,12 @@ function resolveProviderSourceConfig(cfg: OpenClawConfig | undefined, provider: 
 export function resolveProviderConfigSecretInput(
   cfg: OpenClawConfig | undefined,
   provider: string,
+  sourceConfig = resolveProviderSourceConfig(cfg, provider),
 ) {
-  const sourceConfig = resolveProviderSourceConfig(cfg, provider);
   const entry = resolveMergedModelProviderEntry(sourceConfig, provider);
-  const path = entry ? `models.providers.${entry.providerKey}.apiKey` : "";
+  const path = entry
+    ? `${appendConfigPathSegment("models.providers", entry.providerKey)}.apiKey`
+    : "";
   const resolvedEnvRef = entry ? getResolvedConfigEnvSecretRef(sourceConfig, path) : null;
   return {
     providerConfig: resolveProviderConfig(cfg, provider),
@@ -281,19 +284,6 @@ export function resolveProviderAuthOverride(
   return undefined;
 }
 
-export function resolveDirectProviderCredentialMode(params: {
-  cfg: OpenClawConfig | undefined;
-  provider: string;
-  inferredMode: ResolvedProviderAuth["mode"];
-}): ResolvedProviderAuth["mode"] {
-  const configuredMode = resolveProviderAuthOverride(params.cfg, params.provider);
-  // apiKey is the generic provider credential slot. Explicit subscription
-  // strategy classifies its literal, SecretRef, and env material as one route.
-  return configuredMode === "oauth" || configuredMode === "token"
-    ? configuredMode
-    : params.inferredMode;
-}
-
 export function shouldUseImplicitAwsSdkAuth(params: {
   cfg: OpenClawConfig | undefined;
   provider: string;
@@ -418,11 +408,16 @@ export function canUseProfileAsProviderEntryApiKey(params: {
 /** Classifies a provider entry apiKey as literal/profile/marker before resolving secrets. */
 export function resolveProviderEntryApiKeyProfileReference(params: {
   cfg?: OpenClawConfig;
+  sourceConfig?: OpenClawConfig;
   authAliasLookupParams?: ProviderAuthAliasLookupParams;
   provider: string;
   store: AuthProfileStore;
 }): ProviderEntryApiKeyProfileReference {
-  const { providerConfig, ref } = resolveProviderConfigSecretInput(params.cfg, params.provider);
+  const { providerConfig, ref } = resolveProviderConfigSecretInput(
+    params.cfg,
+    params.provider,
+    params.sourceConfig,
+  );
   if (ref) {
     return { kind: "none" };
   }
@@ -581,20 +576,12 @@ export function isConfigBackedInlineProviderApiKey(params: {
   return Boolean(perEntryRawKey && !params.store?.profiles[perEntryRawKey]);
 }
 
-// Reads the inline provider API-key cooldown via usage-state primitives instead
-// of the auth-profiles usage module, so model-auth keeps working in the many
-// tests that partially mock that module. Mirrors the usage-module helper of the
-// same intent, using the same provider normalization as the write side so the
-// `inline-api-key:<provider>` usage id matches what the failure marker records.
+// Use the same normalized usage id as the inline-key failure writer.
 export function resolveInlineProviderApiKeyCooldownUntil(
   store: AuthProfileStore,
   provider: string,
 ): number | null {
-  if (isAuthCooldownBypassedForProvider(provider)) {
-    return null;
-  }
-  const stats = store.usageStats?.[`inline-api-key:${normalizeProviderId(provider)}`];
-  return stats ? resolveProfileUnusableUntil(stats) : null;
+  return readInlineProviderApiKeyUsage(store, provider).unusableUntil;
 }
 
 /** Fails closed while an inline provider API key is inside its billing/auth cooldown. */
@@ -651,16 +638,17 @@ export function providerConfigMatchesRuntimeSnapshot(params: {
 }): boolean {
   const inputProvider = resolveProviderConfig(params.inputConfig, params.provider);
   const runtimeProvider = resolveProviderConfig(params.runtimeConfig ?? undefined, params.provider);
-  if (!inputProvider || !runtimeProvider) {
-    return false;
-  }
   const toComparableConfig = (providerConfig: ModelProviderConfig): OpenClawConfig => ({
     models: { providers: { [params.provider]: providerConfig } },
   });
-  return (
-    hashRuntimeConfigValue(toComparableConfig(inputProvider)) ===
-    hashRuntimeConfigValue(toComparableConfig(runtimeProvider))
-  );
+  // Shared provider objects need no catalog traversal; distinct mutable inputs
+  // still compare their current bytes before reusing runtime SecretRef provenance.
+  return inputProvider && runtimeProvider
+    ? params.inputConfig === params.runtimeConfig ||
+        inputProvider === runtimeProvider ||
+        hashRuntimeConfigValue(toComparableConfig(inputProvider)) ===
+          hashRuntimeConfigValue(toComparableConfig(runtimeProvider))
+    : false;
 }
 
 export function sentinelizeConfigSecretRefEnvApiKey(params: {

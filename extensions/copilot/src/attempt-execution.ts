@@ -418,7 +418,7 @@ export async function runCopilotExecution(context: {
     }
     if (sdkSessionId && deps.onSessionEstablished && !settledToolFinalization) {
       try {
-        deps.onSessionEstablished({
+        await deps.onSessionEstablished({
           compactionSessionConfig,
           sdkSessionId,
           pooledClient: handle,
@@ -487,6 +487,7 @@ export async function runCopilotExecution(context: {
       }
       activeRunHandleRef = registerCopilotActiveRun({
         abortActiveSession,
+        agentId: sessionAgentId,
         bridge,
         canAcceptSteering: () => initialSdkUserValidated,
         startedAtMs: input.startedAtMs,
@@ -613,7 +614,7 @@ export async function runCopilotExecution(context: {
         .catch(() => undefined);
       if (sdkSessionId && !settledToolFinalization) {
         try {
-          deps.onDeferredCompaction?.({
+          await deps.onDeferredCompaction?.({
             abort: () => cleanupAbort.abort(),
             cleanup,
             sdkSessionId,
@@ -624,7 +625,11 @@ export async function runCopilotExecution(context: {
     } else {
       await bridge?.awaitCompactionChain();
       await bridge?.awaitAgentEventChain();
-      nativeSubagentTaskMirror?.finalizeActiveRuns();
+      try {
+        nativeSubagentTaskMirror?.finalizeActiveRuns();
+      } catch (error) {
+        promptError ??= toCopilotError(error);
+      }
       cleanupToolBridge?.();
       await cleanupByokProxy?.();
       bridge?.detach();

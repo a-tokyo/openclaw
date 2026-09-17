@@ -22,6 +22,7 @@ import {
   onAgentRuntimeEvent,
 } from "../infra/agent-events.js";
 import { clearAgentRunContext, getAgentRunContext } from "../infra/agent-run-registry.js";
+import { captureAgentRunTerminalWriteContext } from "../infra/agent-run-terminal-writes.js";
 import { onTrustedToolExecutionEvent } from "../infra/diagnostic-events.js";
 import { onHeartbeatEvent } from "../infra/heartbeat-events.js";
 import type { SubsystemLogger } from "../logging/subsystem.js";
@@ -30,8 +31,6 @@ import { onSessionLifecycleEvent } from "../sessions/session-lifecycle-events.js
 import { onInternalSessionTranscriptUpdate } from "../sessions/transcript-events.js";
 import { createLazyPromise, createLazyPromiseLoader } from "../shared/lazy-runtime.js";
 import { onUserProfilesChanged } from "../state/user-profile-events.js";
-import { isTerminalTaskStatus } from "../tasks/task-executor-policy.js";
-import type { TaskRegistryObserverEvent } from "../tasks/task-registry.store.js";
 import { markChatAbortTerminalPersistenceError } from "./chat-abort-lifecycle-internal.js";
 import {
   type ChatAbortControllerEntry,
@@ -46,13 +45,14 @@ import type {
   ToolEventRecipientRegistry,
 } from "./server-chat-state.js";
 import { resolveVisibleActiveSessionRunState } from "./server-methods/session-active-runs.js";
-import { mapTaskSummary, type TaskEventPayload } from "./server-methods/task-summary.js";
+import { startGatewayTaskSubscriptions } from "./server-task-subscriptions.js";
+import { createSessionActivitySummaries } from "./session-activity-summaries.js";
 import { defaultSessionCompanionContextReader } from "./session-companion-context.js";
 import { createSessionCompanion } from "./session-companion.js";
 import { createSessionLifecyclePersistenceOwner } from "./session-lifecycle-persistence-owner.js";
+import { sessionObserverScopeKey } from "./session-observer-model.js";
 import { createSessionObserver } from "./session-observer.js";
 import { tryResolveSessionCompatibilityOwnerAgentId } from "./session-request-agent.js";
-import { resolveTaskRequesterSessionTarget } from "./task-session-access.js";
 import type { TerminalSessionManager } from "./terminal/session-manager.js";
 
 function dispatchEventHandler<TEvent>(params: {
@@ -73,18 +73,9 @@ function dispatchEventHandler<TEvent>(params: {
     });
 }
 
-function terminalTaskId(event: TaskRegistryObserverEvent): string | undefined {
-  if (event.kind !== "upserted" || !isTerminalTaskStatus(event.task.status)) {
-    return undefined;
-  }
-  if (event.previous && isTerminalTaskStatus(event.previous.status)) {
-    return undefined;
-  }
-  return event.task.taskId;
-}
-
 /** Register gateway runtime event subscriptions and return unsubscribe handles. */
 export function startGatewayEventSubscriptions(params: {
+  signal: AbortSignal;
   log: SubsystemLogger;
   broadcast: GatewayBroadcastFn;
   broadcastToConnIds: (
@@ -93,6 +84,7 @@ export function startGatewayEventSubscriptions(params: {
     connIds: ReadonlySet<string>,
     opts?: { dropIfSlow?: boolean },
   ) => void;
+  nodeHasSessionSubscribers: (sessionKey: string) => boolean;
   nodeSendToSession: (sessionKey: string, event: string, payload: unknown) => void;
   agentRunSeq: Map<string, number>;
   chatRunState: ChatRunState;
@@ -102,6 +94,7 @@ export function startGatewayEventSubscriptions(params: {
   chatAbortControllers: Map<string, ChatAbortControllerEntry>;
   restartRecoveryCandidates: Map<string, RestartRecoveryCandidate>;
   terminalSessions: Pick<TerminalSessionManager, "closeTaskSessions">;
+  refreshConnectedUserProfiles: () => void;
 }) {
   // The worker always runs retention maintenance. audit.enabled only controls
   // producer subscriptions, so disabling collection cannot strand expired rows.
@@ -129,6 +122,19 @@ export function startGatewayEventSubscriptions(params: {
   const clearRuntimeActionDecisionSink = configureRuntimeActionDecisionSink(
     auditRecorder.recordExecutionDecision,
   );
+  const sessionActivitySummaries = createSessionActivitySummaries({
+    getConfig: getRuntimeConfig,
+    onChanged: (target) =>
+      params.broadcast(
+        "sessions.changed",
+        {
+          sessionKey: target.key,
+          agentId: target.agentId,
+          reason: "activity-summary",
+        },
+        { sessionKeys: [target.key], agentId: target.agentId, dropIfSlow: true },
+      ),
+  });
   const sessionObserver = createSessionObserver({
     getConfig: getRuntimeConfig,
     subscribers: params.sessionMessageSubscribers,
@@ -140,6 +146,22 @@ export function startGatewayEventSubscriptions(params: {
     getConfig: getRuntimeConfig,
     sessionObserver,
   });
+  let sessionBackgroundStop: Promise<void> | undefined;
+  // Auxiliary model calls can inherit request work; cancel before that work drains.
+  const stopSessionBackgroundWork = (): void => {
+    if (!sessionBackgroundStop) {
+      sessionCompanion.dispose();
+      sessionObserver.dispose();
+      sessionBackgroundStop = sessionActivitySummaries.dispose();
+      void sessionBackgroundStop.catch((error: unknown) => {
+        params.log.warn(`session background cleanup failed: ${String(error)}`);
+      });
+    }
+  };
+  params.signal.addEventListener("abort", stopSessionBackgroundWork, { once: true });
+  if (params.signal.aborted) {
+    stopSessionBackgroundWork();
+  }
   const unsubscribePrivateAuditEvents = auditEnabled
     ? onAgentAuditEvent(auditRecorder.record)
     : undefined;
@@ -245,6 +267,7 @@ export function startGatewayEventSubscriptions(params: {
           createAgentEventHandler({
             broadcast: params.broadcast,
             broadcastToConnIds: params.broadcastToConnIds,
+            nodeHasSessionSubscribers: params.nodeHasSessionSubscribers,
             nodeSendToSession: params.nodeSendToSession,
             agentRunSeq: params.agentRunSeq,
             chatRunState: params.chatRunState,
@@ -326,6 +349,7 @@ export function startGatewayEventSubscriptions(params: {
     let failedDispatchCleanup: (() => void) | undefined;
     let terminalPreparation: Promise<void> | undefined;
     sessionObserver.handleEvent(evt);
+    sessionActivitySummaries.handleEvent(evt);
     if (auditEnabled) {
       auditRecorder.record(evt);
     }
@@ -360,8 +384,12 @@ export function startGatewayEventSubscriptions(params: {
         .map((candidateRunId) => params.chatAbortControllers.get(candidateRunId))
         .find((entry) => entry !== undefined);
       const runContext = getAgentRunContext(evt.runId);
-      const sessionAgentId = trackedEntry?.agentId ?? evt.agentId ?? runContext?.agentId;
+      // Match the chat projection owner before preparing the shared terminal write.
+      // A bound ACP runtime emits its target key, but the chat link owns the source run.
+      const sessionAgentId =
+        chatLink?.agentId ?? evt.agentId ?? trackedEntry?.agentId ?? runContext?.agentId;
       const knownSessionKey =
+        chatLink?.sessionKey ??
         evt.deliverySessionKey ??
         evt.sessionKey ??
         trackedEntry?.sessionKey ??
@@ -386,12 +414,14 @@ export function startGatewayEventSubscriptions(params: {
         evt.projectSessionLifecycle !== false &&
         trackedOwnerIsCurrent &&
         claimIsComplete;
+      const writeContext = captureAgentRunTerminalWriteContext(evt.runId);
       const prepareTerminalPersistence = (sessionKey: string) => {
         const persistence = sessionLifecyclePersistence.observe({
           sessionKey,
           ...(sessionAgentId ? { agentId: sessionAgentId } : {}),
           event: evt,
           ...(terminalAuthority ? { authority: terminalAuthority } : {}),
+          ...(writeContext ? { writeContext } : {}),
           ...(clientRunId !== evt.runId ? { clientRunId } : {}),
         });
         if (terminalAuthority) {
@@ -423,22 +453,25 @@ export function startGatewayEventSubscriptions(params: {
           () => settleTrackedTerminal({ runId: evt.runId, clientRunId }),
           () => settleTrackedTerminal({ runId: evt.runId, clientRunId, persisted: false }),
         );
+        return persistence;
       };
       if (canPersistTerminal) {
         if (knownSessionKey) {
-          prepareTerminalPersistence(knownSessionKey);
+          const persistence = prepareTerminalPersistence(knownSessionKey);
+          writeContext?.track(persistence);
         } else {
           // Context cleanup can precede a terminal event. Resolve its persisted
           // run mapping before the lazy chat handler consumes the same event.
-          terminalPreparation = getSessionKeyModule().then(({ resolveSessionKeyForRun }) => {
+          terminalPreparation = getSessionKeyModule().then(async ({ resolveSessionKeyForRun }) => {
             const sessionKey = resolveSessionKeyForRun(
               evt.runId,
               sessionAgentId ? { agentId: sessionAgentId } : undefined,
             );
             if (sessionKey) {
-              prepareTerminalPersistence(sessionKey);
+              await prepareTerminalPersistence(sessionKey);
             }
           });
+          writeContext?.track(terminalPreparation);
         }
       }
     } else if (lifecyclePhase === "start") {
@@ -477,8 +510,9 @@ export function startGatewayEventSubscriptions(params: {
   });
   const agentUnsub = async () => {
     unsubscribeAgentEvents();
-    sessionCompanion.dispose();
-    sessionObserver.dispose();
+    params.signal.removeEventListener("abort", stopSessionBackgroundWork);
+    stopSessionBackgroundWork();
+    await sessionBackgroundStop;
     unsubscribePrivateAuditEvents?.();
     unsubscribeToolAuditEvents?.();
     unsubscribeMessageAuditEvents?.();
@@ -504,6 +538,7 @@ export function startGatewayEventSubscriptions(params: {
   });
 
   const transcriptUnsub = onInternalSessionTranscriptUpdate((evt) => {
+    sessionActivitySummaries.handleTranscript(evt);
     void dispatchEventHandler({
       loadHandler: getTranscriptUpdateHandler,
       event: evt,
@@ -514,6 +549,7 @@ export function startGatewayEventSubscriptions(params: {
   });
 
   const unsubscribeProfileChanges = onUserProfilesChanged(() => {
+    params.refreshConnectedUserProfiles();
     params.broadcastToConnIds(
       "sessions.changed",
       { reason: "profile-identity" },
@@ -521,6 +557,17 @@ export function startGatewayEventSubscriptions(params: {
     );
   });
   const unsubscribeLifecycle = onSessionLifecycleEvent((evt) => {
+    sessionActivitySummaries.handleLifecycle(evt);
+    if (evt.reason === "progress-card-reset" && evt.agentId) {
+      // Card readers need not subscribe to session lists. Preserve the canonical
+      // owner tuple even when distinct global rows share a display key.
+      params.broadcast(
+        "progressCard.changed",
+        { sessionKey: sessionObserverScopeKey(evt.sessionKey, evt.agentId), revision: null },
+        { sessionKeys: [evt.sessionKey], agentId: evt.agentId },
+      );
+      return;
+    }
     void dispatchEventHandler({
       loadHandler: getLifecycleEventHandler,
       event: evt,
@@ -538,71 +585,10 @@ export function startGatewayEventSubscriptions(params: {
     unsubscribeLifecycle();
   };
 
-  let taskObserverDisposed = false;
-  const lastTaskSummaryById = new Map<string, string>();
-  const taskObservers = {
-    onEvent: (event: TaskRegistryObserverEvent) => {
-      let payload: TaskEventPayload;
-      let sessionTarget: ReturnType<typeof resolveTaskRequesterSessionTarget>;
-      switch (event.kind) {
-        case "upserted": {
-          const task = mapTaskSummary(event.task);
-          const summary = JSON.stringify(task);
-          if (lastTaskSummaryById.get(task.id) === summary) {
-            return;
-          }
-          lastTaskSummaryById.set(task.id, summary);
-          payload = { action: "upserted", task };
-          sessionTarget = resolveTaskRequesterSessionTarget(event.task);
-          break;
-        }
-        case "deleted":
-          lastTaskSummaryById.delete(event.taskId);
-          payload = { action: "deleted", taskId: event.taskId };
-          sessionTarget = resolveTaskRequesterSessionTarget(event.previous);
-          break;
-        case "restored":
-          lastTaskSummaryById.clear();
-          payload = { action: "restored" };
-          break;
-      }
-      params.broadcast("task", payload, {
-        dropIfSlow: true,
-        ...(sessionTarget
-          ? { sessionKeys: [sessionTarget.sessionKey], agentId: sessionTarget.agentId }
-          : {}),
-      });
-      const taskId = terminalTaskId(event);
-      if (taskId) {
-        params.terminalSessions.closeTaskSessions(taskId);
-      }
-    },
-  };
-  const taskObserverRuntimePromise = import("../tasks/task-registry.store.js").then((module) => {
-    if (!taskObserverDisposed) {
-      module.configureTaskRegistryRuntime({ observers: taskObservers });
-    }
-    return module;
-  });
-  void taskObserverRuntimePromise.catch((error: unknown) => {
-    params.log.warn("Task registry observer registration failed", { error });
-  });
-  // The observer slot is a process-wide singleton. Cleanup returns its promise
-  // so shutdown can await it, and only clears the slot when it still holds
-  // this subscription's observer — a replacement gateway may have registered
-  // its own observer before a stale deferred dispose runs.
-  const taskUnsub = () => {
-    taskObserverDisposed = true;
-    return taskObserverRuntimePromise
-      .then((module) => {
-        if (module.getTaskRegistryObservers() === taskObservers) {
-          module.configureTaskRegistryRuntime({ observers: null });
-        }
-      })
-      .catch(() => undefined);
-  };
+  const taskUnsub = startGatewayTaskSubscriptions(params);
 
   return {
+    sessionActivitySummaries,
     sessionCompanion,
     sessionObserver,
     agentUnsub,

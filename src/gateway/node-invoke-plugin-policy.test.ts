@@ -5,6 +5,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createDeferred } from "../../test/helpers/promise.js";
 import { createOperationalRunInstanceRef } from "../agents/admitted-run-context.js";
 import type { ChannelApprovalKind } from "../infra/approval-types.js";
 import { resolveCanonicalPluginApprovalRequestAllowedDecisions } from "../infra/plugin-approval-canonical-decisions.js";
@@ -16,7 +17,7 @@ import {
 import { createEmptyPluginRegistry } from "../plugins/registry-empty.js";
 import { resetPluginRuntimeStateForTest, setActivePluginRegistry } from "../plugins/runtime.js";
 import type { OpenClawPluginNodeInvokePolicyContext } from "../plugins/types.js";
-import { closeOpenClawStateDatabaseByPath } from "../state/openclaw-state-db.js";
+import { closeOpenClawStateDatabaseByPath } from "../state/openclaw-state-db-cache.js";
 import { ExecApprovalManager } from "./exec-approval-manager.js";
 import { createTestApprovalManager } from "./exec-approval-manager.test-support.js";
 import { applyPluginNodeInvokePolicy } from "./node-invoke-plugin-policy.js";
@@ -95,6 +96,7 @@ describe("applyPluginNodeInvokePolicy", () => {
       command: DEMO_COMMAND,
       params: DEMO_PARAMS,
       timeoutMs: undefined,
+      deadlineAtMs: undefined,
       idempotencyKey: undefined,
       isDispatchAuthorized: expect.any(Function),
       onDispatchReady: expect.any(Function),
@@ -292,9 +294,14 @@ describe("applyPluginNodeInvokePolicy", () => {
     }
   });
 
-  it.each([5_000, 0])(
-    "bounds plugin timeout override %i by the remaining invocation deadline",
-    async (overrideTimeoutMs) => {
+  it.each([
+    { overrideTimeoutMs: 5_000, expectedTimeoutMs: 250, expectedDeadlineAtMs: 1_250 },
+    { overrideTimeoutMs: 0, expectedTimeoutMs: 250, expectedDeadlineAtMs: 1_250 },
+    { overrideTimeoutMs: 80, expectedTimeoutMs: 80, expectedDeadlineAtMs: 1_080 },
+  ])(
+    "bounds plugin timeout override $overrideTimeoutMs by the original or earlier deadline",
+    async ({ overrideTimeoutMs, expectedTimeoutMs, expectedDeadlineAtMs }) => {
+      const clock = vi.spyOn(performance, "now").mockReturnValue(1_000);
       setDangerousDemoCommandRegistry([
         createDemoPolicy((ctx: OpenClawPluginNodeInvokePolicyContext) =>
           ctx.invokeNode({ timeoutMs: overrideTimeoutMs }),
@@ -303,24 +310,27 @@ describe("applyPluginNodeInvokePolicy", () => {
       const { context, invoke } = createContext();
       const controller = new AbortController();
 
-      const result = await applyPluginNodeInvokePolicy({
-        context,
-        client: null,
-        nodeSession: createNodeSession(),
-        command: DEMO_COMMAND,
-        params: DEMO_PARAMS,
-        timeoutMs: 1_000,
-        signal: controller.signal,
-        resolveRemainingTimeoutMs: () => 250,
-      });
+      try {
+        const result = await applyPluginNodeInvokePolicy({
+          context,
+          client: null,
+          nodeSession: createNodeSession(),
+          command: DEMO_COMMAND,
+          params: DEMO_PARAMS,
+          timeoutMs: 1_000,
+          deadlineAtMs: 1_250,
+          signal: controller.signal,
+          resolveRemainingTimeoutMs: () => 250,
+        });
 
-      expect(result).toMatchObject({ ok: true });
-      const request = invoke.mock.calls[0]?.[0] as
-        | { timeoutMs?: number; signal?: AbortSignal }
-        | undefined;
-      expect(request?.signal).toBe(controller.signal);
-      expect(request?.timeoutMs).toBeGreaterThan(0);
-      expect(request?.timeoutMs).toBeLessThanOrEqual(250);
+        expect(result).toMatchObject({ ok: true });
+        const request = invoke.mock.calls[0]?.[0];
+        expect(request?.signal).toBe(controller.signal);
+        expect(request?.timeoutMs).toBe(expectedTimeoutMs);
+        expect(request?.deadlineAtMs).toBe(expectedDeadlineAtMs);
+      } finally {
+        clock.mockRestore();
+      }
     },
   );
 
@@ -469,10 +479,7 @@ describe("applyPluginNodeInvokePolicy", () => {
       createDemoPolicy((ctx: OpenClawPluginNodeInvokePolicyContext) => ctx.invokeNode()),
     ]);
     let authorityActive = true;
-    let releasePairingCheck: (() => void) | undefined;
-    const pairingCheck = new Promise<void>((resolve) => {
-      releasePairingCheck = resolve;
-    });
+    const { promise: pairingCheck, resolve: releasePairingCheck } = createDeferred();
     const { context, invoke } = createContext({
       validateAgentRuntimeApprovalAuthority: () => authorityActive,
     });
@@ -522,10 +529,7 @@ describe("applyPluginNodeInvokePolicy", () => {
       createDemoPolicy((ctx: OpenClawPluginNodeInvokePolicyContext) => ctx.invokeNode()),
     ]);
     let approvalActive = true;
-    let releasePairingCheck: (() => void) | undefined;
-    const pairingCheck = new Promise<void>((resolve) => {
-      releasePairingCheck = resolve;
-    });
+    const { promise: pairingCheck, resolve: releasePairingCheck } = createDeferred();
     const { context, invoke } = createContext();
     const resultPromise = applyPluginNodeInvokePolicy({
       context,
@@ -851,7 +855,7 @@ describe("applyPluginNodeInvokePolicy", () => {
     await expectApprovalResolution(resultPromise, manager, record);
   });
 
-  it("sends an iOS cleanup wake when a plugin policy approval expires", async (testContext) => {
+  it("sends an iOS cleanup wake through the current delivery owner", async (testContext) => {
     const manager = createTestApprovalManager<PluginApprovalRequestPayload>(testContext, {
       approvalKind: "plugin",
     });
@@ -869,13 +873,17 @@ describe("applyPluginNodeInvokePolicy", () => {
 
     const resultPromise = invokeDemoPolicy(context, createOperatorClient());
     const record = await expectSinglePendingApproval(manager);
+    const replacementExpired = vi.fn(async () => {});
+    context.pluginApprovalIosPushDelivery = { handleExpired: replacementExpired };
     manager.expire(record.id, "timeout");
 
     await expect(resultPromise).resolves.toStrictEqual({
       ok: true,
       payload: { id: record.id, decision: null },
     });
-    expect(handleExpired).toHaveBeenCalledWith(expect.objectContaining({ id: record.id }));
+    expect(handleExpired).not.toHaveBeenCalled();
+    expect(replacementExpired).toHaveBeenCalledWith(expect.objectContaining({ id: record.id }));
+    expect(replacementExpired.mock.contexts).toEqual([context.pluginApprovalIosPushDelivery]);
   });
 
   it("ignores approval routes from unsigned node.invoke clients", async (testContext) => {

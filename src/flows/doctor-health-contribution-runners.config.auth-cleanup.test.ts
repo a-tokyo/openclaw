@@ -17,7 +17,8 @@ vi.mock("../commands/doctor/shared/config-flow-steps.js", () => ({
   restoreDoctorConfigEnvRefs: (cfg: OpenClawConfig) => cfg,
 }));
 
-vi.mock("../config/config.js", () => ({
+vi.mock("../config/config.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../config/config.js")>()),
   transformConfigFile: async ({
     transform,
     ...options
@@ -27,7 +28,8 @@ vi.mock("../config/config.js", () => ({
       { snapshot: createDoctorConfigSnapshot(), previousHash: null, attempt: 0 },
       {},
     );
-    return mocks.replaceConfigFile({ ...options, nextConfig });
+    await mocks.replaceConfigFile({ ...options, nextConfig });
+    return { nextConfig };
   },
 }));
 
@@ -70,6 +72,7 @@ describe("Doctor retired auth profile cleanup", () => {
     expect(mocks.replaceConfigFile).toHaveBeenCalledOnce();
     expect(mocks.removeAuthProfilesAcrossOwnerStores).toHaveBeenCalledWith({
       agentDir: "/tmp/openclaw/agents/main",
+      cfg: { gateway: { mode: "local" } },
       profileIds: ["anthropic:claude-cli"],
     });
     expect(mocks.replaceConfigFile.mock.invocationCallOrder[0]).toBeLessThan(

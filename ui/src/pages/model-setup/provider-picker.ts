@@ -1,12 +1,32 @@
 import { html, nothing } from "lit";
 import { ref } from "lit/directives/ref.js";
-import type { SystemAgentSetupDetectResult } from "../../api/types.ts";
+import type {
+  SystemAgentSetupActivateParams,
+  SystemAgentSetupDetectResult,
+} from "../../api/types.ts";
 import { icons } from "../../components/icons.ts";
 import { syncDropdownItemRadio } from "../../components/web-awesome.ts";
 import { t } from "../../i18n/index.ts";
 import { renderProviderIcon } from "./model-setup-icon-loader.ts";
 
 type ManualProvider = SystemAgentSetupDetectResult["manualProviders"][number];
+
+export function manualProviderActivation(
+  providers: readonly ManualProvider[],
+  providerId: string,
+  apiKey: string,
+): SystemAgentSetupActivateParams | null {
+  const provider = providers.find((candidate) => candidate.id === providerId);
+  const value = apiKey.trim();
+  return provider && value
+    ? {
+        kind: "api-key",
+        authChoice: provider.id,
+        apiKey: value,
+        ...(provider.modelTarget ? { modelTarget: provider.modelTarget } : {}),
+      }
+    : null;
+}
 
 type WebAwesomeSelectEvent = CustomEvent<{
   item: HTMLElement & { checked?: boolean; value?: string };
@@ -152,35 +172,37 @@ export function renderManualProviderPicker(
           ${icons.chevronDown}
         </span>
       </button>
-      ${result.manualProviders.map((entry) => {
-        const selected = entry.id === props.manualProviderId;
-        const entryMethod = manualProviderMethod(entry);
-        const accessibleLabel = [manualProviderName(entry), entryMethod, entry.hint]
-          .filter(Boolean)
-          .join(", ");
-        return html`
-          <wa-dropdown-item
-            class="model-setup-provider-select__option"
-            data-manual-provider=${entry.id}
-            ?data-selected=${selected}
-            aria-label=${accessibleLabel}
-            .value=${entry.id}
-            type="checkbox"
-            .checked=${selected}
-            ?disabled=${props.actionsDisabled}
-            ${ref((element) => syncDropdownItemRadio(element, selected))}
-          >
-            <span slot="icon">
-              ${renderProviderIcon(props, entry, "model-setup__icon--picker")}
-            </span>
-            <span class="model-setup-provider-select__copy">
-              <strong>${manualProviderName(entry)}</strong>
-              ${entryMethod ? html`<span>${entryMethod}</span>` : nothing}
-              ${entry.hint ? html`<small>${entry.hint}</small>` : nothing}
-            </span>
-          </wa-dropdown-item>
-        `;
-      })}
+      ${result.manualProviders
+        .toSorted((a, b) => manualProviderName(a).localeCompare(manualProviderName(b)))
+        .map((entry) => {
+          const selected = entry.id === props.manualProviderId;
+          const entryMethod = manualProviderMethod(entry);
+          const accessibleLabel = [manualProviderName(entry), entryMethod, entry.hint]
+            .filter(Boolean)
+            .join(", ");
+          return html`
+            <wa-dropdown-item
+              class="model-setup-provider-select__option"
+              data-manual-provider=${entry.id}
+              ?data-selected=${selected}
+              aria-label=${accessibleLabel}
+              .value=${entry.id}
+              type="checkbox"
+              .checked=${selected}
+              ?disabled=${props.actionsDisabled}
+              ${ref((element) => syncDropdownItemRadio(element, selected))}
+            >
+              <span slot="icon">
+                ${renderProviderIcon(props, entry, "model-setup__icon--picker")}
+              </span>
+              <span class="model-setup-provider-select__copy">
+                <strong>${manualProviderName(entry)}</strong>
+                ${entryMethod ? html`<span>${entryMethod}</span>` : nothing}
+                ${entry.hint ? html`<small>${entry.hint}</small>` : nothing}
+              </span>
+            </wa-dropdown-item>
+          `;
+        })}
     </wa-dropdown>
   `;
 }

@@ -89,7 +89,7 @@ export async function prepareReplyRunContext(params: RunPreparedReplyParams) {
   } = params;
   const runtimePolicySessionKey = resolveRuntimePolicySessionKey({ agentId, cfg, ctx, sessionKey });
   const { resolvedElevatedLevel, execOverrides, abortedLastRun } = params;
-  let { sessionEntry } = params;
+  const { sessionEntry } = params;
   const isHeartbeat = opts?.isHeartbeat === true;
   const explicitThinkingLevelOverride = normalizeThinkLevel(opts?.thinkingLevelOverride);
   const effectiveQueueMode = opts?.queueModeOverride ?? perMessageQueueMode;
@@ -222,15 +222,11 @@ export async function prepareReplyRunContext(params: RunPreparedReplyParams) {
   const isDirectedTurn = isDirectedSourceReplyTurn(ctx, cfg, isDirectChat, inboundEventKind);
   const isAmbientRoomEvent = inboundEventKind === "room_event" && !isDirectedTurn;
   const allowEmptyAssistantReplyAsSilent =
-    isGroupChat &&
-    !isDirectedTurn &&
-    (isAmbientRoomEvent || silentReplySettings.policy === "allow");
-  // Heartbeats retain the embedded runner's trigger-owned optional default.
-  const terminalReplyExpectation = isHeartbeat
-    ? undefined
-    : isAmbientRoomEvent
-      ? "optional"
-      : "required";
+    isHeartbeat ||
+    (isGroupChat &&
+      !isDirectedTurn &&
+      (isAmbientRoomEvent || silentReplySettings.policy === "allow"));
+  const terminalReplyExpectation = isHeartbeat || isAmbientRoomEvent ? "optional" : "required";
   const groupSystemPrompt = normalizeOptionalString(promptSessionCtx.GroupSystemPrompt) ?? "";
   const inboundMetaPrompt = buildInboundMetaSystemPrompt(
     isNewSession ? promptSessionCtx : { ...promptSessionCtx, ThreadStarterBody: undefined },
@@ -422,17 +418,11 @@ export async function prepareReplyRunContext(params: RunPreparedReplyParams) {
     inboundEventKind,
     sourceReplyDeliveryMode,
   });
-  const prefixedBodyBase = await applySessionHints({
+  const prefixedBodyBase = applySessionHints({
     baseBody: promptEnvelopeBase.effectiveBaseBody,
     abortedLastRun,
-    sessionEntry,
-    sessionEntryHandle,
-    sessionStore,
-    sessionKey,
-    storePath,
     abortKey: command.abortKey,
   });
-  sessionEntry = sessionEntryHandle?.getCurrent() ?? sessionEntry;
   const isGroupSession = sessionEntry?.chatType === "group" || sessionEntry?.chatType === "channel";
   const isMainSession = !isGroupSession && sessionKey === normalizeMainKey(sessionCfg?.mainKey);
 

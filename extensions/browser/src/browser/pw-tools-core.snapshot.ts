@@ -32,6 +32,7 @@ import {
   type RoleRefMap,
 } from "./pw-role-snapshot.js";
 import { connectBrowser, pageTargetInfo } from "./pw-session-connection.js";
+import type { RoleRefs } from "./pw-session-contracts.js";
 import {
   assertPageNavigationCompletedSafely,
   closeBlockedNavigationTarget,
@@ -48,10 +49,18 @@ import {
   readMainFrameDocumentIdentityForPage,
   withPageScopedCdpClient,
 } from "./pw-session.page-cdp.js";
+import {
+  assertInteractionCurrent,
+  type InteractionTargetOptions,
+} from "./pw-tools-core.interactions.navigation.js";
 import { runPageEmulationTransition, setViewportSizeOnPage } from "./pw-tools-core.state.js";
+import {
+  assertBrowserDashboardTabCanClose,
+  readBrowserDashboardTabs,
+} from "./session-tab-store.js";
 import { appendSnapshotUrls, type SnapshotUrlEntry } from "./snapshot-urls.js";
 
-type StoredSnapshotRef = RoleRefMap[string] & { backendDOMNodeId?: number };
+type StoredSnapshotRef = RoleRefs[string] & { backendDOMNodeId?: number };
 
 function resolveBoundedTimeoutMs(
   timeoutMs: number | undefined,
@@ -80,7 +89,7 @@ async function collectSnapshotUrls(page: Page): Promise<SnapshotUrlEntry[]> {
     .evaluate(() => {
       const seen = new Set<string>();
       const out: SnapshotUrlEntry[] = [];
-      for (const anchor of Array.from(document.querySelectorAll("a[href]"))) {
+      for (const anchor of document.querySelectorAll("a[href]")) {
         const href = anchor instanceof HTMLAnchorElement ? anchor.href : "";
         if (!href || seen.has(href)) {
           continue;
@@ -160,13 +169,15 @@ export async function storeSnapshotRefsViaPlaywright(opts: {
       targetId: opts.targetId,
     }));
   ensurePageState(page);
+  const backendRefs: { ref: string; backendDOMNodeId: number }[] = [];
+  for (const [ref, info] of Object.entries(sourceRefs)) {
+    if (typeof info.backendDOMNodeId === "number") {
+      backendRefs.push({ ref, backendDOMNodeId: info.backendDOMNodeId });
+    }
+  }
   const markedRefs = await markBackendDomRefsOnPage({
     page,
-    refs: Object.entries(sourceRefs).flatMap(([ref, info]) =>
-      typeof info.backendDOMNodeId === "number"
-        ? [{ ref, backendDOMNodeId: info.backendDOMNodeId }]
-        : [],
-    ),
+    refs: backendRefs,
   });
   if (
     opts.expectedDocumentIdentity &&
@@ -176,9 +187,11 @@ export async function storeSnapshotRefsViaPlaywright(opts: {
   }
   const refs: RoleRefMap = Object.fromEntries(
     Object.entries(sourceRefs).map(([ref, info]) => {
-      const storedInfo = { ...info };
-      delete storedInfo.backendDOMNodeId;
-      return [ref, { ...storedInfo, ...(markedRefs.has(ref) ? { domMarker: true } : {}) }];
+      const { backendDOMNodeId: _backendDOMNodeId, ...storedInfo } = info;
+      if (markedRefs.has(ref)) {
+        storedInfo.domMarker = true;
+      }
+      return [ref, storedInfo];
     }),
   );
   storeRoleRefsForTarget({
@@ -231,9 +244,7 @@ export async function snapshotAriaViaPlaywright(opts: {
       ? Math.max(500, Math.min(60_000, Math.floor(opts.timeoutMs)))
       : undefined;
   const collectAxTree = withPageScopedCdpClient({
-    cdpUrl: opts.cdpUrl,
     page,
-    targetId: opts.targetId,
     fn: async (send) => {
       await send("Accessibility.enable").catch(() => {});
       return (await send("Accessibility.getFullAXTree")) as {
@@ -489,6 +500,7 @@ export async function snapshotRoleViaPlaywright(opts: {
 export async function navigateViaPlaywright(opts: {
   cdpUrl: string;
   targetId?: string;
+  assertCurrent?: InteractionTargetOptions["assertCurrent"];
   resolveOperationTarget?: () => string | undefined | Promise<string | undefined>;
   relayReference?: RelayOperationReference;
   url: string;
@@ -539,9 +551,14 @@ export async function navigateViaPlaywright(opts: {
               if ((await opts.resolveOperationTarget?.()) !== currentTargetId) {
                 throw new BrowserTabNotFoundError({ input: currentTargetId });
               }
+              if (opts.assertCurrent) {
+                await opts.assertCurrent();
+              }
             },
           }
-        : {}),
+        : opts.assertCurrent
+          ? { assertPageCurrent: opts.assertCurrent }
+          : {}),
     });
   const navigateWithDownloadCapture = async (): Promise<{
     response: Awaited<ReturnType<typeof navigate>> | null;
@@ -656,13 +673,13 @@ export async function navigateViaPlaywright(opts: {
 }
 
 /** Resizes the target page viewport within the browser action policy bounds. */
-export async function resizeViewportViaPlaywright(opts: {
-  cdpUrl: string;
-  targetId?: string;
-  width: number;
-  height: number;
-  signal?: AbortSignal;
-}): Promise<void> {
+export async function resizeViewportViaPlaywright(
+  opts: InteractionTargetOptions & {
+    width: number;
+    height: number;
+    signal?: AbortSignal;
+  },
+): Promise<void> {
   const page = await getPageForTargetId(opts);
   const state = ensurePageState(page);
   const viewport = {
@@ -672,17 +689,30 @@ export async function resizeViewportViaPlaywright(opts: {
   await runPageEmulationTransition({
     state,
     signal: opts.signal,
-    run: () => setViewportSizeOnPage(page, state, viewport),
+    run: opts.assertCurrent
+      ? async () => {
+          await assertInteractionCurrent(opts);
+          opts.signal?.throwIfAborted();
+          await setViewportSizeOnPage(page, state, viewport);
+        }
+      : () => setViewportSizeOnPage(page, state, viewport),
   });
 }
 
 /** Closes the target Playwright page. */
-export async function closePageViaPlaywright(opts: {
-  cdpUrl: string;
-  targetId?: string;
-}): Promise<void> {
+export async function closePageViaPlaywright(opts: InteractionTargetOptions): Promise<void> {
   const page = await getPageForTargetId(opts);
   ensurePageState(page);
+  if (readBrowserDashboardTabs().length > 0) {
+    const targetId = (await pageTargetInfo(page))?.targetId;
+    if (!targetId) {
+      throw new Error("Cannot verify that this page is not retained by a dashboard");
+    }
+    assertBrowserDashboardTabCanClose(targetId);
+  }
+  if (opts.assertCurrent) {
+    await assertInteractionCurrent(opts);
+  }
   await page.close();
 }
 

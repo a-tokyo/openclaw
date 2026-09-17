@@ -6,16 +6,15 @@ import {
   mkdirSync,
   readFileSync,
   realpathSync,
-  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { delimiter, join } from "node:path";
 import { afterAll } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../helpers/temp-dir.js";
-import { copyPrWrapperSources } from "./pr-wrapper.test-support.js";
+import { copyPrWrapperSources, linkPrWrapperDependencies } from "./pr-wrapper.test-support.js";
 
 const templateDirs = useAutoCleanupTempDirTracker(afterAll);
-let fixtureTemplate: ReturnType<typeof createMainRefreshTemplate> | undefined;
+const fixtureTemplates = new Map<boolean, ReturnType<typeof createMainRefreshTemplate>>();
 
 function shellQuote(value: string): string {
   return `'${value.replace(/'/gu, `'\\''`)}'`;
@@ -45,7 +44,7 @@ function createFixtureGit(root: string) {
   return { env, realGit, git };
 }
 
-function createMainRefreshTemplate(directory: string) {
+function createMainRefreshTemplate(directory: string, perWorktreeConfig: boolean) {
   const root = realpathSync(directory);
   const canonical = join(root, "canonical");
   const origin = join(root, "origin.git");
@@ -55,7 +54,9 @@ function createMainRefreshTemplate(directory: string) {
   git(canonical, "config", "user.name", "OpenClaw Test");
   git(canonical, "config", "user.email", "test@example.invalid");
   git(canonical, "config", "core.hooksPath", "/dev/null");
-  git(canonical, "config", "extensions.worktreeConfig", "true");
+  if (perWorktreeConfig) {
+    git(canonical, "config", "extensions.worktreeConfig", "true");
+  }
   copyPrWrapperSources(canonical);
   cpSync(join(process.cwd(), ".github", "workflows"), join(canonical, ".github", "workflows"), {
     recursive: true,
@@ -92,10 +93,21 @@ function createMainRefreshTemplate(directory: string) {
 
 // Keep the complete wrapper/lock/entry/gate owners. Command resolution, Git
 // transport faults, and GitHub responses are synthetic.
-export function createMainRefreshFixture(directory: string) {
-  const template = (fixtureTemplate ??= createMainRefreshTemplate(
-    templateDirs.make("openclaw-pr-main-refresh-template-"),
-  ));
+export function createMainRefreshFixture(
+  directory: string,
+  options: { perWorktreeConfig?: boolean } = {},
+) {
+  // Existing regression fixtures retain worktreeConfig; acceleration starts with
+  // a distinct pristine fixture, never a shared-config reset after sparse use.
+  const perWorktreeConfig = options.perWorktreeConfig !== false;
+  let template = fixtureTemplates.get(perWorktreeConfig);
+  if (!template) {
+    template = createMainRefreshTemplate(
+      templateDirs.make("openclaw-pr-main-refresh-template-"),
+      perWorktreeConfig,
+    );
+    fixtureTemplates.set(perWorktreeConfig, template);
+  }
   const root = realpathSync(directory);
   const canonical = join(root, "canonical");
   const origin = join(root, "origin.git");
@@ -119,7 +131,7 @@ export function createMainRefreshFixture(directory: string) {
     "https://github.com/fixture/repo.git",
   );
   git(canonical, "worktree", "add", "--detach", worktree, head);
-  symlinkSync(join(process.cwd(), "node_modules"), join(canonical, "node_modules"), "dir");
+  linkPrWrapperDependencies(canonical);
   const local = join(worktree, ".local");
   mkdirSync(local);
   const metadata = {
@@ -199,6 +211,8 @@ export function createMainRefreshFixture(directory: string) {
     authorPermission: "write",
     failFetch: false,
     failPrFetch: false,
+    prIdentityDriftAfterFetch: "" as "" | "oid" | "branch" | "repository",
+    wrongPrFetch: false,
     failDetach: false,
     failFetchAt: 0,
     pauseFetchAt: 0,
@@ -262,7 +276,11 @@ function runGit(args, input) {
     instrumentedGit,
     prelude +
       `
-if ((control.failPrFetch && args.includes('fetch') && args.includes('pull/42/head:pr-42')) ||
+const prFetch = args.includes('fetch') && args.some(arg =>
+  arg.startsWith('pull/42/head') ||
+  arg.replace(/^\\+/, '').split(':')[0] === control.metadata.headRefOid
+);
+if ((control.failPrFetch && prFetch) ||
     (control.failDetach && args[0] === 'checkout' && args[1] === '--detach')) {
   console.error('fatal: injected prepare handoff failure');
   process.exit(73);
@@ -296,6 +314,22 @@ if (args.includes('push')) {
   event({ kind: 'leased-cleanup', args });
 }
 const result = spawnSync(git, args, { stdio: 'inherit' });
+if (prFetch && result.status === 0) {
+  const prefix = args.slice(0, args.indexOf('fetch'));
+  const destination = args.at(-1).split(':')[1];
+  if (control.wrongPrFetch && destination) {
+    runGit([...prefix, 'update-ref', destination.startsWith('refs/') ? destination : 'refs/heads/' + destination,
+      ${JSON.stringify(sameTreeHead)}]);
+  }
+  if (control.prIdentityDriftAfterFetch === 'oid') {
+    control.metadata.headRefOid = ${JSON.stringify(sameTreeHead)};
+  } else if (control.prIdentityDriftAfterFetch === 'branch') {
+    control.metadata.headRefName = 'renamed';
+  } else if (control.prIdentityDriftAfterFetch === 'repository') {
+    control.metadata.headRepository.nameWithOwner = 'fixture/replacement';
+  }
+  if (control.prIdentityDriftAfterFetch) writeFileSync(controlFile, JSON.stringify(control));
+}
 if (mainFetch && result.status === 0) {
   const prefix = args.slice(0, args.indexOf('fetch'));
   const destination = args.at(-1).split(':')[1] || 'FETCH_HEAD';
@@ -347,8 +381,10 @@ if (args[0] === 'pr' && args[1] === 'view') {
   }
   const parent = runGit(['-C', origin, 'rev-parse', 'refs/heads/main']);
   const tree = runGit(['-C', origin, 'merge-tree', '--write-tree', parent, control.metadata.headRefOid]);
+  const bodyIndex = args.indexOf('--body-file');
+  const body = bodyIndex < 0 ? '' : readFileSync(args[bodyIndex + 1], 'utf8');
   const landed = runGit(['-C', origin, '-c', 'user.name=Fixture', '-c',
-    'user.email=fixture@example.invalid', 'commit-tree', tree, '-p', parent], 'Fixture squash\\n');
+    'user.email=fixture@example.invalid', 'commit-tree', tree, '-p', parent], 'Fixture squash\\n\\n' + body);
   runGit(['-C', origin, 'update-ref', 'refs/heads/main', landed, parent]);
   control.metadata.state = 'MERGED';
   control.metadata.mergeCommit = { oid: landed };
@@ -392,20 +428,45 @@ if (args[0] === 'pr' && args[1] === 'view') {
         process.exit(1);
       }
       value = { data: { viewer: { login: 'fixture' } } };
+    } else if (args.some(arg => arg.includes('viewerMergeBodyText'))) {
+      value = { data: { repository: { pullRequest: {
+        headRefOid: control.metadata.headRefOid,
+        author: { ...control.metadata.author, __typename: 'User' },
+        isMergeQueueEnabled: control.metadata.isMergeQueueEnabled,
+        viewerMergeBodyText: 'Reviewed fixture body',
+      } } } };
     } else if (args.some(arg => arg.includes('ref(qualifiedName:'))) {
       value = { data: { repository: {
-        id: 'fixture-repo', nameWithOwner: 'fixture/repo', url: 'https://github.com/fixture/repo',
+        id: 'fixture-repo', databaseId: 123, nameWithOwner: 'fixture/repo', url: 'https://github.com/fixture/repo',
         ref: { target: { oid: runGit(['-C', origin, 'rev-parse', 'refs/heads/main']) } },
         pullRequest: control.metadata,
       } } };
     } else {
       throw new Error('Unexpected GraphQL request');
     }
+  } else if (endpoint === 'repos/fixture/repo') {
+    value = { id: 123, node_id: 'fixture-repo', full_name: 'fixture/repo', html_url: 'https://github.com/fixture/repo' };
+  } else if (endpoint === 'repos/fixture/repo/commits/${head}') {
+    const [name, email] = runGit(['-C', origin, 'show', '-s', '--format=%an%n%ae', ${JSON.stringify(head)}]).split('\\n');
+    value = { commit: { author: { name, email } }, author: { ...control.metadata.author, type: 'User' } };
   } else if (endpoint === 'users/fixture') {
     value = { id: 123 };
+  } else if (new RegExp('^repos/fixture/repo/commits/[0-9a-f]{40}$').test(endpoint)) {
+    const [name, email] = runGit(['-C', origin, 'show', '-s', '--format=%an%n%ae',
+      endpoint.split('/').at(-1) + '^{commit}']).split('\\n');
+    // Synthetic Git authors have no linked GitHub account.
+    value = { commit: { author: { name, email } }, author: null };
   } else if (endpoint === 'repos/fixture/repo/collaborators/fixture/permission') {
     if (control.authorPermission === 'error') process.exit(1);
     value = { permission: control.authorPermission };
+  } else if (endpoint.startsWith('repos/fixture/repo/commits/')) {
+    const oid = endpoint.slice('repos/fixture/repo/commits/'.length);
+    if (!/^[0-9a-f]{40}$/.test(oid)) throw new Error('Invalid synthetic commit identity');
+    const [name, email] = runGit(['-C', origin, 'show', '-s', '--format=%an%n%ae', oid]).split('\\n');
+    value = {
+      commit: { author: { name, email } },
+      author: { login: control.metadata.author.login, type: 'User' },
+    };
   } else if (endpoint.startsWith('repos/fixture/repo/issues/42/comments')) {
     if (args.includes('POST')) {
       value = { html_url: 'https://example.invalid/pr/42#completion' };
@@ -570,15 +631,20 @@ if (process.argv[1]?.endsWith('/watch-pr-ci.mts')) {
         encoding: "utf8",
       });
     },
-    shell(command: string, bash = "bash") {
+    shell(command: string, shellOptions: { supervised?: boolean } = {}) {
+      // Sourced helpers bypass the entrypoint's Darwin heredoc protection.
+      const bash = process.platform === "darwin" ? "/bin/bash" : "bash";
+      const args = [
+        "-c",
+        `set -euo pipefail\nscript_parent_dir="$1/scripts"\nsource "$script_parent_dir/lib/plain-gh.sh"\nfor library in worktree operation-lock common changelog gates push review prepare-core merge; do source "$script_parent_dir/pr-lib/$library.sh"; done\n${command}`,
+        "fixture",
+        canonical,
+      ];
       return spawnSync(
-        bash,
-        [
-          "-c",
-          `set -euo pipefail\nscript_parent_dir="$1/scripts"\nsource "$script_parent_dir/lib/plain-gh.sh"\nfor library in worktree operation-lock common changelog gates push review prepare-core merge; do source "$script_parent_dir/pr-lib/$library.sh"; done\n${command}`,
-          "fixture",
-          canonical,
-        ],
+        shellOptions.supervised ? process.execPath : bash,
+        shellOptions.supervised
+          ? [join(canonical, "scripts/pr-lib/process-group-runner.mjs"), canonical, bash, ...args]
+          : args,
         { cwd: canonical, env, encoding: "utf8" },
       );
     },

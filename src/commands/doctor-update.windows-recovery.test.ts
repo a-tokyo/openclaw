@@ -19,6 +19,8 @@ describe("maybeOfferUpdateBeforeDoctor", () => {
     "stopped-mutation-throws",
     "restore-fails",
     "restart-fails",
+    "verify-fails",
+    "readiness-pending",
   ] as const)("finishes Windows task recovery after a Doctor update: %s", async (outcome) => {
     mockGitCheckout();
     let taskEnabled = false;
@@ -29,6 +31,7 @@ describe("maybeOfferUpdateBeforeDoctor", () => {
     const recovery = {
       suspended: Promise.resolve(true),
       interrupted: () => false,
+      handoff: vi.fn(),
       beginMutation: vi.fn(),
       restore: vi.fn(async (safe?: boolean) => {
         expect(safe).toBe(true);
@@ -37,7 +40,13 @@ describe("maybeOfferUpdateBeforeDoctor", () => {
         }
         taskEnabled = true;
       }),
-      complete: vi.fn(() => {
+      complete: vi.fn(async (safe?: boolean) => {
+        await new Promise<void>((resolve) => {
+          setImmediate(resolve);
+        });
+        if (safe === false) {
+          taskEnabled = false;
+        }
         recoveryClosed = true;
       }),
     };
@@ -69,14 +78,34 @@ describe("maybeOfferUpdateBeforeDoctor", () => {
     });
     mocks.maybeRestartServiceAfterFailedMutableUpdate.mockImplementation(async () => {
       expect(taskEnabled).toBe(true);
+      expect(recovery.complete).not.toHaveBeenCalled();
       return safeRecoveryFails ? "failed" : "healthy";
     });
     mocks.restartUpdatedGateway.mockImplementation(async () => {
       expect(taskEnabled).toBe(true);
+      expect(recovery.complete).not.toHaveBeenCalled();
       if (outcome === "restart-fails") {
         throw failure;
       }
     });
+    if (outcome === "verify-fails") {
+      mocks.waitForHealthyRestart.mockResolvedValue({
+        healthy: false,
+        runtime: { status: "stopped" },
+        staleGatewayPids: [],
+      });
+    }
+    if (outcome === "readiness-pending") {
+      mocks.waitForHealthyRestart.mockResolvedValue({
+        healthy: false,
+        runtime: { status: "running", pid: 7376 },
+        portUsage: { status: "free", listeners: [], hints: [] },
+        staleGatewayPids: [],
+        waitOutcome: "timeout",
+        elapsedMs: 90_000,
+        startupPhase: "waiting for Gateway listener",
+      });
+    }
     const runtime = {
       log: vi.fn(),
       error: vi.fn(),
@@ -87,20 +116,23 @@ describe("maybeOfferUpdateBeforeDoctor", () => {
     mocks.triageCommand.mockImplementation(async () => {
       expect(recoveryClosed).toBe(true);
     });
-    const offer = runOffer({ confirm: vi.fn().mockResolvedValue(true), runtime });
+    const outro = vi.fn();
+    const offer = runOffer({ confirm: vi.fn().mockResolvedValue(true), runtime, outro });
     const terminalFailure =
       unsafe ||
       mutationThrows ||
       outcome === "safe-error" ||
       safeRecoveryFails ||
       outcome === "restore-fails" ||
-      outcome === "restart-fails";
+      outcome === "restart-fails" ||
+      outcome === "verify-fails";
     if (terminalFailure) {
       await expect(offer).rejects.toEqual(new ExitError(1));
     } else {
       await expect(offer).resolves.toEqual({
         updated: true,
         handled: true,
+        ...(outcome === "readiness-pending" ? { reason: "gateway-readiness-unverified" } : {}),
       });
     }
     expect(recoveryClosed).toBe(true);
@@ -108,8 +140,13 @@ describe("maybeOfferUpdateBeforeDoctor", () => {
     expect(recovery.beginMutation).toHaveBeenCalledOnce();
     const restoreAttempted = !unsafe && !mutationThrows;
     const restoreVerified = restoreAttempted && outcome !== "restore-fails";
-    expect(taskEnabled).toBe(restoreVerified);
-    expect(recovery.complete).toHaveBeenCalledWith(restoreVerified);
+    const restartVerified =
+      restoreVerified &&
+      !safeRecoveryFails &&
+      outcome !== "restart-fails" &&
+      outcome !== "verify-fails";
+    expect(taskEnabled).toBe(restartVerified);
+    expect(recovery.complete).toHaveBeenCalledWith(restartVerified);
     if (!restoreAttempted) {
       expect(recovery.restore).not.toHaveBeenCalled();
     }
@@ -141,6 +178,29 @@ describe("maybeOfferUpdateBeforeDoctor", () => {
       expect(mocks.triageCommand.mock.calls[0]?.[1]?.recovery?.updateFailure).toMatchObject({
         result: { recovery: { serviceRestartSafe: true, service: "failed" } },
       });
+    }
+    if (outcome === "readiness-pending") {
+      expect(outro).toHaveBeenCalledWith(expect.stringContaining("readiness remains unverified"));
+      expect(mocks.note).toHaveBeenCalledWith(
+        expect.stringContaining("Reason: gateway-readiness-unverified"),
+        "Update result",
+      );
+      expect(mocks.restartUpdatedGateway).toHaveBeenCalledOnce();
+      expect(mocks.maybeRestartServiceAfterFailedMutableUpdate).not.toHaveBeenCalled();
+      expect(mocks.note).toHaveBeenCalledWith(expect.stringContaining("still starting"), "Update");
+      expect(mocks.completeUpdateCommandRun).toHaveBeenCalledWith(
+        expect.objectContaining({
+          status: "ok",
+          steps: expect.arrayContaining([
+            expect.objectContaining({
+              name: "gateway verification",
+              termination: "timeout",
+              advisory: expect.objectContaining({ kind: "recoverable-maintenance" }),
+            }),
+          ]),
+        }),
+        expect.anything(),
+      );
     }
   });
 });

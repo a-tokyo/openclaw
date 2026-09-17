@@ -3,8 +3,11 @@ import { html, nothing } from "lit";
 import type { AgentsListResult } from "../../../api/types.ts";
 import { icons } from "../../../components/icons.ts";
 import { t } from "../../../i18n/index.ts";
+import { registerChatMessageMetadataEnglish } from "../../../i18n/locales/en-chat-message-metadata.ts";
 import type { MessageGroup } from "../../../lib/chat/chat-types.ts";
 import { parseAgentSessionKey } from "../../../lib/sessions/session-key.ts";
+
+registerChatMessageMetadataEnglish();
 
 type ForwardedAttributionOptions = {
   agentId?: string;
@@ -42,8 +45,8 @@ export function renderForwardedAttribution(group: MessageGroup, opts: ForwardedA
       <span class="chat-reply-attribution__icon" aria-hidden="true">${icons.forward}</span>
       ${
         linkableSourceKey
-          ? // The titler owns child text (.textContent keeps Lit's part out of
-            // it). A rendered group's source never changes: messages are
+          ? // The titler may replace the initial label. Its .textContent binding
+            // keeps Lit text parts out of it. A group's source never changes: messages are
             // immutable and grouping splits on senderSession, so no keyed
             // remount is needed. Main-session sources pre-title as the agent's
             // display name (an agent's main session IS the agent); the titler
@@ -57,7 +60,10 @@ export function renderForwardedAttribution(group: MessageGroup, opts: ForwardedA
                 role="link"
                 tabindex="0"
                 data-session-key=${linkableSourceKey}
-                .textContent=${sourceMainLabel ?? linkableSourceKey}
+                ><span
+                  class="session-label"
+                  .textContent=${sourceMainLabel ?? linkableSourceKey}
+                ></span
               ></a>`
           : sourceSessionKey
             ? html`<span>${t("chat.messages.forwardedFrom")}</span>

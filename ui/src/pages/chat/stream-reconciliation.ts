@@ -33,7 +33,7 @@ import {
   resolveLiveToolStreamRefs,
   resolveMatchingLiveToolIdentity,
 } from "./tool-stream-identity.ts";
-import { resetToolStream, resetToolStreamRun } from "./tool-stream.ts";
+import { resetToolStream, resetToolStreamRun } from "./tool-stream-state.ts";
 
 type StreamReconciliationState = StreamCausalBoundaryState & {
   chatStream: string | null;
@@ -142,6 +142,7 @@ function buildAssistantStreamMessage(
   itemId?: string,
   runId?: string,
   afterBoundaryRunId?: string,
+  afterSequence?: number,
 ): Record<string, unknown> {
   return {
     role: "assistant",
@@ -153,6 +154,7 @@ function buildAssistantStreamMessage(
       ...(itemId ? { itemId } : {}),
       ...(runId ? { runId } : {}),
       ...(afterBoundaryRunId ? { afterBoundaryRunId } : {}),
+      ...(afterSequence === undefined ? {} : { afterSequence }),
     },
   };
 }
@@ -167,7 +169,11 @@ function unkeyedStreamFallbackMetadata(message: unknown): Record<string, unknown
   return metadata && !normalizeOptionalString(metadata.itemId) ? metadata : null;
 }
 
-export function appendTerminalAssistantMessage(messages: unknown[], message: unknown): unknown[] {
+export function appendTerminalAssistantMessage(
+  messages: unknown[],
+  message: unknown,
+  opts?: { preserveKeyedCommentary?: boolean },
+): unknown[] {
   const identity = readSessionMessageIdentity(message);
   const terminalRunId =
     (identity?.role === "assistant" ? identity.runId : null) ?? readLiveTerminalRunId(message);
@@ -204,7 +210,7 @@ export function appendTerminalAssistantMessage(messages: unknown[], message: unk
       // beside the final answer. When a keyed segment is the exact final
       // answer, though, retaining both renders the streamed and persisted
       // copies as duplicate assistant messages.
-      if (visibleText && visibleText === terminalText) {
+      if (!opts?.preserveKeyedCommentary && visibleText && visibleText === terminalText) {
         removedIndexes.add(index);
       }
       continue;
@@ -581,6 +587,10 @@ export function materializeVisibleStreamState(
       part.itemId,
       part.runId,
       part.afterBoundaryRunId,
+      nextMessages
+        .slice(0, insertIndex)
+        .map((message) => readSessionMessageIdentity(message)?.sequence)
+        .findLast((sequence): sequence is number => typeof sequence === "number"),
     );
     nextMessages = [
       ...nextMessages.slice(0, insertIndex),

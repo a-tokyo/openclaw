@@ -4,6 +4,7 @@ import {
   outboxPayloadMatchesOwner,
   observeOutboxRecoveryOwner,
 } from "../../lib/chat/outbox-payload-store.runtime.ts";
+import { sameQueuedDeliveryVersion } from "../../lib/chat/outbox-store-codec.ts";
 import {
   applyStoredChatOutboxScope,
   subscribeStoredChatOutboxChanges,
@@ -157,13 +158,21 @@ class ChatOutboxGatewayOwner {
           }
           if (result.status === "ready") {
             if (result.update.attachmentPayload?.key !== key) {
-              // Copy adoption must not overwrite a retry that replaced the captured row.
+              // Reconnect can park this attempt while its private Blob copy awaits.
+              // Preserve that newer state, but never adopt over a changed submission.
+              const parked =
+                item.sendState === "waiting-reconnect" &&
+                current.sendState === "unconfirmed" &&
+                sameQueuedDeliveryVersion(current, {
+                  ...applyStoredChatOutboxScope(item, outbox),
+                  sendState: "unconfirmed",
+                });
               if (
                 !updateStoredChatComposerQueueItem(
                   host,
                   outbox.sessionKey,
-                  item,
-                  { ...item, ...result.update },
+                  parked ? current : item,
+                  { ...current, ...result.update },
                   outbox.agentId,
                 )
               ) {
@@ -216,6 +225,7 @@ class ChatOutboxGatewayOwner {
     if (!previous || previous === this) {
       return;
     }
+    let adopted = false;
     // A shared client's credentials change before pane callbacks run. Move peers
     // together so the first reconnect drain still observes every pane's edit hold.
     for (const pane of previous.panes) {
@@ -238,6 +248,11 @@ class ChatOutboxGatewayOwner {
       pane.chatQueue = [];
       previous.detach(pane);
       this.attach(pane);
+      adopted = true;
+    }
+    if (adopted) {
+      // Publish only after every peer has moved, preserving shared edit holds.
+      this.publish();
     }
   }
   private attach(host: Host): void {

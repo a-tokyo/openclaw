@@ -10,6 +10,7 @@ import {
   requireString,
   waitForRequests,
 } from "./chat-flow.test-support.ts";
+import { createControlUiE2eContextOptions } from "./control-ui-e2e-suite.test-support.ts";
 import { waitForCommittedState } from "./settle.test-support.ts";
 
 const suite = createChatFlowE2eSuite();
@@ -180,11 +181,7 @@ suite.define(() => {
   });
 
   it("renders stable markdown during a streaming chat turn and finalizes the tail", async () => {
-    const context = await suite.newBrowserContext({
-      locale: "en-US",
-      serviceWorkers: "block",
-      viewport: { height: 900, width: 1280 },
-    });
+    const context = await suite.newBrowserContext(createControlUiE2eContextOptions());
     const page = await context.newPage();
     const gateway = await installMockGateway(page);
 
@@ -238,11 +235,7 @@ suite.define(() => {
   });
 
   it("normalizes Unicode line separators in streaming and final chat DOM", async () => {
-    const context = await suite.newBrowserContext({
-      locale: "en-US",
-      serviceWorkers: "block",
-      viewport: { height: 900, width: 1280 },
-    });
+    const context = await suite.newBrowserContext(createControlUiE2eContextOptions());
     const page = await context.newPage();
     const gateway = await installMockGateway(page);
 
@@ -473,11 +466,7 @@ suite.define(() => {
   );
 
   it("keeps the pending telemetry row stable through acknowledgement and streaming", async () => {
-    const context = await suite.newBrowserContext({
-      locale: "en-US",
-      serviceWorkers: "block",
-      viewport: { height: 900, width: 1280 },
-    });
+    const context = await suite.newBrowserContext(createControlUiE2eContextOptions());
     const page = await context.newPage();
     const gateway = await installMockGateway(page);
 
@@ -641,11 +630,7 @@ suite.define(() => {
   });
 
   it("refreshes history after a tool-call window disconnects and reconnects", async () => {
-    const context = await suite.newBrowserContext({
-      locale: "en-US",
-      serviceWorkers: "block",
-      viewport: { height: 900, width: 1280 },
-    });
+    const context = await suite.newBrowserContext(createControlUiE2eContextOptions());
     const page = await context.newPage();
     const gateway = await installMockGateway(page);
 
@@ -675,9 +660,9 @@ suite.define(() => {
         sessionInfo: acceptedSession,
         messages: [],
       });
-      await gateway.resolveDeferred("chat.send", { runId, status: "started" });
-      // Publish acceptance after the ACK settles, then wait for its durable
-      // retirement before disconnecting this already accepted tool run.
+      await gateway.resolveDeferred("chat.send");
+      // Default execution commits the original source before its ACK. Publish
+      // live state after consumption, then disconnect during the tool run.
       await waitForCommittedState(
         page,
         ({ runId: expectedRunId }) => {
@@ -746,12 +731,8 @@ suite.define(() => {
     }
   });
 
-  it("keeps live assistant stream text before the matching tool card", async () => {
-    const context = await suite.newBrowserContext({
-      locale: "en-US",
-      serviceWorkers: "block",
-      viewport: { height: 900, width: 1280 },
-    });
+  it("keeps one live assistant message growing through tool activity", async () => {
+    const context = await suite.newBrowserContext(createControlUiE2eContextOptions());
     const page = await context.newPage();
     const gateway = await installMockGateway(page);
 
@@ -797,11 +778,11 @@ suite.define(() => {
       const toolBubble = page.locator('[data-message-id^="tool:assistant:call-read"]');
       await toolBubble.waitFor({ timeout: 10_000 });
 
-      const nextStream = "```ts\nconst answer = 42;";
+      const nextStream = "\n\n```ts\nconst answer = 42;";
       await gateway.emitGatewayEvent("chat", {
         deltaText: nextStream,
         message: {
-          content: [{ text: nextStream, type: "text" }],
+          content: [{ text: initialStream + nextStream, type: "text" }],
           role: "assistant",
           timestamp: Date.now(),
         },
@@ -813,26 +794,12 @@ suite.define(() => {
         .poll(() => page.locator(".chat-bubble.streaming code.language-ts").textContent())
         .toContain("const answer = 42;");
 
-      const composedGroup = transcript
-        .locator(".chat-group.assistant")
-        .filter({ hasText: "I will inspect the file." });
-      expect(await composedGroup.count()).toBe(1);
-      const visibleOrder = await composedGroup.evaluate((group: Element) =>
-        Array.from(group.querySelectorAll(".chat-bubble")).flatMap((bubble: Element) => {
-          if ((bubble.textContent ?? "").includes("I will inspect the file.")) {
-            return ["assistant stream"];
-          }
-          if (bubble.matches('[data-message-id^="tool:assistant:call-read"]')) {
-            return ["tool card"];
-          }
-          if ((bubble.textContent ?? "").includes("const answer = 42;")) {
-            return ["assistant continuation"];
-          }
-          return [];
-        }),
-      );
-
-      expect(visibleOrder).toEqual(["assistant stream", "tool card", "assistant continuation"]);
+      const stream = transcript.locator(".chat-bubble.streaming");
+      expect(await stream.count()).toBe(1);
+      expect(await stream.textContent()).toContain("I will inspect the file.");
+      expect(await stream.textContent()).toContain("const answer = 42;");
+      expect(await toolBubble.count()).toBe(1);
+      expect(await transcript.getByText("I will inspect the file.").count()).toBe(1);
     } finally {
       await suite.closeBrowserContext(context);
     }

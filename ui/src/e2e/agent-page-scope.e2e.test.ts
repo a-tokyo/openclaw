@@ -157,7 +157,7 @@ suite.define(() => {
           await result.waitFor();
           await screenshot(page, "07-palette-reviewer-result.png");
           await result.click();
-          const selectedAgent = page.locator("openclaw-agents-page openclaw-agent-select");
+          const selectedAgent = page.locator(".settings-sidebar openclaw-agent-select");
           await selectedAgent.waitFor();
           await expect.poll(() => new URL(page.url()).pathname).toBe("/settings/agents/reviewer");
           await expect
@@ -184,8 +184,8 @@ suite.define(() => {
             .toBe("reviewer");
           await waitForRequest(
             gateway,
-            "agents.files.list",
-            (params) => params.agentId === "reviewer",
+            "models.list",
+            (params) => params.agentId === "reviewer" && params.view === "configured",
           );
           await screenshot(page, "10-reloaded-reviewer.png");
           await page.goBack();

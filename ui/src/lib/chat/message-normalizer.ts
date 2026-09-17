@@ -14,20 +14,21 @@ import {
   extractCanvasShortcodes,
   isCanvasBoardWidgetName,
 } from "../../../../src/chat/canvas-render.js";
+import { readMessageClientSources } from "../../../../src/chat/message-client-source.js";
 import { readTranscriptSenderIdentity } from "../../../../src/chat/sender-identity.js";
 import {
   isToolCallContentType,
   isToolResultContentType,
   resolveToolBlockArgs,
 } from "../../../../src/chat/tool-content.js";
-import {
-  isRelativeAssistantMediaReference,
-  splitMediaFromOutput,
-} from "../../../../src/media/parse.js";
+import { splitMediaFromOutput } from "../../../../src/media/parse.js";
+import { readClawHubRecommendation } from "../../../../src/shared/clawhub-recommendations.js";
 import { getMediaFileExtension } from "../media-file-extension.ts";
 import type { NormalizedMessage, MessageContentItem } from "./chat-types.ts";
+import { projectImportedMessageForDisplay } from "./imported-message-display.ts";
 import { normalizeAttachmentContentBlock } from "./message-normalizer-attachments.ts";
-import { formatSenderLabel, normalizeSenderIdentity } from "./sender-label.ts";
+import { normalizeImageContentBlock } from "./message-normalizer-images.ts";
+import { formatSenderLabel, normalizeSenderIdentity, type SenderIdentity } from "./sender-label.ts";
 
 // Keep legacy labels readable without treating their UUID suffix as profile evidence.
 const OPAQUE_ID_LABEL_SUFFIX_RE =
@@ -130,6 +131,34 @@ export function resolveMessageRole(message: unknown): string {
   return hasToolContent || hasToolMessageEnvelope(m)
     ? "toolResult"
     : (readStringField(m, "role") ?? "unknown");
+}
+
+export function resolveMessageSender(
+  metadata: Record<string, unknown> | undefined,
+): SenderIdentity | null {
+  const identity = readTranscriptSenderIdentity(metadata?.senderIdentity);
+  return normalizeSenderIdentity({
+    identity,
+    id: metadata?.senderId,
+    name: metadata?.senderName,
+    username: metadata?.senderUsername,
+    profileAvatarUrl: identity?.type === "profile" ? metadata?.senderProfileAvatarUrl : undefined,
+  });
+}
+
+export function resolveMessageSenderLabel(
+  message: unknown,
+  sender?: SenderIdentity | null,
+): string | null {
+  const m = asOptionalRecord(message);
+  const rawLabel = readStringField(m, "senderLabel")?.trim() ?? "";
+  if (rawLabel) {
+    return rawLabel.replace(OPAQUE_ID_LABEL_SUFFIX_RE, "").trim();
+  }
+  // Full normalization already prepared the sender; null is a known absence.
+  return formatSenderLabel(
+    sender === undefined ? resolveMessageSender(asOptionalRecord(m?.["__openclaw"])) : sender,
+  );
 }
 
 export function isToolResultMessage(message: unknown): boolean {
@@ -374,10 +403,6 @@ function expandTextContent(
 
   for (const segment of segments) {
     if (segment.type === "media") {
-      if (isRelativeAssistantMediaReference(segment.url)) {
-        parts.push({ type: "text", text: `MEDIA:${segment.url}` });
-        continue;
-      }
       const inferred = inferAttachmentKind(segment.url);
       parts.push({
         type: "attachment",
@@ -422,13 +447,9 @@ function expandTextContent(
     content:
       content.length > 0
         ? content
-        : (parsed.mediaUrls ?? []).some(isRelativeAssistantMediaReference)
-          ? (parsed.mediaUrls ?? [])
-              .filter(isRelativeAssistantMediaReference)
-              .map((url) => ({ type: "text" as const, text: `MEDIA:${url}` }))
-          : replyTarget === null && !audioAsVoice && parsed.text.trim().length > 0
-            ? [{ type: "text", text: parsed.text }]
-            : [],
+        : replyTarget === null && !audioAsVoice && parsed.text.trim().length > 0
+          ? [{ type: "text", text: parsed.text }]
+          : [],
     audioAsVoice,
     replyTarget,
   };
@@ -438,7 +459,7 @@ function expandTextContent(
  * Normalize a raw message object into a consistent structure.
  */
 export function normalizeMessage(message: unknown): NormalizedMessage {
-  const m = asOptionalRecord(message) ?? {};
+  const m = asOptionalRecord(projectImportedMessageForDisplay(message)) ?? {};
   const role = resolveMessageRole(m);
   const contentRaw = m.content;
   const contentItems = Array.isArray(contentRaw) ? contentRaw : null;
@@ -475,7 +496,15 @@ export function normalizeMessage(message: unknown): NormalizedMessage {
       if (omittedMedia) {
         return [omittedMedia];
       }
+      const image = normalizeImageContentBlock(item);
+      if (image) {
+        return [image];
+      }
       const type = item.type;
+      if (type === "clawhub") {
+        const recommendation = isAssistantMessage ? readClawHubRecommendation(item) : null;
+        return recommendation ? [recommendation] : [];
+      }
       const text = readStringField(item, "text");
       if (type === "thinking") {
         const thinking = readStringField(item, "thinking");
@@ -568,20 +597,10 @@ export function normalizeMessage(message: unknown): NormalizedMessage {
   const replyPreviewRecord = asOptionalRecord(openClawMeta?.replyToPreview);
   const replyPreviewText = readStringField(replyPreviewRecord, "text")?.trim() ?? "";
   const replyPreviewSender = readStringField(replyPreviewRecord, "senderLabel")?.trim() ?? "";
-  const identity = readTranscriptSenderIdentity(openClawMeta?.senderIdentity);
-  const metaSender = normalizeSenderIdentity({
-    identity,
-    id: openClawMeta?.senderId,
-    name: openClawMeta?.senderName,
-    username: openClawMeta?.senderUsername,
-    profileAvatarUrl:
-      identity?.type === "profile" ? openClawMeta?.senderProfileAvatarUrl : undefined,
-  });
-  const rawLabel = readStringField(m, "senderLabel")?.trim() ?? "";
-  const senderLabel = rawLabel
-    ? rawLabel.replace(OPAQUE_ID_LABEL_SUFFIX_RE, "").trim()
-    : formatSenderLabel(metaSender);
+  const metaSender = resolveMessageSender(openClawMeta);
+  const senderLabel = resolveMessageSenderLabel(m, metaSender);
   const sender = metaSender ?? (senderLabel ? { name: senderLabel } : null);
+  const sourceClients = role === "user" ? readMessageClientSources(m) : [];
 
   content = stripMessageDisplayMetadata(content);
   const senderSession = readMessageSenderSession(m.senderSession);
@@ -594,6 +613,7 @@ export function normalizeMessage(message: unknown): NormalizedMessage {
     senderLabel,
     ...(senderSession ? { senderSession } : {}),
     ...(sender ? { sender } : {}),
+    ...(sourceClients.length ? { sourceClients } : {}),
     ...(audioAsVoice ? { audioAsVoice: true } : {}),
     ...(replyPreviewText
       ? {

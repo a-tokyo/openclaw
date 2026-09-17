@@ -11,6 +11,7 @@ import { invalidateOperatorRolePolicy } from "./operator-role-policy.js";
 const {
   listDevicePairingMock,
   listBoundWebPushSubscriptionsMock,
+  hasBoundWebPushSubscriptionsMock,
   prepareWebPushNotificationSenderMock,
   preparedWebPushSendMock,
   resolveUserProfileIdMock,
@@ -22,6 +23,7 @@ const {
 } = vi.hoisted(() => ({
   listDevicePairingMock: vi.fn(),
   listBoundWebPushSubscriptionsMock: vi.fn(),
+  hasBoundWebPushSubscriptionsMock: vi.fn(),
   prepareWebPushNotificationSenderMock: vi.fn(),
   preparedWebPushSendMock: vi.fn(),
   resolveUserProfileIdMock: vi.fn(),
@@ -59,6 +61,7 @@ vi.mock("../infra/device-pairing-store-readonly.js", async () => {
 
 vi.mock("../infra/push-web.js", () => ({
   listBoundWebPushSubscriptions: listBoundWebPushSubscriptionsMock,
+  hasBoundWebPushSubscriptions: hasBoundWebPushSubscriptionsMock,
   prepareWebPushNotificationSender: prepareWebPushNotificationSenderMock,
 }));
 
@@ -141,6 +144,7 @@ describe("event Web Push classification", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     listBoundWebPushSubscriptionsMock.mockReturnValue([boundSubscription("browser-device")]);
+    hasBoundWebPushSubscriptionsMock.mockReturnValue(true);
     listDevicePairingMock.mockReturnValue({
       pending: [],
       paired: [pairedOperator("browser-device")],
@@ -156,8 +160,13 @@ describe("event Web Push classification", () => {
 
   afterEach(() => vi.restoreAllMocks());
 
-  it("sends only final chat events as agent completion", async () => {
+  it("waits for final completion after a parent yields to its children", async () => {
     const delivery = createEventWebPushDelivery({ getRuntimeConfig: () => ({}) });
+    delivery.handleEvent("chat", { state: "delta", runId: "run-1" });
+    delivery.handleEvent("chat", { state: "final", runId: "run-1", yielded: true });
+    await Promise.resolve();
+    expect(preparedWebPushSendMock).not.toHaveBeenCalled();
+
     delivery.handleEvent("chat", { state: "final", runId: "run-1" });
     await vi.waitFor(() => expect(preparedWebPushSendMock).toHaveBeenCalledOnce());
     expect(preparedWebPushSendMock).toHaveBeenCalledWith(
@@ -165,10 +174,75 @@ describe("event Web Push classification", () => {
         payload: expect.objectContaining({ tag: "openclaw-agent-finished-run-1" }),
       }),
     );
+  });
 
-    preparedWebPushSendMock.mockClear();
-    delivery.handleEvent("chat", { state: "delta", runId: "run-1" });
-    expect(preparedWebPushSendMock).not.toHaveBeenCalled();
+  it.each([
+    {
+      event: "question.requested",
+      payload: { id: "question:1" },
+      path: "ask/question%3A1",
+    },
+    {
+      event: "chat",
+      payload: { state: "final", runId: "run-1", sessionKey: "agent:research:thread.1" },
+      path: "chat/research/thread%2E1",
+    },
+    {
+      event: "task",
+      payload: {
+        action: "upserted",
+        task: { id: "task-1", runtime: "subagent", status: "failed" },
+      },
+      path: "chat/research/thread%2E1",
+    },
+    {
+      event: "cron",
+      payload: { action: "finished", jobId: "nightly", status: "error", runAtMs: 1234 },
+      path: "automations?job=nightly&run=cron%3Anightly%3A1234",
+    },
+  ])(
+    "opens the $event attention target on its originating Gateway",
+    async ({ event, payload, path }) => {
+      listDevicePairingMock.mockReturnValue({
+        paired: [pairedOperator("browser-device", ["operator.read", "operator.questions"])],
+      });
+      const delivery = createEventWebPushDelivery({
+        getRuntimeConfig: () => ({
+          gateway: {
+            publicOrigin: "https://gateway.example.test",
+            controlUi: { basePath: "/operator" },
+          },
+        }),
+      });
+
+      delivery.handleEvent(event, payload, {
+        sessionKeys: ["agent:research:thread.1"],
+        agentId: "research",
+      });
+
+      await vi.waitFor(() => expect(preparedWebPushSendMock).toHaveBeenCalledOnce());
+      expect(preparedWebPushSendMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          payload: expect.objectContaining({
+            url: `${path}#gatewayUrl=wss%3A%2F%2Fgateway.example.test%2Foperator`,
+          }),
+        }),
+      );
+    },
+  );
+
+  it("uses the session hub when the event has no prepared session scope", async () => {
+    const delivery = createEventWebPushDelivery({ getRuntimeConfig: () => ({}) });
+    delivery.handleEvent("chat", {
+      state: "final",
+      runId: "run-1",
+      sessionKey: "agent:research:thread.1",
+    });
+
+    await vi.waitFor(() => expect(preparedWebPushSendMock).toHaveBeenCalledOnce());
+    expect(preparedWebPushSendMock).toHaveBeenCalledWith(
+      expect.objectContaining({ payload: expect.objectContaining({ url: "sessions" }) }),
+    );
   });
 
   it("does not treat injected transcript updates as agent completion", async () => {
@@ -292,6 +366,43 @@ describe("event Web Push classification", () => {
     );
   });
 
+  it.each([false, true])(
+    "uses only the scheduled failure preference for cron tracking tasks (enabled: %s)",
+    async (scheduledTaskFailed) => {
+      const subscription = boundSubscription("browser-device");
+      subscription.devicePreferences.categories = {
+        backgroundTaskFailed: true,
+        scheduledTaskFailed,
+      };
+      listBoundWebPushSubscriptionsMock.mockReturnValue([subscription]);
+      const delivery = createEventWebPushDelivery({ getRuntimeConfig: () => ({}) });
+
+      delivery.handleEvent("task", {
+        action: "upserted",
+        task: { id: "task-cron", kind: "automation_run", runtime: "cron", status: "failed" },
+      });
+      await Promise.resolve();
+      expect(preparedWebPushSendMock).not.toHaveBeenCalled();
+
+      delivery.handleEvent("cron", {
+        action: "finished",
+        jobId: "nightly",
+        status: "error",
+      });
+      if (scheduledTaskFailed) {
+        await vi.waitFor(() => expect(preparedWebPushSendMock).toHaveBeenCalledOnce());
+        expect(preparedWebPushSendMock).toHaveBeenCalledWith(
+          expect.objectContaining({
+            payload: expect.objectContaining({ title: "OpenClaw scheduled task failed" }),
+          }),
+        );
+      } else {
+        await Promise.resolve();
+        expect(preparedWebPushSendMock).not.toHaveBeenCalled();
+      }
+    },
+  );
+
   it("rereads subscriptions after transport preparation before sending", async () => {
     const stale = boundSubscription("stale-device");
     const preparation = createDeferred<typeof preparedWebPushSendMock>();
@@ -308,21 +419,22 @@ describe("event Web Push classification", () => {
 
     await vi.waitFor(() => expect(prepareWebPushNotificationSenderMock).toHaveBeenCalledOnce());
     expect(getRuntimeConfig).not.toHaveBeenCalled();
-    expect(listBoundWebPushSubscriptionsMock).toHaveBeenCalledOnce();
+    expect(listBoundWebPushSubscriptionsMock).not.toHaveBeenCalled();
     listBoundWebPushSubscriptionsMock.mockReturnValue([]);
     preparation.resolve(preparedWebPushSendMock);
-    await vi.waitFor(() => expect(listBoundWebPushSubscriptionsMock).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(listBoundWebPushSubscriptionsMock).toHaveBeenCalledOnce());
     expect(getRuntimeConfig).toHaveBeenCalledOnce();
     expect(preparedWebPushSendMock).not.toHaveBeenCalled();
   });
 
   it("skips transport preparation when no subscriptions exist", async () => {
     listBoundWebPushSubscriptionsMock.mockReturnValue([]);
+    hasBoundWebPushSubscriptionsMock.mockReturnValue(false);
     const delivery = createEventWebPushDelivery({ getRuntimeConfig: () => ({}) });
 
     delivery.handleEvent("chat", { state: "final", runId: "run-1" });
 
-    await vi.waitFor(() => expect(listBoundWebPushSubscriptionsMock).toHaveBeenCalledOnce());
+    await vi.waitFor(() => expect(hasBoundWebPushSubscriptionsMock).toHaveBeenCalledOnce());
     expect(prepareWebPushNotificationSenderMock).not.toHaveBeenCalled();
     expect(preparedWebPushSendMock).not.toHaveBeenCalled();
   });

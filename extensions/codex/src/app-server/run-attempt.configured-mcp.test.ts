@@ -3,7 +3,10 @@ import path from "node:path";
 import { openFileBackedSessionManagerForTest } from "openclaw/plugin-sdk/agent-runtime-test-contracts";
 import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
 import { initializeGlobalHookRunner } from "openclaw/plugin-sdk/hook-runtime";
-import { createMockPluginRegistry } from "openclaw/plugin-sdk/plugin-test-runtime";
+import {
+  createMockPluginRegistry,
+  createPluginMetadataSnapshotFixture,
+} from "openclaw/plugin-sdk/plugin-test-runtime";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mcpMocks = vi.hoisted(() => ({
@@ -171,6 +174,7 @@ vi.mock("openclaw/plugin-sdk/codex-mcp-projection", async (importOriginal) => {
 });
 
 import * as attemptContext from "./attempt-context.js";
+import { createCronAuthorityCapabilityFixture } from "./codex-app-server.test-fixtures.js";
 import * as dynamicTools from "./dynamic-tools.js";
 import {
   assistantMessage,
@@ -211,13 +215,12 @@ beforeEach(() => {
   mcpMocks.threadConfigFacade.mockClear();
 });
 
-function configureFakeMcp(params: ReturnType<typeof createParams>): void {
+function configureFakeMcp(params: ReturnType<typeof createParams>) {
   setCodexTestModelSupportsTools(params, true);
   params.cleanupBundleMcpOnRunEnd = true;
   params.runtimePlan = createCodexRuntimePlanFixture();
-  params.preparedModelRuntime = {
-    metadataSnapshot: { manifestRegistry: { plugins: [] }, plugins: [] },
-  } as never;
+  const metadataSnapshot = createPluginMetadataSnapshotFixture();
+  params.preparedModelRuntime = { metadataSnapshot } as never;
   params.config = {
     ...params.config,
     mcp: {
@@ -230,22 +233,7 @@ function configureFakeMcp(params: ReturnType<typeof createParams>): void {
       },
     },
   };
-}
-
-function createCronAuthorityCapabilityFixture(
-  runId: string,
-): NonNullable<ReturnType<typeof createParams>["cronCreatorAuthorityCapability"]> {
-  // Mirror the gateway-minted capability instead of casting a partial fixture;
-  // transcript tools consume callerOrigin and future contract drift must type-fail.
-  const abortController = new AbortController();
-  return {
-    active: true,
-    abort: () => abortController.abort(),
-    callerOrigin: { kind: "local" },
-    grantTokens: new Set<string>(),
-    runId,
-    signal: abortController.signal,
-  };
+  return metadataSnapshot;
 }
 
 function admitLocalOperatorCronAuthority(params: ReturnType<typeof createParams>): void {
@@ -412,11 +400,8 @@ describe("runCodexAppServerAttempt configured MCP ownership", () => {
   it("does not replace bundle discovery with partial prepared plugin metadata", async () => {
     const sessionFile = path.join(tempDir, "session-partial-manifest-registry.jsonl");
     const params = createParams(sessionFile, path.join(tempDir, "workspace-partial-registry"));
-    configureFakeMcp(params);
-    const manifestRegistry = { plugins: [] };
-    params.preparedModelRuntime = {
-      metadataSnapshot: { manifestRegistry, pluginIds: ["codex"], plugins: [] },
-    } as never;
+    const metadataSnapshot = configureFakeMcp(params);
+    metadataSnapshot.pluginIds = ["codex"];
 
     const harness = createStartedThreadHarness();
     const run = runCodexAppServerAttempt(params);
@@ -830,6 +815,7 @@ describe("runCodexAppServerAttempt configured MCP ownership", () => {
     { name: "missing", capabilityRunId: undefined },
     { name: "wrong-run", capabilityRunId: "other-run" },
     { name: "remote-management", capabilityRunId: "same-run" },
+    { name: "channel-owner-management", capabilityRunId: "same-run" },
   ])(
     "does not bind $name local-operator authority at Codex tool construction",
     async (testCase) => {
@@ -843,11 +829,18 @@ describe("runCodexAppServerAttempt configured MCP ownership", () => {
       params.senderIsOwner = false;
       if (testCase.capabilityRunId) {
         const capability = createCronAuthorityCapabilityFixture(
-          testCase.name === "remote-management" ? params.runId : testCase.capabilityRunId,
+          testCase.capabilityRunId === "same-run" ? params.runId : testCase.capabilityRunId,
         );
         params.cronCreatorAuthorityCapability =
-          testCase.name === "remote-management"
-            ? { ...capability, callerOrigin: { kind: "unknown" }, controlUiAdmin: true }
+          testCase.capabilityRunId === "same-run"
+            ? {
+                ...capability,
+                callerOrigin: { kind: "unknown" },
+                managementEntitlement:
+                  testCase.name === "channel-owner-management"
+                    ? { source: "channel-owner", isCurrent: () => true }
+                    : { source: "control-ui-admin" },
+              }
             : capability;
       }
 

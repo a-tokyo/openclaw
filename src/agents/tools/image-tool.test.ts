@@ -5,9 +5,11 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { isInboundPathAllowed } from "@openclaw/media-core/inbound-path-policy";
+import { collectManifestModelIdNormalizationPolicies } from "@openclaw/model-catalog-core/provider-model-id-normalization";
 import { expectDefined } from "@openclaw/normalization-core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../../config/config.js";
+import { createPluginMetadataSnapshot } from "../../config/plugin-auto-enable.test-helpers.js";
 import type { ModelDefinitionConfig } from "../../config/types.models.js";
 import { encodePngRgba, fillPixel } from "../../media/png-encode.js";
 import type {
@@ -22,6 +24,10 @@ import {
   createOpenClawTestState,
   type OpenClawTestState,
 } from "../../test-utils/openclaw-test-state.js";
+import {
+  createApiKeyCredential,
+  createAuthProfileStoreFixture,
+} from "../auth-profiles/credential-fixtures.test-support.js";
 import type { AuthProfileCredential, AuthProfileStore } from "../auth-profiles/types.js";
 import {
   createModelGenerationFixture,
@@ -47,6 +53,7 @@ function jsonRoundTrip<T>(value: T): T {
 }
 
 const publicSurfaceLoaderMocks = vi.hoisted(() => ({
+  loadBundledPluginPublicArtifactModuleFromCandidatesSync: vi.fn(() => null),
   loadBundledPluginPublicArtifactModuleSync: vi.fn(
     ({ artifactBasename, dirName }: { artifactBasename: string; dirName: string }) => {
       if (dirName === "imessage" && artifactBasename === "media-contract-api.js") {
@@ -145,18 +152,21 @@ function readMockAuthProfileStore(agentDir?: string): {
   }
 }
 
+function readMockRuntimeAuthProfileStore(agentDir?: string) {
+  const store = readMockAuthProfileStore(agentDir);
+  if (process.env.OPENCLAW_TEST_CODEX_CLI_OAUTH === "1") {
+    store.profiles["openai:default"] = {
+      provider: "openai",
+      type: "oauth",
+    };
+  }
+  return store;
+}
+
 vi.mock("../auth-profiles.js", () => ({
   externalCliDiscoveryForProviderAuth: (params: { provider: string }) => params,
-  ensureAuthProfileStore: (agentDir?: string) => {
-    const store = readMockAuthProfileStore(agentDir);
-    if (process.env.OPENCLAW_TEST_CODEX_CLI_OAUTH === "1") {
-      store.profiles["openai:default"] = {
-        provider: "openai",
-        type: "oauth",
-      };
-    }
-    return store;
-  },
+  ensureAuthProfileStore: readMockRuntimeAuthProfileStore,
+  loadAuthProfileStoreForRuntime: readMockRuntimeAuthProfileStore,
   ensureAuthProfileStoreWithoutExternalProfiles: (agentDir?: string) =>
     readMockAuthProfileStore(agentDir),
   hasAnyAuthProfileStoreSource: (agentDir?: string) => {
@@ -632,6 +642,7 @@ const resolveConfiguredImageModelForTest: NonNullable<
     (candidate) => candidate.id === model || candidate.id === `${provider}/${model}`,
   );
   return {
+    logicalRef: { provider, model },
     model: {
       ...configuredModel,
       id: model,
@@ -1515,9 +1526,9 @@ describe("image tool implicit imageModel config", () => {
 
   it("pairs minimax-portal primary with MiniMax-VL-01 (and fallbacks) when auth exists", async () => {
     await withTempAgentDir(async (agentDir) => {
-      await writeAuthProfiles(agentDir, {
-        version: 1,
-        profiles: {
+      await writeAuthProfiles(
+        agentDir,
+        createAuthProfileStoreFixture({
           "minimax-portal:default": {
             type: "oauth",
             provider: "minimax-portal",
@@ -1525,8 +1536,8 @@ describe("image tool implicit imageModel config", () => {
             refresh: "refresh-test",
             expires: Date.now() + 60_000,
           },
-        },
-      });
+        }),
+      );
       vi.stubEnv("OPENAI_API_KEY", "openai-test");
       vi.stubEnv("ANTHROPIC_API_KEY", "anthropic-test");
       const cfg: OpenClawConfig = {
@@ -1582,12 +1593,12 @@ describe("image tool implicit imageModel config", () => {
 
   it("pairs a custom provider when it declares an image-capable model", async () => {
     await withTempAgentDir(async (agentDir) => {
-      await writeAuthProfiles(agentDir, {
-        version: 1,
-        profiles: {
+      await writeAuthProfiles(
+        agentDir,
+        createAuthProfileStoreFixture({
           "acme:default": { type: "api_key", provider: "acme", key: "sk-test" },
-        },
-      });
+        }),
+      );
       const cfg: OpenClawConfig = {
         agents: { defaults: { model: { primary: "acme/text-1" } } },
         models: {
@@ -1635,12 +1646,12 @@ describe("image tool implicit imageModel config", () => {
 
   it("does not double-prefix custom provider model IDs that already include the provider", async () => {
     await withTempAgentDir(async (agentDir) => {
-      await writeAuthProfiles(agentDir, {
-        version: 1,
-        profiles: {
+      await writeAuthProfiles(
+        agentDir,
+        createAuthProfileStoreFixture({
           "kimchi:default": { type: "api_key", provider: "kimchi", key: "sk-test" },
-        },
-      });
+        }),
+      );
       const cfg: OpenClawConfig = {
         agents: { defaults: { model: { primary: "kimchi/text-1" } } },
         models: {
@@ -1664,16 +1675,12 @@ describe("image tool implicit imageModel config", () => {
 
   it("does not pair provider aliases through core normalization", async () => {
     await withTempAgentDir(async (agentDir) => {
-      await writeAuthProfiles(agentDir, {
-        version: 1,
-        profiles: {
-          "amazon-bedrock:default": {
-            type: "api_key",
-            provider: "amazon-bedrock",
-            key: "sk-test",
-          },
-        },
-      });
+      await writeAuthProfiles(
+        agentDir,
+        createAuthProfileStoreFixture({
+          "amazon-bedrock:default": createApiKeyCredential("amazon-bedrock", "sk-test"),
+        }),
+      );
       const cfg: OpenClawConfig = {
         agents: { defaults: { model: { primary: "aws-bedrock/text-1" } } },
         models: {
@@ -2026,9 +2033,9 @@ describe("image tool implicit imageModel config", () => {
   it("falls back to the generic image runtime when minimax-portal has no media provider registration", async () => {
     await withTempAgentDir(async (agentDir) => {
       installImageUnderstandingProviderStubs();
-      await writeAuthProfiles(agentDir, {
-        version: 1,
-        profiles: {
+      await writeAuthProfiles(
+        agentDir,
+        createAuthProfileStoreFixture({
           "minimax-portal:default": {
             type: "oauth",
             provider: "minimax-portal",
@@ -2036,8 +2043,8 @@ describe("image tool implicit imageModel config", () => {
             refresh: "refresh-test",
             expires: Date.now() + 60_000,
           },
-        },
-      });
+        }),
+      );
       // The generic image runtime still uses global.fetch, so mock it directly.
       const fetch = vi.fn().mockImplementation(async () =>
         Response.json({
@@ -3340,6 +3347,131 @@ describe("image compression policy", () => {
     },
   );
 
+  it.each([
+    { route: "primary", supplied: "captured", expected: "captured", maxSidePx: 96 },
+    { route: "override", supplied: "captured", expected: "captured", maxSidePx: 96 },
+    { route: "fallback", supplied: "captured", expected: "captured", maxSidePx: 96 },
+    { route: "primary", supplied: "ambient", expected: "ambient", maxSidePx: 192 },
+    { route: "primary", supplied: "none", expected: "ambient", maxSidePx: 192 },
+  ])(
+    "uses $supplied metadata for $route image selection and compression",
+    async ({ route, supplied, expected, maxSidePx }) => {
+      const state = await createOpenClawTestState({ label: "image-captured-planning" });
+      try {
+        const provider = "image-planning";
+        const cfg = {
+          agents: {
+            defaults: {
+              imageQuality: "high",
+              imageModel: {
+                primary: `${provider}/${route === "fallback" ? "unavailable" : "entry"}`,
+                ...(route === "fallback" ? { fallbacks: [`${provider}/entry`] } : {}),
+              },
+            },
+          },
+          models: {
+            providers: {
+              [provider]: {
+                api: "openai-completions",
+                baseUrl: "https://image-planning.example.test/v1",
+                models: [
+                  { id: "captured", side: 96 },
+                  { id: "ambient", side: 192 },
+                  { id: "unavailable", side: 256 },
+                ].map(({ id, side }) =>
+                  Object.assign(makeModelDefinition(id, ["text", "image"]), {
+                    mediaInput: { image: { maxSidePx: side, preferredSidePx: side } },
+                  }),
+                ),
+              },
+            },
+          },
+        } satisfies OpenClawConfig;
+        const generation = (modelId: string) => {
+          const fixture = createModelGenerationFixture({
+            agentDir: state.agentDir("image"),
+            workspaceDir: state.workspaceDir,
+            config: cfg,
+            label: modelId,
+            provider,
+            requestProvider: provider,
+            modelId,
+          });
+          const metadataSnapshot = createPluginMetadataSnapshot({
+            config: cfg,
+            workspaceDir: state.workspaceDir,
+            manifestRegistry: {
+              plugins: fixture.metadataSnapshot.plugins.map((plugin) => ({
+                ...plugin,
+                modelIdNormalization: {
+                  providers: { [provider]: { aliases: { entry: modelId } } },
+                },
+              })),
+              diagnostics: [],
+            },
+          });
+          metadataSnapshot.owners.modelIdNormalizationPolicies =
+            collectManifestModelIdNormalizationPolicies(metadataSnapshot.plugins);
+          return {
+            ...fixture,
+            metadataSnapshot,
+            preparedModelRuntime: { ...fixture.preparedModelRuntime, metadataSnapshot },
+          };
+        };
+        const captured = generation("captured");
+        const ambient = generation("ambient");
+        publishCurrentModelGeneration(ambient);
+        const observed: Array<{ model: string; width: number; height: number }> = [];
+        installImageUnderstandingProviderDeps(
+          [
+            {
+              id: provider,
+              capabilities: ["image"],
+              describeImage: async (request) => {
+                const dimensions =
+                  request.mime === "image/png"
+                    ? readPngDimensions(request.buffer)
+                    : readJpegDimensions(request.buffer);
+                observed.push({ model: request.model, ...dimensions });
+                if (request.model === "unavailable") {
+                  throw new Error("fixture image model unavailable");
+                }
+                return { text: "inspected", model: request.model };
+              },
+            },
+          ],
+          { useDefaultResolveModelAsync: true },
+        );
+        const tool = createRequiredImageTool({
+          config: cfg,
+          agentDir: state.agentDir("image"),
+          workspaceDir: state.workspaceDir,
+          ...(supplied === "none"
+            ? {}
+            : {
+                preparedModelRuntime: (supplied === "captured" ? captured : ambient)
+                  .preparedModelRuntime,
+              }),
+        });
+        const source = createLargeColorBlockPng(256);
+        const result = await withPluginRuntimeGenerationScope(ambient.preparedModelRuntime, () =>
+          tool.execute("image", {
+            path: `data:image/png;base64,${source.toString("base64")}`,
+            ...(route === "override" ? { model: `${provider}/entry` } : {}),
+          }),
+        );
+        expect.soft(result.details).toMatchObject({ model: `${provider}/${expected}` });
+        expect
+          .soft(observed.map(({ model }) => model))
+          .toEqual(route === "fallback" ? ["unavailable", expected] : [expected]);
+        expect.soft(observed.at(-1)).toMatchObject({ width: maxSidePx, height: maxSidePx });
+      } finally {
+        resetModelGenerationFixtureState();
+        await state.cleanup();
+      }
+    },
+  );
+
   it("derives model metadata, quality preference, and image count from config", async () => {
     const cfg = {
       ...cfgWithImageModelMetadata,
@@ -3403,6 +3535,7 @@ describe("image compression policy", () => {
   it("keeps runtime Anthropic media limits for dated model variants", async () => {
     testing.setProviderDepsForTest({
       resolveModelAsync: async (_provider, model) => ({
+        logicalRef: { provider: _provider, model },
         model: {
           mediaInput: {
             image: model.includes("opus")
@@ -3439,6 +3572,7 @@ describe("image compression policy", () => {
   it("merges partial configured Anthropic media policy with runtime side limits", async () => {
     testing.setProviderDepsForTest({
       resolveModelAsync: async (_provider, _model, _agentDir, _cfg, options) => ({
+        logicalRef: { provider: _provider, model: _model },
         model: {
           mediaInput: {
             image: options?.skipProviderRuntimeHooks

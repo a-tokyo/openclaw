@@ -7,7 +7,6 @@ import { isProgressCardRendererClient } from "../utils/message-channel.js";
 import { revokeDeviceBootstrapTokensForDevice } from "./device-bootstrap.js";
 import {
   cloneDevicePairingTokens,
-  isPairingRequestExpired,
   loadDevicePairingState,
   loadDevicePairingStateReadOnly,
   mergeDevicePairingRoles,
@@ -25,6 +24,7 @@ import {
   loadPairedDevicePairingStoreRecord,
   persistDevicePairingStoreState,
   updatePairedDevicePresenceInTransaction,
+  type DevicePairingStoreState,
 } from "./device-pairing-store.js";
 import type {
   DeviceAuthToken,
@@ -398,8 +398,7 @@ function buildPendingDevicePairingRequest(params: {
   };
 }
 
-export async function listDevicePairing(baseDir?: string): Promise<DevicePairingList> {
-  const state = await loadDevicePairingState(baseDir);
+function toDevicePairingList(state: DevicePairingStoreState): DevicePairingList {
   const pending = Object.values(state.pendingById)
     .map(toPublicPendingDevicePairingRequest)
     .toSorted((a, b) => b.ts - a.ts);
@@ -409,16 +408,13 @@ export async function listDevicePairing(baseDir?: string): Promise<DevicePairing
   return { pending, paired };
 }
 
+export async function listDevicePairing(baseDir?: string): Promise<DevicePairingList> {
+  return toDevicePairingList(await loadDevicePairingState(baseDir));
+}
+
 /** List pairing state without creating or migrating shared state. */
 export async function listDevicePairingReadOnly(baseDir?: string): Promise<DevicePairingList> {
-  const state = await loadDevicePairingStateReadOnly(baseDir);
-  const pending = Object.values(state.pendingById)
-    .map(toPublicPendingDevicePairingRequest)
-    .toSorted((a, b) => b.ts - a.ts);
-  const paired = Object.values(state.pairedByDeviceId).toSorted(
-    (a, b) => b.approvedAtMs - a.approvedAtMs,
-  );
-  return { pending, paired };
+  return toDevicePairingList(await loadDevicePairingStateReadOnly(baseDir));
 }
 
 /** Return one paired device by normalized device id. */
@@ -426,11 +422,7 @@ export async function getPairedDevice(
   deviceId: string,
   baseDir?: string,
 ): Promise<PairedDevice | null> {
-  const device = loadPairedDevicePairingStoreRecord(normalizeDevicePairingId(deviceId), baseDir);
-  if (device?.pendingNodeSurface && isPairingRequestExpired(device.pendingNodeSurface.ts)) {
-    delete device.pendingNodeSurface;
-  }
-  return device;
+  return loadPairedDevicePairingStoreRecord(normalizeDevicePairingId(deviceId), baseDir);
 }
 
 /** Return one pending pairing request by request id. */

@@ -9,12 +9,13 @@ import type {
 } from "../infra/outbound/session-binding-service.js";
 import { drainGlobalSingletonLifecycleState } from "../shared/global-singleton.js";
 import type { DB as OpenClawStateKyselyDatabase } from "../state/openclaw-state-db.generated.js";
-import * as openClawStateDb from "../state/openclaw-state-db.js";
 import {
+  closeOpenClawStateDatabaseAsync,
   closeOpenClawStateDatabaseForTest,
   openOpenClawStateDatabase,
   runOpenClawStateWriteTransaction,
 } from "../state/openclaw-state-db.js";
+import * as stateWorker from "../state/openclaw-state-worker-store.js";
 import { seedPluginConversationBindingApprovalForTest } from "./conversation-binding.test-fixtures.js";
 import { createEmptyPluginRegistry } from "./registry-empty.js";
 import type { PluginRegistry } from "./registry.js";
@@ -163,7 +164,8 @@ function createAdapter(channel: string, accountId: string): SessionBindingAdapte
   };
 }
 
-afterAll(() => {
+afterAll(async () => {
+  await closeOpenClawStateDatabaseAsync();
   closeOpenClawStateDatabaseForTest();
   if (previousStateDir == null) {
     delete process.env.OPENCLAW_STATE_DIR;
@@ -444,18 +446,6 @@ function readPluginBindingApprovalRows(): Array<{
   ).rows;
 }
 
-function insertPluginBindingApprovalRow(params: {
-  pluginRoot: string;
-  channel: string;
-  accountId: string;
-  pluginId: string;
-}): void {
-  seedPluginConversationBindingApprovalForTest({
-    ...params,
-    approvedAt: 1,
-  });
-}
-
 describe("plugin conversation binding approvals", () => {
   beforeEach(async () => {
     await drainGlobalSingletonLifecycleState();
@@ -644,10 +634,17 @@ describe("plugin conversation binding approvals", () => {
     });
   });
 
-  it("requires a fresh approval again after allow-once is consumed", async () => {
+  it("keeps allow-once approval scoped to its requester and conversation", async () => {
     const firstRequest = await requestPendingBinding(
       createDiscordCodexBindRequest("channel:1", "Bind this conversation to Codex thread 123."),
     );
+    await expect(
+      resolvePluginConversationBindingApproval({
+        approvalId: firstRequest.approvalId,
+        decision: "allow-once",
+        senderId: "another-user",
+      }),
+    ).resolves.toEqual({ status: "expired" });
     const approved = await approveBindingRequest(firstRequest.approvalId, "allow-once");
 
     expect(approved.status).toBe("approved");
@@ -690,14 +687,12 @@ describe("plugin conversation binding approvals", () => {
     );
 
     const writeSpy = vi
-      .spyOn(openClawStateDb, "runOpenClawStateWriteTransaction")
-      .mockImplementationOnce(() => {
-        throw new Error("SQLITE_BUSY: database is locked");
-      });
+      .spyOn(stateWorker, "runOpenClawStateWorkerOperation")
+      .mockRejectedValueOnce(new Error("approval operation unavailable"));
 
     // A failed persist must propagate; the grant was never durably recorded.
     await expect(approveBindingRequest(pendingRequest.approvalId, "allow-always")).rejects.toThrow(
-      "SQLITE_BUSY",
+      "approval operation unavailable",
     );
 
     writeSpy.mockRestore();
@@ -775,7 +770,8 @@ describe("plugin conversation binding approvals", () => {
   });
 
   it("does not remove approval rows written outside the process cache", async () => {
-    insertPluginBindingApprovalRow({
+    await seedPluginConversationBindingApprovalForTest({
+      approvedAt: 1,
       pluginRoot: "/plugins/other",
       channel: "discord",
       accountId: "default",

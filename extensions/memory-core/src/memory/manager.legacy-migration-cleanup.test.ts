@@ -15,7 +15,8 @@ import {
 } from "openclaw/plugin-sdk/sqlite-runtime-testing";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import "./test-runtime-mocks.js";
-import { closeAllMemoryIndexManagers, MemoryIndexManager } from "./manager.js";
+import { closeAllMemoryIndexManagers } from "./manager-runtime.js";
+import { MemoryIndexManager } from "./manager.js";
 
 const originalStateDir = process.env.OPENCLAW_STATE_DIR;
 
@@ -140,7 +141,6 @@ describe("memory legacy migration cleanup", () => {
               },
             },
             cache: { enabled: false },
-            sync: { watch: false, onSessionStart: false, onSearch: false },
             query: { hybrid: { enabled: true } },
           },
         },

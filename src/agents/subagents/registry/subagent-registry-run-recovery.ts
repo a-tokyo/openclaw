@@ -4,7 +4,6 @@ import {
 } from "../../../config/sessions.js";
 import { loadSessionEntryReadOnly } from "../../../config/sessions/session-accessor.js";
 import type { GatewayContextResolver } from "../../../gateway/server-methods/types.js";
-/** Owns steer replacement and restart-recovery receipt transitions. */
 import {
   getAgentEventLifecycleGeneration,
   isAgentEventLifecycleGenerationCurrent,
@@ -18,6 +17,7 @@ import { prepareCanonicalTaskActivation } from "../../../tasks/task-backing-auth
 import { createSubagentTaskBackingDetail } from "../../../tasks/task-backing-authority.js";
 import { removeInternalSessionEffectsSession } from "../../internal-session-effects.js";
 import type { AgentRunSessionTarget } from "../../run-session-target.js";
+import { replaceRequesterCronAuthorityEntry } from "../requester-cron-authority.js";
 import {
   clearDeliveryState,
   ensureCompletionState,
@@ -149,19 +149,18 @@ export class SubagentRecoveryManager extends SubagentWaitManager {
     const sourceRequesterSettleWake = replaceParams.preserveRequesterSettleWake
       ? source.requesterSettleWake
       : undefined;
-    const inheritedRequesterSettleWake: RequesterSettleWakeState | undefined =
-      sourceRequesterSettleWake
+    const remapRequesterSettleWake = (
+      wake: RequesterSettleWakeState,
+    ): RequesterSettleWakeState => ({
+      ...wake,
+      ...(wake.batchRunIds
         ? {
-            ...sourceRequesterSettleWake,
-            ...(sourceRequesterSettleWake.batchRunIds
-              ? {
-                  batchRunIds: sourceRequesterSettleWake.batchRunIds
-                    .map((runId) => (runId === previousRunId ? nextRunId : runId))
-                    .toSorted(),
-                }
-              : {}),
+            batchRunIds: wake.batchRunIds
+              .map((runId) => (runId === previousRunId ? nextRunId : runId))
+              .toSorted(),
           }
-        : undefined;
+        : {}),
+    });
     const next: SubagentRunRecord = normalizeSubagentRunState({
       ...source,
       runId: nextRunId,
@@ -179,7 +178,9 @@ export class SubagentRecoveryManager extends SubagentWaitManager {
       browserCleanupDispatchedAt: undefined,
       deleteCleanupDispatchedAt: undefined,
       wakeOnDescendantSettle: undefined,
-      requesterSettleWake: inheritedRequesterSettleWake,
+      requesterSettleWake: sourceRequesterSettleWake
+        ? remapRequesterSettleWake(sourceRequesterSettleWake)
+        : undefined,
       execution: {
         status: "running",
         startedAt: now,
@@ -237,40 +238,31 @@ export class SubagentRecoveryManager extends SubagentWaitManager {
     }
     this.options.runs.set(nextRunId, next);
     const killReconciliationSnapshots = this.markOlderKillReconciliationsSuperseded(next);
+    const wakeSnapshots = new Map<SubagentRunRecord, RequesterSettleWakeState>();
+    // Every member carries the frozen cohort. Remap them atomically with the
+    // successor so a settled sibling cannot drop a still-running replacement.
+    for (const memberRunId of sourceRequesterSettleWake?.batchRunIds ?? []) {
+      const member = this.options.runs.get(memberRunId);
+      const wake = member?.requesterSettleWake;
+      if (
+        !member ||
+        member === next ||
+        member.requesterSessionKey !== source.requesterSessionKey ||
+        member.requesterAgentId !== source.requesterAgentId ||
+        !wake?.batchRunIds?.includes(previousRunId) ||
+        wake.rearmGeneration !== sourceRequesterSettleWake?.rearmGeneration
+      ) {
+        continue;
+      }
+      wakeSnapshots.set(member, wake);
+      member.requesterSettleWake = remapRequesterSettleWake(wake);
+    }
     const changedRunIds = [
       previousRunId,
       nextRunId,
       ...[...killReconciliationSnapshots.keys()].map((entry) => entry.runId),
+      ...[...wakeSnapshots.keys()].map((entry) => entry.runId),
     ];
-    const rollbackReplacement = () => {
-      this.restoreKillReconciliationSnapshots(killReconciliationSnapshots);
-      this.options.runs.delete(nextRunId);
-      this.options.runs.set(previousRunId, source);
-    };
-    const adoptSuccessorOwner = () => {
-      if (!taskActivation) {
-        subagentRuns.commitOwnership(next);
-      }
-      if (previousRunId !== nextRunId) {
-        this.options.clearPendingLifecycleError(previousRunId);
-        this.options.resumedRuns.delete(previousRunId);
-        if (this.shouldDeleteAttachments(source)) {
-          void safeRemoveAttachmentsDir(source);
-        }
-        if (
-          source.execution.transcriptTarget &&
-          source.execution.transcriptTarget !== replaceParams.transcriptTarget
-        ) {
-          void removeInternalSessionEffectsSession(source.execution.transcriptTarget);
-        }
-      }
-      this.options.ensureListener();
-      // Always start sweeper — session-mode runs (no archiveAtMs) also need TTL cleanup.
-      this.options.startSweeper();
-      if (!next.execution.restartRecovery) {
-        void this.waitForSubagentCompletion(nextRunId, waitTimeoutMs, next);
-      }
-    };
     const canReconcileAcceptedReceipt = () => {
       // Staging replaces the map entry before commit. Only this exact
       // live acceptance may bridge its failed write, never a restored copy.
@@ -305,7 +297,7 @@ export class SubagentRecoveryManager extends SubagentWaitManager {
           session.lifecycleRevision === acceptedReceipt.sessionLifecycleRevision)
       );
     };
-    const persistReplacement = (): void => {
+    try {
       if (taskActivation) {
         commitSubagentTaskReplacement({
           runs: this.options.runs,
@@ -315,14 +307,16 @@ export class SubagentRecoveryManager extends SubagentWaitManager {
           task: taskActivation,
           canReconcileAcceptedReceipt,
         });
-        return;
+      } else {
+        this.options.persistOrThrow(...changedRunIds);
       }
-      this.options.persistOrThrow(...changedRunIds);
-    };
-    try {
-      persistReplacement();
     } catch (error) {
-      rollbackReplacement();
+      this.restoreKillReconciliationSnapshots(killReconciliationSnapshots);
+      for (const [member, wake] of wakeSnapshots) {
+        member.requesterSettleWake = wake;
+      }
+      this.options.runs.delete(nextRunId);
+      this.options.runs.set(previousRunId, source);
       log.warn("failed to persist replacement subagent recovery run; restored source lease", {
         error,
         previousRunId,
@@ -342,7 +336,33 @@ export class SubagentRecoveryManager extends SubagentWaitManager {
     if (this.options.runs.get(nextRunId) !== next) {
       return true;
     }
-    adoptSuccessorOwner();
+    replaceRequesterCronAuthorityEntry({
+      previous: source,
+      next,
+      preserve: replaceParams.preserveRequesterSettleWake === true,
+    });
+    if (!taskActivation) {
+      subagentRuns.commitOwnership(next);
+    }
+    if (previousRunId !== nextRunId) {
+      this.options.clearPendingLifecycleError(previousRunId);
+      this.options.resumedRuns.delete(previousRunId);
+      if (this.shouldDeleteAttachments(source)) {
+        void safeRemoveAttachmentsDir(source);
+      }
+      if (
+        source.execution.transcriptTarget &&
+        source.execution.transcriptTarget !== replaceParams.transcriptTarget
+      ) {
+        void removeInternalSessionEffectsSession(source.execution.transcriptTarget);
+      }
+    }
+    this.options.ensureListener();
+    // Always start sweeper — session-mode runs (no archiveAtMs) also need TTL cleanup.
+    this.options.startSweeper();
+    if (!next.execution.restartRecovery) {
+      void this.waitForSubagentCompletion(nextRunId, waitTimeoutMs, next);
+    }
     return true;
   };
 

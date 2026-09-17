@@ -18,6 +18,7 @@ import {
   resetServerUiPrefsSync,
   resolveServerUiPrefState,
 } from "./server-prefs.ts";
+import { invalidateUserPreferences } from "./user-prefs-cache.ts";
 
 const AGENT_ROSTER_REFRESH_DEBOUNCE_MS = 100;
 
@@ -188,6 +189,9 @@ export class ShellGatewayOwner {
         "profileId" in payload &&
         payload.profileId === profileId
       ) {
+        if (context.gateway.snapshot.client) {
+          invalidateUserPreferences(context.gateway.snapshot.client);
+        }
         void this.refreshProfileAppearancePrefs(context, true).catch(() => undefined);
       }
       return;
@@ -272,7 +276,7 @@ export class ShellGatewayOwner {
       next.agents.length > 0 &&
       !nextIds.has(activeAgentId)
     ) {
-      context.agentSelection.set(next.defaultId);
+      context.agentSelection.set(next.defaultId, { background: true });
     }
   }
 
@@ -287,7 +291,10 @@ export class ShellGatewayOwner {
         await this.ensureRuntimeConfig(snapshot, context.runtimeConfig);
         return this.refreshProfileAppearancePrefs(context);
       });
-      if (this.host.routeState.routeId && !context.agents.state.agentsList) {
+      if (
+        this.host.routeState.routeId &&
+        (!context.agents.state.agentsList || context.agents.state.agentsListCached)
+      ) {
         void connectionBootstrap.run("agents", () =>
           this.ensureAgentsList(snapshot, context.agents),
         );
@@ -339,7 +346,7 @@ export class ShellGatewayOwner {
       return Promise.resolve();
     }
     const routeId = this.host.routeState.routeId;
-    if (!agents || !routeId || agents.state.agentsList) {
+    if (!agents || !routeId || (agents.state.agentsList && !agents.state.agentsListCached)) {
       return Promise.resolve();
     }
     if (this.host.agentsListClient === snapshot.client && this.host.agentsListSource === agents) {

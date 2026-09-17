@@ -1,19 +1,23 @@
 import {
   createChannelProgressDraftCompositor,
+  resolveChannelProgressDraftMaxLineChars,
+  resolveChannelProgressDraftMaxLines,
   type ChannelProgressDraftLine,
 } from "openclaw/plugin-sdk/channel-outbound";
 import type { TelegramBotDeps } from "./bot-deps.js";
-import { resetLaneState, rotateAnswerLaneAfterToolProgress } from "./bot-message-dispatch-draft.js";
+import {
+  enqueueDraftEvent,
+  resetLaneState,
+  rotateAnswerLaneAfterToolProgress,
+  rotateAnswerLaneForNewMessage,
+} from "./bot-message-dispatch-draft.js";
 import type {
   TelegramDispatchTurn as Turn,
   TelegramDispatchTurnConfig as TurnConfig,
   TelegramProgressStateSlice,
 } from "./bot-message-dispatch.types.js";
-import type { DraftLaneState } from "./lane-delivery.js";
-import {
-  formatTelegramProgressLine,
-  renderTelegramProgressDraftPreview,
-} from "./progress-draft-preview.js";
+import type { DraftLaneState } from "./lane-delivery-text-deliverer.js";
+import { renderTelegramProgressDraftPreview } from "./progress-draft-preview.js";
 
 type BufferedDispatchParams = Parameters<
   TelegramBotDeps["dispatchReplyWithBufferedBlockDispatcher"]
@@ -84,35 +88,37 @@ export function createProgressState(
     mode: config.streamMode,
     active: Boolean(draftState.answerLane.stream),
     seed: `${config.context.route.accountId}:${config.context.chatId}:${config.context.threadSpec.id ?? ""}`,
-    formatLine: (text) =>
-      progressCompositor.hasStatusHeadline || progressCompositor.hasPlanProgress
-        ? text
-        : formatTelegramProgressLine(text),
     reasoningGate: draftState.streamReasoningInProgressDraft,
     reasoningLinePrefix: "🧠 ",
     commentaryLinePrefix: "💬 ",
     commentaryItalics: false,
     updateOnLineChange: true,
     shouldStartNow: (line) => typeof line !== "string" && line?.kind === "tool",
-    // renderTelegramProgressDraftPreview draws the work lines from `lines` in
-    // headline/checklist mode, so they must not also arrive inside the text.
-    rendersRollingLinesNatively: true,
     update: async (streamText, options) => {
       await prepareAnswerLaneForToolProgress();
       draftState.answerLane.lastPartialText = streamText;
       draftState.answerLane.hasStreamedMessage = true;
       draftState.answerLane.finalized = false;
       draftState.answerLane.stream?.updatePreview(
-        renderTelegramProgressDraftPreview(
-          streamText,
-          options?.lines ?? [],
-          config.telegramCfg.richMessages === true,
-          progressCompositor.hasStatusHeadline || progressCompositor.hasPlanProgress,
-        ),
+        renderTelegramProgressDraftPreview(options.snapshot, {
+          toolProgress: progressCompositor.previewToolProgressEnabled,
+          richMessages: config.telegramCfg.richMessages === true,
+          maxLines: resolveChannelProgressDraftMaxLines(config.telegramCfg),
+          maxLineChars: resolveChannelProgressDraftMaxLineChars(config.telegramCfg),
+        }),
       );
-      if (options?.flush) {
+      if (options.flush) {
         await draftState.answerLane.stream?.flush();
       }
+    },
+    deleteCurrent: async () => {
+      // clear waits for in-flight sends and stops the stream. Reopen only after
+      // that stop so a cleared card cannot consume the next progress update.
+      await draftState.answerLane.stream?.clear();
+      draftState.answerLane.stream?.forceNewMessage();
+      draftState.answerLane.lastPartialText = "";
+      draftState.answerLane.hasStreamedMessage = false;
+      draftState.answerLane.finalized = false;
     },
   });
   return Object.assign(progressState, {
@@ -135,7 +141,6 @@ export function canPushToolProgress(turn: Turn): boolean {
 
 function canPushCompactionProgress(turn: Turn): boolean {
   return Boolean(
-    turn.streamMode === "progress" &&
     turn.answerLane.stream &&
     !turn.answerLane.finalized &&
     !turn.finalAnswerDeliveryStarted &&
@@ -212,13 +217,26 @@ export async function handleToolStart(
   payload: CallbackPayload<"onToolStart">,
 ): Promise<boolean> {
   const toolName = payload.name?.trim();
-  const progressPromise = pushProgressEvent(turn, () =>
-    turn.progressCompositor.pushToolEvent(payload),
-  );
+  let rendered = false;
+  const progressPromise = enqueueDraftEvent(turn, async () => {
+    if (
+      payload.phase !== "update" &&
+      turn.answerLane.stream &&
+      turn.streamMode !== "progress" &&
+      !turn.activeAnswerDraftIsToolProgressOnly
+    ) {
+      // A tool invalidates unaccepted answer text, including pending lazy previews.
+      // Serialize with partials so earlier text cannot arrive after retirement.
+      await rotateAnswerLaneForNewMessage(turn);
+      turn.progressCompositor.resetActivity();
+    }
+    rendered = await pushProgressEvent(turn, () => turn.progressCompositor.pushToolEvent(payload));
+  });
   if (turn.statusReactionController && toolName) {
     await turn.statusReactionController.setTool(toolName);
   }
-  return await progressPromise;
+  await progressPromise;
+  return rendered;
 }
 
 export async function handleCompactionStart(turn: Turn): Promise<boolean> {
@@ -277,6 +295,7 @@ export async function handlePlanUpdate(
   return payload.phase === "update" && canPushToolProgress(turn)
     ? await turn.progressCompositor.pushPlanProgress(payload.steps, {
         explanation: payload.explanation,
+        explanationFormat: payload.explanationFormat,
       })
     : false;
 }

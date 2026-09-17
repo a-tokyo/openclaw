@@ -43,13 +43,20 @@ const connection = new AgentSideConnection(
     },
     async newSession({ mcpServers }) {
       const sessionId = randomUUID();
-      const state = { history: [], tone: "plain", mode: "normal", mcpServers };
+      const state = {
+        history: [],
+        tone: "plain",
+        mode: "normal",
+        mcpServers,
+        argv: process.argv.slice(3),
+      };
       sessions.set(sessionId, state);
       await save(sessionId);
       return { sessionId, ...describe(state) };
     },
-    async loadSession({ sessionId }) {
+    async loadSession({ sessionId, mcpServers }) {
       const state = JSON.parse(await fs.readFile(file(sessionId), "utf8"));
+      state.loadedMcpServers = mcpServers;
       sessions.set(sessionId, state);
       return describe(state);
     },

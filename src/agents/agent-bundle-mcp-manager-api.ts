@@ -38,6 +38,7 @@ export async function acquireSessionMcpRuntime(params: {
   agentAccountId?: string | null;
   messageChannel?: string | null;
   toolOverrides?: Pick<SessionToolOverrides, "mcpServers" | "mcpToolsDeny">;
+  toolDenylist?: string[];
 }): Promise<SessionMcpRuntimeLease> {
   return await getSessionMcpRuntimeManager().acquire(params);
 }
@@ -57,6 +58,7 @@ export async function acquireRequesterScopedMcpRuntime(params: {
   agentAccountId?: string | null;
   messageChannel?: string | null;
   toolOverrides?: Pick<SessionToolOverrides, "mcpServers" | "mcpToolsDeny">;
+  toolDenylist?: string[];
 }): Promise<RequesterScopedMcpRuntimeHandle | undefined> {
   return await getSessionMcpRuntimeManager().acquireRequesterScoped(params);
 }
@@ -85,10 +87,6 @@ export function peekSessionMcpRuntime(params: {
   });
 }
 
-async function disposeSessionMcpRuntime(sessionId: string): Promise<void> {
-  await getSessionMcpRuntimeManager().disposeSession(sessionId);
-}
-
 export async function retireSessionMcpRuntime(params: {
   sessionId?: string | null;
   reason: string;
@@ -101,24 +99,16 @@ export async function retireSessionMcpRuntime(params: {
     return false;
   }
   const manager = getSessionMcpRuntimeManager();
-  const retainAcrossReuse =
-    params.preserveActiveLeases === true && params.retainAcrossReuse === true;
-  // Aggregate leases across static + all requester-scoped parts so preserveActiveLeases
-  // does not miss a leased scoped runtime while peeking only the bare session key.
-  if (params.preserveActiveLeases === true) {
-    manager.deferRetirement(sessionId, {
-      retainAcrossReuse,
-    });
-    if (manager.totalActiveLeasesForSession(sessionId) > 0) {
-      return true;
-    }
-  }
   try {
-    if (retainAcrossReuse) {
+    if (
+      params.preserveActiveLeases === true &&
+      manager.deferRetirement(sessionId, { retainAcrossReuse: params.retainAcrossReuse })
+    ) {
+      // The lifecycle owner checks every partition and preserves required retirement.
       await manager.completeDeferredRetirement(sessionId);
-      return true;
+    } else {
+      await manager.disposeSession(sessionId);
     }
-    await disposeSessionMcpRuntime(sessionId);
     return true;
   } catch (error) {
     params.onError?.(error, sessionId, params.reason);
@@ -127,17 +117,27 @@ export async function retireSessionMcpRuntime(params: {
 }
 
 /** Releases an acquisition after its consumer has taken ownership, or after failure. */
-export async function releaseSessionMcpRuntime(lease: {
-  runtime: SessionMcpRuntime;
-  releaseLease?: () => void;
-}): Promise<void> {
+export async function releaseSessionMcpRuntime(
+  lease: Pick<SessionMcpRuntimeLease, "runtime" | "retireUnusedServers"> & {
+    releaseLease?: () => void;
+  },
+  retainedServerNames?: ReadonlySet<string>,
+): Promise<void> {
   lease.releaseLease?.();
-  await completeDeferredSessionMcpRuntimeRetirement(lease.runtime).catch((error: unknown) => {
-    logWarn(`bundle-mcp: deferred runtime cleanup failed: ${String(error)}`);
-  });
+  try {
+    if (retainedServerNames) {
+      await lease.retireUnusedServers?.(retainedServerNames);
+    }
+  } catch (error) {
+    logWarn(`bundle-mcp: unused server cleanup failed: ${String(error)}`);
+  } finally {
+    await completeDeferredSessionMcpRuntimeRetirement(lease.runtime).catch((error: unknown) => {
+      logWarn(`bundle-mcp: deferred runtime cleanup failed: ${String(error)}`);
+    });
+  }
 }
 
-/** Completes a one-shot retirement after its final run, view, or request lease releases. */
+/** Completes deferred retirement after its final run, view, or request lease releases. */
 export async function completeDeferredSessionMcpRuntimeRetirement(
   runtime: SessionMcpRuntime,
 ): Promise<boolean> {

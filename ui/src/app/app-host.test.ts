@@ -1,6 +1,4 @@
 /* @vitest-environment jsdom */
-
-import type { RouteLocation, RouterState } from "@openclaw/uirouter";
 import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import type { GatewayBrowserClient } from "../api/gateway.ts";
 import type { AgentsListResult, GatewayAgentRow } from "../api/types.ts";
@@ -19,6 +17,7 @@ import { createSessionCapabilityHarness } from "../lib/sessions/session-capabili
 import { createStorageMock } from "../test-helpers/storage.ts";
 import { selectShellRouteState } from "./app-host-route-state.ts";
 import {
+  committedRouterState,
   createLazyElementSpec,
   resetAppHostTestGlobals,
   type ShellKeyboardState,
@@ -26,6 +25,7 @@ import {
   stubRenderedWhenDefined,
 } from "./app-host.test-support.ts";
 import { ShellGatewayOwner, type ShellGatewayHost } from "./app-shell-gateway.ts";
+import { createChatSubmissions } from "./chat-submissions.ts";
 import type {
   ApplicationContext,
   ApplicationGateway,
@@ -61,8 +61,7 @@ function createRouteSessions() {
 type AppLifecycleState = {
   loginToken: string;
   loginPassword: string;
-  loginShowGatewayToken: boolean;
-  loginShowGatewayPassword: boolean;
+  loginShowGatewaySecret: boolean;
   disconnectedCallback: () => void;
   synchronizeGateway: (gateway: ApplicationGateway) => void;
 };
@@ -261,35 +260,17 @@ type ShellSessionNavigationState = {
   routeState: { routeId?: RouteId };
   navigate: (routeId: RouteId) => void;
   handleCommandPaletteSlashCommand: (command: string) => void;
-  replaceChatWithCurrentSession: () => boolean;
+  recoverNotFoundRoute: () => boolean;
 };
-
-function committedRouterState(
-  routeId: RouteId,
-  pathname: string,
-  data?: unknown,
-): RouterState<RouteId> {
-  const location = { pathname, search: "", hash: "" } satisfies RouteLocation;
-  return {
-    location,
-    resolvedLocation: location,
-    status: "success",
-    matches: [{ routeId, location, data }],
-    pendingMatches: [],
-    cachedMatches: [],
-  } as unknown as RouterState<RouteId>;
-}
 
 describe("OpenClaw app lifecycle", () => {
   it("hides revealed login credentials when the app connection epoch ends", () => {
     const app = document.createElement("openclaw-app") as unknown as AppLifecycleState;
-    app.loginShowGatewayToken = true;
-    app.loginShowGatewayPassword = true;
+    app.loginShowGatewaySecret = true;
 
     app.disconnectedCallback();
 
-    expect(app.loginShowGatewayToken).toBe(false);
-    expect(app.loginShowGatewayPassword).toBe(false);
+    expect(app.loginShowGatewaySecret).toBe(false);
   });
 
   it("hides revealed login credentials when the Gateway source changes", () => {
@@ -313,13 +294,11 @@ describe("OpenClaw app lifecycle", () => {
       },
     } as ApplicationGateway;
     app.synchronizeGateway(firstGateway);
-    app.loginShowGatewayToken = true;
-    app.loginShowGatewayPassword = true;
+    app.loginShowGatewaySecret = true;
 
     app.synchronizeGateway(secondGateway);
 
-    expect(app.loginShowGatewayToken).toBe(false);
-    expect(app.loginShowGatewayPassword).toBe(false);
+    expect(app.loginShowGatewaySecret).toBe(false);
     expect(app.loginToken).toBe("second");
     expect(app.loginPassword).toBe("second-password");
   });
@@ -481,6 +460,7 @@ describe("OpenClaw shell route session commits", () => {
         agentSelection: { state: { selectedId: "main" } },
         gateway: { snapshot: { hello: null } },
         sessions: createRouteSessions(),
+        chatSubmissions: createChatSubmissions(),
         navigate,
       } as unknown as ApplicationContext,
     };
@@ -509,6 +489,7 @@ describe("OpenClaw shell route session commits", () => {
         agentSelection: { state: { selectedId: "research" } },
         gateway: { snapshot: { hello: null } },
         sessions: createRouteSessions(),
+        chatSubmissions: createChatSubmissions(),
         navigate,
       } as unknown as ApplicationContext,
     };
@@ -538,17 +519,18 @@ describe("OpenClaw shell route session commits", () => {
         agentSelection: { set: vi.fn(), state: { selectedId: null } },
         gateway: { setSessionKey: vi.fn(), snapshot },
         sessions: createRouteSessions(),
+        chatSubmissions: createChatSubmissions(),
         replace,
       } as unknown as ApplicationContext,
     };
     shell.activeSessionKey = "main";
     shell.routeState = { routeId: "chat" };
 
-    expect(shell.replaceChatWithCurrentSession()).toBe(false);
+    expect(shell.recoverNotFoundRoute()).toBe(false);
     expect(replace).not.toHaveBeenCalled();
 
     snapshot.phase = "connected";
-    expect(shell.replaceChatWithCurrentSession()).toBe(true);
+    expect(shell.recoverNotFoundRoute()).toBe(true);
     expect(replace).toHaveBeenCalledWith("chat", { pathname: "/chat/research" });
   });
 
@@ -566,6 +548,7 @@ describe("OpenClaw shell route session commits", () => {
         },
         agentSelection: { set: setAgent },
         sessions: createRouteSessions(),
+        chatSubmissions: createChatSubmissions(),
       } as unknown as ApplicationContext,
     };
     shell.activeSessionKey = "agent:main:session-a";
@@ -878,23 +861,33 @@ describe("OpenClaw shell keyboard shortcuts", () => {
     }
   });
 
-  it("normalizes an unloaded palette toggle shortcut to open", async () => {
-    const element = createLazyElementSpec("command palette");
-    const openPalette = vi.fn();
-    const shell = configureLazyPaletteShell(element, openPalette);
-    stubRenderedWhenDefined(shell);
-    const event = new KeyboardEvent("keydown", {
-      key: "л",
-      code: "KeyK",
-      ctrlKey: true,
-      cancelable: true,
-    });
+  it.each(["MacIntel", "Win32", "Linux x86_64"])(
+    "opens an unloaded palette only with the platform shortcut on %s",
+    async (platform) => {
+      vi.spyOn(navigator, "platform", "get").mockReturnValue(platform);
+      const element = createLazyElementSpec("command palette");
+      const openPalette = vi.fn();
+      const shell = configureLazyPaletteShell(element, openPalette);
+      stubRenderedWhenDefined(shell);
+      const chord = (metaKey: boolean) =>
+        new KeyboardEvent("keydown", {
+          key: "л",
+          code: "KeyK",
+          metaKey,
+          ctrlKey: !metaKey,
+          cancelable: true,
+        });
+      const other = chord(platform !== "MacIntel");
+      shell.handleDocumentKeydown(other);
+      expect(other.defaultPrevented).toBe(false);
+      expect(openPalette).not.toHaveBeenCalled();
 
-    shell.handleDocumentKeydown(event);
-
-    expect(event.defaultPrevented).toBe(true);
-    await vi.waitFor(() => expect(openPalette).toHaveBeenCalledOnce());
-  });
+      const primary = chord(platform === "MacIntel");
+      shell.handleDocumentKeydown(primary);
+      expect(primary.defaultPrevented).toBe(true);
+      await vi.waitFor(() => expect(openPalette).toHaveBeenCalledOnce());
+    },
+  );
 
   it("clears a rejected command palette action on Close", async () => {
     vi.stubGlobal("sessionStorage", createStorageMock());
@@ -951,6 +944,7 @@ describe("OpenClaw shell keyboard shortcuts", () => {
         agents: { state: { agentsList: { mainKey: "main" } } },
         agentSelection: { state: { selectedId: "main" }, set: setAgent },
         sessions: createRouteSessions(),
+        chatSubmissions: createChatSubmissions(),
         navigate,
       } as unknown as ApplicationContext,
     };
@@ -1059,7 +1053,7 @@ describe("OpenClaw shell keyboard shortcuts", () => {
     shell.handleGatewayEvent({ event: "config.changed", payload: {} });
     await vi.advanceTimersByTimeAsync(100);
 
-    expect(harness.setSelection).toHaveBeenCalledExactlyOnceWith("main");
+    expect(harness.setSelection).toHaveBeenCalledExactlyOnceWith("main", { background: true });
   });
 
   it("keeps caches intact when a config.changed refresh returns the same roster", async () => {

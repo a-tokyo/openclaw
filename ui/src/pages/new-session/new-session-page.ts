@@ -6,22 +6,26 @@ import { applicationContext, type ApplicationContext } from "../../app/context.t
 import { readPresenceEntries } from "../../app/user-profile.ts";
 import type { ImageLightboxItem } from "../../components/image-lightbox.ts";
 import { t } from "../../i18n/index.ts";
-import { normalizeAgentTargetLabel } from "../../lib/agents/display.ts";
-import "../../components/web-awesome-popover.ts";
+import { registerNewSessionSetupEnglish } from "../../i18n/locales/en-new-session-setup.ts";
+import { normalizeAgentTargetLabel, resolveAgentTextAvatar } from "../../lib/agents/display.ts";
+import { resolveAgentAvatarUrl } from "../../lib/avatar.ts";
 import type { HumanMention } from "../../lib/chat/chat-types.ts";
+import "../../components/web-awesome-popover.ts";
+import { createIdleImport } from "../../lib/idle-import.ts";
 import { sessionNavigationTarget } from "../../lib/sessions/route-navigation.ts";
 import { buildAgentMainSessionKey } from "../../lib/sessions/session-key.ts";
 import { OpenClawLightDomElement } from "../../lit/openclaw-element.ts";
 import { SubscriptionsController } from "../../lit/subscriptions-controller.ts";
 import { focusChatComposerFromPrintableKeydown } from "../chat/chat-pane-shared.ts";
 import "../../styles/chat/composer.css";
+import "../../styles/chat/composer-surface.css";
 import "../../styles/new-session.css";
 import { renderChatImageLightbox } from "../chat/components/chat-image-lightbox.ts";
 import { renderWelcomeState } from "../chat/components/chat-welcome.ts";
 import * as catalog from "./catalog-target.ts";
 import { NewSessionDictationControl } from "./composer-dictation-control.ts";
 import { ConnectMachineSetupState, renderConnectMachineDialog } from "./connect-machine-dialog.ts";
-import { renderNewSessionBody } from "./draft-composer.ts";
+import { renderNewSessionBody } from "./draft-body.ts";
 import { DraftGatewayState } from "./draft-gateway-state.ts";
 import * as drafts from "./draft-navigation-handoff.ts";
 import { DraftPlaceBrowser } from "./draft-place-browser.ts";
@@ -30,17 +34,19 @@ import { DraftSubmissionFlow } from "./draft-submission-flow.ts";
 import { NewSessionTitleController } from "./draft-title.ts";
 import { renderNewSessionDraftView } from "./draft-view.ts";
 import { renderNewSessionIncognitoControl } from "./incognito-control.ts";
+import { forgetInstantThreadPage } from "./instant-thread-restore.ts";
 import type { NewSessionRouteData } from "./location.ts";
 import {
   closeAgentPicker,
   closeSessionMenus,
   createControllerHost,
-  handleSessionPickerEvent,
   isPlaceTopologyEvent,
-  presenceStateSignature,
+  nodePresenceStateSignature,
 } from "./new-session-runtime.ts";
 import type { SubmissionOutcomeReason } from "./session-placement-recovery-state.ts";
 import { renderAgentSelect, renderNewSessionPlaceControls } from "./target-controls.ts";
+
+registerNewSessionSetupEnglish();
 
 const { activateDraft, restoreDraft, restoreDraftOwner, retainDraft } = drafts;
 
@@ -50,7 +56,11 @@ export class NewSessionPage extends OpenClawLightDomElement {
   @consume({ context: applicationContext, subscribe: true })
   private context?: ApplicationContext;
 
+  private retainedForHandoff: object | null = null;
   private openedFor: string | null = null;
+  private readonly critterImport = createIdleImport(
+    () => import("../../components/lobster-pet.runtime.ts"),
+  );
   private openedGroupDefaults = "";
   private openedAgentId = "";
   private messageOwnerKey = "";
@@ -149,7 +159,7 @@ export class NewSessionPage extends OpenClawLightDomElement {
         requestUpdate: () => this.requestUpdate(),
         onError: (error) =>
           error === null ? this.submission.clearError() : this.submission.setError(error),
-        onClearError: (error) => this.submission.clearErrorIf(error),
+        onClearError: (error) => this.submission.clearError(error),
       },
     );
     this.submission = new DraftSubmissionFlow(
@@ -160,6 +170,31 @@ export class NewSessionPage extends OpenClawLightDomElement {
         requestUpdate: () => this.requestUpdate(),
         closeTransientUi: () => closeSessionMenus(this),
         takePreparedTitle: () => this.titlePreparation.takePreparedTitle(),
+        retainForHandoff: () => {
+          if (!this.data || !this.isConnected) {
+            return undefined;
+          }
+          const retention = {};
+          this.retainedForHandoff = retention;
+          return {
+            page: this,
+            data: this.data,
+            synchronizeGateway: () => {
+              if (this.context) {
+                this.gateway.synchronize(this.context.gateway);
+              }
+            },
+            release: () => {
+              if (this.retainedForHandoff !== retention) {
+                return;
+              }
+              this.retainedForHandoff = null;
+              if (!this.isConnected) {
+                this.disposeDraft();
+              }
+            },
+          };
+        },
       },
     );
     this.connectMachine = new ConnectMachineSetupState(
@@ -189,7 +224,7 @@ export class NewSessionPage extends OpenClawLightDomElement {
       .effect(
         () => this.context?.gateway,
         (gateway) => {
-          this.presenceSignature = presenceStateSignature(
+          this.presenceSignature = nodePresenceStateSignature(
             readPresenceEntries(gateway.snapshot.hello?.snapshot) ?? [],
           );
           return gateway.subscribeEvents((event) => {
@@ -198,16 +233,18 @@ export class NewSessionPage extends OpenClawLightDomElement {
             }
             if (isPlaceTopologyEvent(event.event)) {
               void this.gateway.refreshCloudProfiles();
+              this.gateway.handleCatalogRetry();
               return;
             }
             const presence = event.event === "presence" ? readPresenceEntries(event.payload) : null;
             if (!presence) {
               return;
             }
-            const signature = presenceStateSignature(presence);
+            const signature = nodePresenceStateSignature(presence);
             if (signature !== this.presenceSignature) {
               this.presenceSignature = signature;
               void this.gateway.refreshCloudProfiles();
+              this.gateway.handleCatalogRetry();
             }
           });
         },
@@ -226,6 +263,10 @@ export class NewSessionPage extends OpenClawLightDomElement {
         (sessions) => this.groupRouteRevalidation.synchronize(sessions),
       )
       .watch(
+        () => this.context?.runtimeConfig,
+        (runtimeConfig, notify) => runtimeConfig.subscribe(notify),
+      )
+      .watch(
         () => this.context?.config,
         (config, notify) => config.subscribe(() => notify()),
       );
@@ -235,22 +276,32 @@ export class NewSessionPage extends OpenClawLightDomElement {
     if (event instanceof KeyboardEvent) {
       focusChatComposerFromPrintableKeydown(this, event);
     }
-    handleSessionPickerEvent(this, event);
   }
 
   override connectedCallback() {
     super.connectedCallback();
+    this.submission.draftPersistence.connect();
+    this.critterImport.schedule();
     document.addEventListener("keydown", this, true);
-    document.addEventListener("pointerdown", this, true);
     window.addEventListener("beforeunload", this.flushDraft);
   }
 
   override disconnectedCallback() {
+    this.critterImport.dispose();
     document.removeEventListener("keydown", this, true);
-    document.removeEventListener("pointerdown", this, true);
     window.removeEventListener("beforeunload", this.flushDraft);
-    retainDraft(this.context, this.submission, this.openedFor, this.messageOwnerKey);
     this.subscriptions.clear();
+    this.dictation.dispose();
+    this.connectMachine.close();
+    if (!this.retainedForHandoff) {
+      this.disposeDraft();
+    }
+    super.disconnectedCallback();
+  }
+
+  private disposeDraft() {
+    forgetInstantThreadPage(this.data, this);
+    retainDraft(this.context, this.submission, this.openedFor, this.messageOwnerKey);
     this.gateway.invalidateDiscovery(
       true,
       this.submission.pendingPlacement.sessionKey ? "placement-interrupted" : "gateway-changed",
@@ -258,9 +309,6 @@ export class NewSessionPage extends OpenClawLightDomElement {
     this.gateway.disconnect();
     this.browser.disconnect();
     this.submission.disconnect();
-    this.dictation.dispose();
-    this.connectMachine.close();
-    super.disconnectedCallback();
   }
 
   override updated() {
@@ -288,6 +336,10 @@ export class NewSessionPage extends OpenClawLightDomElement {
     const resolvedAgentId = this.data?.agentId ?? "";
     const groupDefaults = catalog.groupDefaultsKey(this.data);
     if (this.openedFor !== openKey) {
+      // Ordinary drafts release previews on reset and restore through durable storage.
+      if (this.openedFor !== null && this.submission.visibility === "incognito") {
+        retainDraft(this.context, this.submission, this.openedFor, this.messageOwnerKey);
+      }
       const ownedMessage = this.messageOwnerKey === openKey ? this.submission.message : "";
       const ownedMentions = this.messageOwnerKey === openKey ? this.submission.mentions : undefined;
       this.openedFor = openKey;
@@ -320,6 +372,7 @@ export class NewSessionPage extends OpenClawLightDomElement {
       });
     }
     this.place.restorePreferenceSelections();
+    this.place.synchronizeTerminalHosts();
     activateDraft(this.submission, openKey);
     this.submission.resumeInterruptedSubmission();
   }
@@ -431,9 +484,10 @@ export class NewSessionPage extends OpenClawLightDomElement {
     const identity = this.context?.agentIdentity.get(this.place.agentId);
     const gateway = this.context?.gateway.snapshot;
     return renderWelcomeState({
+      currentAgentId: this.place.agentId,
       assistantName: agent ? normalizeAgentTargetLabel(agent, identity) : "",
-      assistantAvatar: agent?.identity?.avatar ?? agent?.identity?.emoji ?? null,
-      assistantAvatarUrl: agent?.identity?.avatarUrl ?? null,
+      assistantAvatar: resolveAgentTextAvatar(agent ?? {}, identity),
+      assistantAvatarUrl: resolveAgentAvatarUrl(agent ?? {}, identity),
       hint: t(catalog.isTarget(this.data) ? "newSession.nativeTerminalHint" : "newSession.hint"),
       composer: this.renderDraftBlock(),
       hideSecondaryContent: this.submission.visibility === "incognito",
@@ -473,6 +527,7 @@ export class NewSessionPage extends OpenClawLightDomElement {
 
   override render() {
     const pendingMessage = this.submission.pendingMessage;
+    const identity = this.context?.gateway.snapshot.selfUser?.identity;
     const incognito = this.submission.visibility === "incognito";
     return html`
       <div
@@ -491,6 +546,7 @@ export class NewSessionPage extends OpenClawLightDomElement {
         ${renderNewSessionBody({
           error: this.submission.error,
           pendingMessage,
+          userId: identity?.type === "profile" ? identity.id : null,
           submitting: this.submission.submitting,
           renderDraft: () => this.renderWelcome(),
           onOpenImage: this.setImageLightbox,

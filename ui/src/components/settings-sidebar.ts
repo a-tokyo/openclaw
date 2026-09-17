@@ -1,7 +1,7 @@
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
 // Dedicated sidebar for the full-page settings takeover (see app-host.ts).
 import { html, nothing } from "lit";
-import type { UpdateAvailable, UpdateScheduleState } from "../api/types.ts";
+import type { AgentsListResult, UpdateAvailable, UpdateScheduleState } from "../api/types.ts";
 import {
   cancelRoutePreload,
   isSettingsNavigationRouteVisible,
@@ -17,14 +17,19 @@ import {
   type SettingsSearchBlock,
 } from "../app-navigation.ts";
 import { pathForRoute, type RouteId } from "../app-route-paths.ts";
+import type { AgentSelectionCapability } from "../app/agent-selection.ts";
 import type { ApplicationNavigationOptions } from "../app/context.ts";
 import type { ApplicationGatewaySnapshot } from "../app/gateway.ts";
 import type { NativeDeviceSettingsCapability } from "../app/native-device-settings.ts";
+import { beginNativeWindowDragFromTopInset } from "../app/native-window-drag.ts";
 import type { UpdateProgress } from "../app/update-confirmation.ts";
 import type { ApplicationStatusBanner } from "../app/update-overlay-helpers.ts";
 import { t } from "../i18n/index.ts";
+import { listSelectableAgents, normalizeAgentLabel } from "../lib/agents/display.ts";
+import type { AgentIdentityCapability } from "../lib/agents/identity.ts";
 import { redactLoginFailureError } from "../lib/connection-hints.ts";
 import { shouldHandleNavigationClick } from "../lib/navigation-click.ts";
+import { normalizeAgentId } from "../lib/sessions/session-key.ts";
 import { findSettingsSearchBlocks } from "../pages/config/settings-search.ts";
 import { icons } from "./icons.ts";
 import {
@@ -32,16 +37,25 @@ import {
   resolveSidebarConnectionStatus,
 } from "./session-row-badges.ts";
 import type { SettingsSaveIndicatorProps } from "./settings-save-indicator.ts";
+import "./agent-select-registration.ts";
 import "./settings-save-indicator.ts";
+import "../styles/settings.css";
 import "./sidebar-build-chip.ts";
 
+type AgentRosterRow = AgentsListResult["agents"][number];
+
 type SettingsSidebarProps = {
+  presentation?: "sidebar" | "embed-list" | "embed-page";
   basePath: string;
   activeRouteId: RouteId;
+  agents: readonly AgentRosterRow[];
+  agentIdentity: AgentIdentityCapability;
+  settingsAgentSelection: AgentSelectionCapability;
   activePathname?: string;
   activeSearch?: string;
   activeHash?: string;
   offline: boolean;
+  phase?: ApplicationGatewaySnapshot["phase"];
   restartPending?: boolean;
   suspensionPhase?: ApplicationGatewaySnapshot["suspensionPhase"];
   queuedOutboxCount?: number;
@@ -206,8 +220,9 @@ function renderItem(props: SettingsSidebarProps, routeId: RouteId, label?: strin
         >${icons[navigationIconForRoute(routeId)]}</span
       >
       <span class="settings-sidebar__item-label"
-        >${label ?? settingsNavigationLabelForRoute(routeId)}</span
+        >${label ?? settingsNavigationLabelForRoute(routeId, props.nativeDeviceSettings?.snapshot)}</span
       >
+      ${props.presentation === "embed-list" ? html`<span class="settings-row__chevron" aria-hidden="true">${icons.chevronRight}</span>` : nothing}
     </a>
   `;
 }
@@ -251,7 +266,111 @@ function syncSettingsSearchScrollShadow(nav: HTMLElement) {
     ?.classList.toggle("settings-sidebar__search--scrolled", nav.scrollTop > 0);
 }
 
+function buildAgentRosterTree(agents: AgentRosterRow[]) {
+  const agentById = new Map(agents.map((agent) => [agent.id, agent]));
+  const childrenById = new Map<string, AgentRosterRow[]>();
+  const roots: AgentRosterRow[] = [];
+  for (const agent of agents) {
+    const creatorAgentId = agent.creatorAgentId;
+    if (creatorAgentId && creatorAgentId !== agent.id && agentById.has(creatorAgentId)) {
+      const children = childrenById.get(creatorAgentId) ?? [];
+      children.push(agent);
+      childrenById.set(creatorAgentId, children);
+    } else {
+      roots.push(agent);
+    }
+  }
+  const entries: Array<{ agent: AgentRosterRow; creatorAgentId?: string }> = [];
+  const visited = new Set<string>();
+  const append = (agent: AgentRosterRow, depth: number): void => {
+    if (visited.has(agent.id)) {
+      return;
+    }
+    visited.add(agent.id);
+    entries.push({
+      agent,
+      ...(depth > 0 && agent.creatorAgentId ? { creatorAgentId: agent.creatorAgentId } : {}),
+    });
+    for (const child of childrenById.get(agent.id) ?? []) {
+      append(child, depth + 1);
+    }
+  };
+  roots.forEach((agent) => append(agent, 0));
+  // Match the CLI tree: malformed cycles cannot make configured agents disappear.
+  agents.forEach((agent) => append(agent, 0));
+  return entries;
+}
+
+function renderSettingsAgentSelector(props: SettingsSidebarProps) {
+  const agents = listSelectableAgents(props.agents).map((agent) =>
+    Object.assign({}, agent, {
+      id: normalizeAgentId(agent.id),
+      creatorAgentId: agent.creatorAgentId
+        ? normalizeAgentId(agent.creatorAgentId)
+        : agent.creatorAgentId,
+    }),
+  );
+  const options = buildAgentRosterTree(agents).map(({ agent, creatorAgentId }) => ({
+    value: agent.id,
+    label: normalizeAgentLabel(agent),
+    agent,
+    description: creatorAgentId ? t("agents.createdBy", { id: creatorAgentId }) : undefined,
+  }));
+  return html`<div class="settings-sidebar__agent">
+    <openclaw-agent-select
+      .options=${options}
+      .identityById=${Object.fromEntries(
+        props.agentIdentity.entries().map((identity) => [identity.agentId, identity]),
+      )}
+      .value=${props.settingsAgentSelection.state.selectedId ?? ""}
+      .accessibleLabel=${t("agentScope.label")}
+      .menuLabel=${t("agentScope.label")}
+      .disabled=${options.length <= 1}
+      .onSelect=${(agentId: string) => props.settingsAgentSelection.set(agentId)}
+      @wa-show=${() => void props.agentIdentity.ensure(agents.map((agent) => agent.id))}
+    ></openclaw-agent-select>
+  </div>`;
+}
+
+function renderEmbeddedSettingsHeader(props: SettingsSidebarProps) {
+  const connectionStatus = resolveSidebarConnectionStatus(props);
+  return html`<header class="native-embed-header">
+    ${
+      props.presentation === "embed-page"
+        ? html`<button
+            class="native-embed-header__back btn btn--ghost"
+            type="button"
+            aria-label=${t("common.back")}
+            @click=${props.onExit}
+          >
+            <span aria-hidden="true">${icons.chevronLeft}</span>${t("common.back")}
+          </button>`
+        : nothing
+    }
+    <h1 class="page-title">
+      ${props.presentation === "embed-list" ? t("nav.settings") : settingsNavigationLabelForRoute(props.activeRouteId, props.nativeDeviceSettings?.snapshot)}
+    </h1>
+    ${
+      connectionStatus
+        ? renderSidebarConnectionStatus({
+            kind: connectionStatus,
+            queuedOutboxCount: props.queuedOutboxCount ?? 0,
+            title: props.lastError
+              ? redactLoginFailureError(props.lastError)
+              : t("connection.reconnecting"),
+            onRetry: props.onRetryConnect,
+          })
+        : html`<openclaw-settings-save-indicator
+            .props=${props.saveIndicator}
+          ></openclaw-settings-save-indicator>`
+    }
+  </header>`;
+}
+
 export function renderSettingsSidebar(props: SettingsSidebarProps) {
+  if (props.presentation === "embed-page") {
+    return html`${renderEmbeddedSettingsHeader(props)} ${renderSettingsAgentSelector(props)}`;
+  }
   const connectionStatus = resolveSidebarConnectionStatus(props);
   const reconnecting = t("connection.reconnecting");
   const searchBlockMatches =
@@ -263,9 +382,43 @@ export function renderSettingsSidebar(props: SettingsSidebarProps) {
     props.canAdmin !== false,
     props.nativeDeviceSettings ?? null,
   );
+  const navigation = html` <nav
+    class="settings-sidebar__nav"
+    aria-label=${t("common.settingsSections")}
+    @scroll=${(event: Event) => syncSettingsSearchScrollShadow(event.currentTarget as HTMLElement)}
+  >
+    ${
+      navigationGroups.length === 0
+        ? html`<p class="settings-sidebar__empty" role="status">
+            ${t("nav.settingsSearchNoResults")}
+          </p>`
+        : navigationGroups.map(
+            (group) => html`
+              <div class="settings-sidebar__group">
+                ${
+                  group.labelKey
+                    ? html`<div class="settings-sidebar__group-label">${t(group.labelKey)}</div>`
+                    : nothing
+                }
+                ${group.items.map(
+                  (item) => html`
+                    ${renderItem(props, item.routeId)}
+                    ${item.blocks.map((block) => renderBlockItem(props, block))}
+                  `,
+                )}
+              </div>
+            `,
+          )
+    }
+  </nav>`;
+  if (props.presentation === "embed-list") {
+    return html`<section class="settings-embed-list">
+      ${renderEmbeddedSettingsHeader(props)} ${renderSettingsAgentSelector(props)} ${navigation}
+    </section>`;
+  }
   return html`
     <aside class="settings-sidebar">
-      <header class="settings-sidebar__header">
+      <header class="settings-sidebar__header" @mousedown=${beginNativeWindowDragFromTopInset}>
         <button type="button" class="settings-sidebar__back" @click=${() => props.onExit()}>
           <span class="settings-sidebar__back-icon" aria-hidden="true">${icons.arrowLeft}</span>
           ${t("nav.exitSettings")}
@@ -273,6 +426,7 @@ export function renderSettingsSidebar(props: SettingsSidebarProps) {
         </button>
         <h1 class="settings-sidebar__title">${t("nav.settings")}</h1>
       </header>
+      ${renderSettingsAgentSelector(props)}
       <div class="settings-sidebar__search" role="search">
         <span class="settings-sidebar__search-icon" aria-hidden="true">${icons.search}</span>
         <input
@@ -318,38 +472,7 @@ export function renderSettingsSidebar(props: SettingsSidebarProps) {
             : nothing
         }
       </div>
-      <nav
-        class="settings-sidebar__nav"
-        aria-label=${t("common.settingsSections")}
-        @scroll=${(event: Event) =>
-          syncSettingsSearchScrollShadow(event.currentTarget as HTMLElement)}
-      >
-        ${
-          navigationGroups.length === 0
-            ? html`<p class="settings-sidebar__empty" role="status">
-                ${t("nav.settingsSearchNoResults")}
-              </p>`
-            : navigationGroups.map(
-                (group) => html`
-                  <div class="settings-sidebar__group">
-                    ${
-                      group.labelKey
-                        ? html`<div class="settings-sidebar__group-label">
-                            ${t(group.labelKey)}
-                          </div>`
-                        : nothing
-                    }
-                    ${group.items.map(
-                      (item) => html`
-                        ${renderItem(props, item.routeId)}
-                        ${item.blocks.map((block) => renderBlockItem(props, block))}
-                      `,
-                    )}
-                  </div>
-                `,
-              )
-        }
-      </nav>
+      ${navigation}
       <footer class="settings-sidebar__footer">
         ${
           connectionStatus

@@ -9,17 +9,16 @@ import {
   readSessionTranscriptWatermarkBatch,
   type SessionTranscriptMessageEvent,
   type SessionTranscriptReadScope,
+  type SessionTranscriptReadTarget,
   type SessionTranscriptTitleProbe,
 } from "../config/sessions/session-accessor.js";
+import { resolveSessionTranscriptReadTarget } from "../config/sessions/session-accessor.transcript-target.js";
+import { SessionTranscriptColdError } from "../config/sessions/session-cold-storage-state.js";
 import { pruneMapToMaxSize } from "../infra/map-size.js";
 import { hasInterSessionUserProvenance } from "../sessions/input-provenance.js";
 import { projectSessionDisplayMessage } from "./session-display-projection.js";
-import {
-  resolveTranscriptReadTarget,
-  sqliteMessageEventWithSeq,
-  toTranscriptReadScope,
-  type ResolvedTranscriptReadTarget,
-} from "./session-transcript-readers.js";
+import { sqliteMessageEventWithSeq } from "./session-transcript-entry-message.js";
+import { toTranscriptReadScope } from "./session-transcript-read-target.js";
 
 type SessionTitleFields = {
   firstUserMessage: string | null;
@@ -31,7 +30,7 @@ const EMPTY_SESSION_TITLE_FIELDS: SessionTitleFields = {
   lastMessagePreview: null,
 };
 // Degraded nulls advance the sessions.list cache fence so the completed result cannot
-// outlive the projection rebuild that made those title fields temporarily unavailable.
+// outlive the projection rebuild or cold restoration that makes title fields available again.
 let sessionTitleProjectionUnavailableVersion = 0;
 
 export function readSessionTitleProjectionUnavailableVersion(): number {
@@ -53,7 +52,7 @@ type SqliteTitleFieldCacheEntry = ReturnType<typeof readSessionTranscriptWaterma
 // miss by design; the store-batched probe bounds that load while this LRU still serves idle rows.
 const sqliteTitleFieldCache = new Map<string, SqliteTitleFieldCacheEntry>();
 
-function sqliteTitleFieldCacheKey(target: ResolvedTranscriptReadTarget): string {
+function sqliteTitleFieldCacheKey(target: SessionTranscriptReadTarget): string {
   return `${target.agentId ?? ""}\0${target.sessionId}\0${target.storePath ?? ""}`;
 }
 
@@ -117,7 +116,7 @@ function copySessionTitleText(text: string | null): string | null {
 }
 
 function hydrateSqliteTitleFields(
-  target: ResolvedTranscriptReadTarget,
+  target: SessionTranscriptReadTarget,
   opts?: { includeInterSession?: boolean },
   probe?: SessionTranscriptTitleProbe,
 ): SessionTitleFields {
@@ -189,10 +188,14 @@ function hydrateSqliteTitleFields(
     });
     return { ...fields };
   } catch (error) {
-    if (!isSessionTranscriptProjectionUnavailableError(error)) {
+    if (
+      !isSessionTranscriptProjectionUnavailableError(error) &&
+      !(error instanceof SessionTranscriptColdError)
+    ) {
       throw error;
     }
-    // Do not cache degraded nulls: the completed-list fence must advance until reconciliation.
+    // Optional titles must not restore cold payloads. Do not cache nulls under the preserved
+    // watermark: restoration and projection reconciliation can make these fields available again.
     sessionTitleProjectionUnavailableVersion += 1;
     return { ...EMPTY_SESSION_TITLE_FIELDS };
   }
@@ -206,7 +209,7 @@ export function readSessionTitleFieldsFromTranscriptBatch(
   try {
     const variant = opts?.includeInterSession === true ? "includeInterSession" : "default";
     const reads = scopes.map((scope) => {
-      const target = resolveTranscriptReadTarget(scope);
+      const target = resolveSessionTranscriptReadTarget(scope);
       const cacheKey = sqliteTitleFieldCacheKey(target);
       const cached = sqliteTitleFieldCache.get(cacheKey);
       return { target, cacheKey, cached, fields: cached?.fields[variant] };
@@ -248,7 +251,7 @@ export function readSessionTitleFieldsFromTranscriptBatch(
       throw error;
     }
     return scopes.map((scope) =>
-      hydrateSqliteTitleFields(resolveTranscriptReadTarget(scope), opts),
+      hydrateSqliteTitleFields(resolveSessionTranscriptReadTarget(scope), opts),
     );
   }
 }
@@ -260,5 +263,5 @@ export function readSessionTitleFieldsFromTranscript(
   scope: SessionTranscriptReadScope,
   opts?: { includeInterSession?: boolean },
 ): SessionTitleFields {
-  return hydrateSqliteTitleFields(resolveTranscriptReadTarget(scope), opts);
+  return hydrateSqliteTitleFields(resolveSessionTranscriptReadTarget(scope), opts);
 }

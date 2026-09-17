@@ -9,15 +9,17 @@ import {
   patchSessionEntry,
   resolveStorePath,
 } from "openclaw/plugin-sdk/session-store-runtime";
+import {
+  isCodexAppServerNativeAuthProfile,
+  normalizeCodexAppServerBindingModelProvider,
+  type CodexAppServerAuthProfileLookup,
+} from "./app-server/auth-profile.js";
 import { resolveCodexBindingAppServerConnection } from "./app-server/binding-connection.js";
 import type { CodexAppServerClient } from "./app-server/client.js";
 import { isCodexFastServiceTier } from "./app-server/config.js";
 import type { CodexServiceTier } from "./app-server/protocol.js";
 import {
   bindingStoreKey,
-  isCodexAppServerNativeAuthProfile,
-  normalizeCodexAppServerBindingModelProvider,
-  type CodexAppServerAuthProfileLookup,
   type CodexAppServerBindingIdentity,
   type CodexAppServerBindingStore,
   type CodexAppServerThreadBinding,
@@ -91,10 +93,12 @@ export async function stopCodexConversationTurn(params: {
       message: "The active Codex run no longer matches this session binding.",
     };
   }
-  const connection = resolveCodexBindingAppServerConnection({
+  const connection = await resolveCodexBindingAppServerConnection({
     binding,
     authProfileId: binding?.authProfileId,
     pluginConfig: params.pluginConfig,
+    ...lookup,
+    assertCurrent: params.assertCurrent,
   });
   const runtime = connection.appServer;
   // Turn ids are connection-local. Prefer the exact live client; ID-only
@@ -149,10 +153,12 @@ export async function steerCodexConversationTurn(params: {
       message: "The active Codex run no longer matches this session binding.",
     };
   }
-  const connection = resolveCodexBindingAppServerConnection({
+  const connection = await resolveCodexBindingAppServerConnection({
     binding,
     authProfileId: binding?.authProfileId,
     pluginConfig: params.pluginConfig,
+    ...lookup,
+    assertCurrent: params.assertCurrent,
   });
   const runtime = connection.appServer;
   // Turn ids are connection-local. Prefer the exact live client; ID-only

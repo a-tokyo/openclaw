@@ -419,10 +419,11 @@ function findRun(repo: string, sha: string, after?: number, pr?: number) {
 }
 const readRun = (repo: string, runId: number, deadline?: number) =>
   RunStatusSchema.parse(
-    execGhJson(
-      `run view ${runId} --repo ${repo} --json status,conclusion`.split(" "),
-      ghReadOptions(deadline),
-    ),
+    execGhJson(`run view ${runId} --repo ${repo} --json status,conclusion`.split(" "), {
+      ...ghReadOptions(deadline),
+      // Revalidate changing run status instead of reusing a cached snapshot.
+      env: { ...process.env, OCTOPOOL_FRESH: "1" },
+    }),
   );
 
 function readQueuedPlaceholderEvidence(
@@ -763,10 +764,16 @@ export async function pollUntilDeadline<T>({
     await wait(Math.min(interval * 1000, remaining));
   }
 }
-const retry = (phase: string, error: unknown) =>
-  console.log(
-    `RETRY phase=${phase} error=${(error instanceof Error ? error.message : String(error)).replaceAll(/\s+/gu, " ")}`,
-  );
+function retry(phase: string, error: unknown) {
+  const message = (error instanceof Error ? error.message : String(error)).replaceAll(/\s+/gu, " ");
+  // Run-scoped proxy credentials cannot recover while this process keeps polling.
+  if (/\bProxy Authentication Required\b/iu.test(message)) {
+    throw new Error(
+      `PROXY-AUTH-FAILED phase=${phase} status=407 hint="Restart the watcher in an active run with valid proxy authentication; run-scoped credentials expire when their owning run closes."`,
+    );
+  }
+  console.log(`RETRY phase=${phase} error=${message}`);
+}
 
 function precheck(pr: RollupPage, sha: string, midWait = false) {
   const state = (pr.state ?? "MISSING").toUpperCase();
@@ -903,7 +910,7 @@ async function main(argv = process.argv.slice(2)) {
         lastState = pr.statusCheckRollup?.state ?? "NONE";
         lastPending = result.pendingCount;
         console.log(
-          `STATUS state=${lastState} pending=${lastPending} superseded=${result.supersededCount}`,
+          `STATUS rollup=${result.verdict.toLowerCase()} github_rollup=${lastState} pending=${lastPending} superseded=${result.supersededCount}`,
         );
         if (result.verdict === "FAILING") {
           return emit(`FAILING checks=${result.failingNames.join(", ")}`, 15);
@@ -927,7 +934,12 @@ async function main(argv = process.argv.slice(2)) {
   if (watchResult !== undefined) {
     return watchResult;
   }
-  return emit(`TIMEOUT state=${lastState} pending=${lastPending}`, 16);
+  return emit(
+    args.completion === "rollup"
+      ? `TIMEOUT github_rollup=${lastState} pending=${lastPending}`
+      : "TIMEOUT completion=ci-run",
+    16,
+  );
 }
 
 if (isDirectRunUrl(process.argv[1], import.meta.url)) {

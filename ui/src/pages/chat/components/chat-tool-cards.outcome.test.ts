@@ -8,6 +8,37 @@ import { renderToolCard } from "./chat-tool-cards.ts";
 // Outcome presentation for tool cards: neutral collapsed rows, the expanded
 // outcome line, and the compact progress_card receipt.
 describe("tool-card outcomes", () => {
+  it.each([
+    { name: "exec", args: { command: "pnpm check" } },
+    { name: "write", args: { path: "/workspace/operation.json", content: "{}" } },
+    { name: "lookup", args: { query: "release status" } },
+    { name: "progress_card", args: { markdown: "Preparing release" } },
+  ])("shows skipped $name calls without claiming failure or success", ({ name, args }) => {
+    const container = document.createElement("div");
+    const card: ToolCard = {
+      id: "steering-skip",
+      name,
+      args,
+      outputText: "Skipped to process an incoming message.",
+      details: { status: "skipped", deniedReason: "steering" },
+      isError: true,
+      completed: true,
+    };
+    for (const expanded of [false, true]) {
+      render(
+        renderToolCard(card, {
+          messageKey: "test-message",
+          expanded,
+          onToggleExpanded: vi.fn(),
+        }),
+        container,
+      );
+      expect(container.textContent?.toLowerCase()).toContain("skipped");
+      expect(container.textContent).not.toMatch(/failed|Completed|updated|Tool error/);
+      expect(container.querySelector(".chat-tool-card--error")).toBeNull();
+    }
+  });
+
   it.each(["exec", "lookup"])(
     "keeps %s progress neutral across the row, expanded body, and sidebar until completion",
     (name) => {
@@ -35,6 +66,7 @@ describe("tool-card outcomes", () => {
       show();
       expect(container.querySelector(".chat-tool-row--running")).not.toBeNull();
       expect(container.querySelector(".chat-tool-card--error")).toBeNull();
+      expect(container.querySelector(".chat-tool-failure")).toBeNull();
       expect(container.querySelector(".chat-tool-card__outcome")?.textContent).toBe("Running");
       expect(container.textContent).toContain(card.outputText);
       container.querySelector<HTMLButtonElement>(".chat-tool-card__action-btn")?.click();
@@ -132,7 +164,75 @@ describe("tool-card outcomes", () => {
       "Unknown",
     );
     expect(container.querySelector(".chat-tool-msg-body")).toBeNull();
+    expect(summaryButton?.textContent).toContain("failed");
+    expect(container.textContent).not.toContain("Tool not found");
   });
+
+  it.each([
+    {
+      name: "structured",
+      output: JSON.stringify({ error: "Cannot connect to the service" }),
+      diagnostic: "Cannot connect to the service",
+      exitCode: 1,
+      outcome: "Exit code 1",
+    },
+    {
+      name: "multiline",
+      output: "gh: command not found\nVerbose process diagnostics",
+      diagnostic: "gh: command not found",
+      exitCode: undefined,
+      outcome: "failed",
+    },
+    {
+      name: "long path",
+      output:
+        "Error: Could not find edits[1] in /workspace/dashboard-state-persistence-and-defaults/ui/src/e2e/dashboard-presentation-defaults.e2e.test.ts",
+      diagnostic: "Could not find edits[1]",
+      exitCode: undefined,
+      outcome: "failed",
+    },
+  ])(
+    "keeps $name diagnostics inside expanded tool details",
+    ({ output, diagnostic, exitCode, outcome }) => {
+      const container = document.createElement("div");
+      let expanded = false;
+      const show = () =>
+        render(
+          renderToolCard(
+            {
+              id: "login-failure",
+              name: "exec",
+              isError: true,
+              completed: true,
+              args: { title: "Sign in to GitHub", command: "gh auth login" },
+              outputText: output,
+              exitCode,
+            },
+            {
+              messageKey: "login",
+              expanded,
+              onToggleExpanded: () => {
+                expanded = !expanded;
+                show();
+              },
+            },
+          ),
+          container,
+        );
+      show();
+      expect(container.textContent).toContain("Sign in to GitHub");
+      expect(container.textContent).not.toContain(diagnostic);
+      expect(container.querySelector(".chat-tool-msg-summary")?.textContent).toContain(outcome);
+      expect(container.textContent).not.toContain(output);
+      expect(container.textContent).not.toContain("gh auth login");
+      expect(container.querySelector(".chat-tool-msg-body")).toBeNull();
+      container.querySelector<HTMLButtonElement>(".chat-tool-msg-summary")?.click();
+      expect(container.querySelector(".chat-tool-msg-body")?.textContent).toContain(output);
+      expect(container.querySelector(".chat-tool-card__outcome")?.textContent).toBe(outcome);
+      container.querySelector<HTMLButtonElement>(".chat-tool-msg-summary")?.click();
+      expect(container.textContent).not.toContain(diagnostic);
+    },
+  );
 
   it("renders a neutral summary when the tool card has an explicit error flag", () => {
     const container = document.createElement("div");

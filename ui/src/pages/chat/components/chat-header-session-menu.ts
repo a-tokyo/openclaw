@@ -33,6 +33,7 @@ export type HeaderMenuQuickAction = {
   icon: TemplateResult;
   active?: boolean;
   badge?: number;
+  disabled?: boolean;
   onActivate: () => void;
 };
 
@@ -146,7 +147,7 @@ class ChatHeaderSessionMenu extends OpenClawLightDomElement {
       const [, group, id] = value.split(":");
       const actions = group === "panels" ? this.panelActions : this.layoutActions;
       const action = actions.find((candidate) => candidate.id === id);
-      if (action) {
+      if (action && !action.disabled) {
         action.onActivate();
       }
       return;
@@ -168,7 +169,11 @@ class ChatHeaderSessionMenu extends OpenClawLightDomElement {
       }
       return;
     }
-    if (value.startsWith("visibility:") || value.startsWith("member:")) {
+    if (
+      value.startsWith("visibility:") ||
+      value.startsWith("member:") ||
+      value.startsWith("public:")
+    ) {
       if (this.sharing) {
         selectChatSessionSharingItem(this.sharing, value);
       }
@@ -201,6 +206,7 @@ class ChatHeaderSessionMenu extends OpenClawLightDomElement {
           value=${`quick:${group}:${action.id}`}
           type=${action.active === undefined ? nothing : "checkbox"}
           .checked=${action.active ?? false}
+          ?disabled=${action.disabled}
         >
           <span slot="icon" class="session-menu__icon" aria-hidden="true">${action.icon}</span>
           <span class="session-menu__text">${action.label}</span>

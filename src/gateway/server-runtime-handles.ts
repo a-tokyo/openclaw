@@ -2,7 +2,10 @@
 // Provides stop-safe defaults for timers, sidecars, subscriptions, and services.
 import type { HeartbeatRunner } from "../infra/heartbeat-runner.js";
 import type { ChannelHealthMonitor } from "./channel-health-monitor.js";
-import type { GatewayHotReloadStatus } from "./config-reload-status.types.js";
+import type {
+  GatewayDeferredChannelReload,
+  GatewayHotReloadStatus,
+} from "./config-reload-status.types.js";
 import type { GatewayDiscovery } from "./server-discovery-runtime.js";
 import {
   MEDIA_CLEANUP_STOP_TIMEOUT_MS,
@@ -11,7 +14,10 @@ import {
 } from "./server-media-cleanup-lifecycle.js";
 import { createNoopHeartbeatRunner } from "./server-runtime-service-shared.js";
 import type { GatewayMaintenanceHandles } from "./server-runtime-services.js";
-import type { GatewayPostReadySidecarHandle } from "./server-startup-post-attach.js";
+import {
+  createGatewaySidecarStopOwner,
+  type GatewaySidecarStopOwner,
+} from "./server-sidecar-owners.js";
 
 // Mutable server handles track timers, sidecars, subscriptions, and service
 // cleanup hooks that shutdown/reload code must stop exactly once.
@@ -20,8 +26,9 @@ import type { GatewayPostReadySidecarHandle } from "./server-startup-post-attach
 // active" instead of guessing.
 export type GatewayConfigReloaderHandle = {
   stop: () => Promise<void>;
-  hotReloadStatus?: () => GatewayHotReloadStatus;
-  notifyPluginMetadataChanged: () => void;
+  hotReloadStatus?: () => GatewayHotReloadStatus | undefined;
+  getDeferredChannelReloads?: () => readonly GatewayDeferredChannelReload[];
+  applyPluginLifecycleChange: import("../plugins/lifecycle.js").PluginLifecycleRuntimeApply;
   isConfigReloadSettled: () => boolean;
 };
 
@@ -34,8 +41,8 @@ export type GatewayServerMutableState = {
   stopDeliveryRecovery: () => Promise<void>;
   stopGatewayUpdateCheck: () => Promise<void>;
   tailscaleCleanup: (() => Promise<void>) | null;
-  postReadySidecars: GatewayPostReadySidecarHandle[];
-  gatewayLifetimeSidecars: GatewayPostReadySidecarHandle[];
+  readonly postReadySidecars: GatewaySidecarStopOwner;
+  readonly gatewayLifetimeSidecars: GatewaySidecarStopOwner;
   skillsRefreshTimer: ReturnType<typeof setTimeout> | null;
   skillsRefreshDelayMs: number;
   skillsChangeUnsub: () => Promise<void>;
@@ -58,15 +65,17 @@ export function createGatewayServerMutableState(): GatewayServerMutableState {
     stopDeliveryRecovery: async () => {},
     stopGatewayUpdateCheck: async () => {},
     tailscaleCleanup: null as (() => Promise<void>) | null,
-    postReadySidecars: [],
-    gatewayLifetimeSidecars: [],
+    postReadySidecars: createGatewaySidecarStopOwner(),
+    gatewayLifetimeSidecars: createGatewaySidecarStopOwner(),
     skillsRefreshTimer: null as ReturnType<typeof setTimeout> | null,
     skillsRefreshDelayMs: 30_000,
     skillsChangeUnsub: async () => {},
     channelHealthMonitor: null as ChannelHealthMonitor | null,
     configReloader: {
       stop: async () => {},
-      notifyPluginMetadataChanged: () => {},
+      applyPluginLifecycleChange: async () => {
+        throw new Error("Plugin lifecycle is unavailable before Gateway startup completes.");
+      },
       isConfigReloadSettled: () => false,
     } satisfies GatewayConfigReloaderHandle,
     agentUnsub: null as (() => Promise<void> | void) | null,

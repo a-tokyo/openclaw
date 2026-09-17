@@ -8,6 +8,7 @@ import { NodeRegistry } from "../node-registry.js";
 import type { GatewayWsClient } from "../server/ws-types.js";
 import { createNodeDesktopService } from "./node-source.js";
 import { createNodeDesktopStreamBroker } from "./node-stream-broker.js";
+import * as observeBridge from "./observe-bridge.js";
 import { createDesktopSessionRegistry } from "./session-registry.js";
 
 const cleanups: Array<() => Promise<void>> = [];
@@ -122,6 +123,92 @@ function createFixture(boundary: "activation" | "pairing" | "attachment") {
 }
 
 describe("node desktop runtime policy", () => {
+  it.each(["activation", "pairing"] as const)(
+    "does not dispatch after the requesting connection closes during %s",
+    async (boundary) => {
+      const fixture = createFixture(boundary);
+      const controller = new AbortController();
+      const observed = fixture.service
+        .observe({
+          nodeId: "node",
+          control: false,
+          requester: {
+            signal: controller.signal,
+            isCurrent: () => !controller.signal.aborted,
+          },
+        })
+        .then(
+          () => true,
+          () => false,
+        );
+      await fixture.reached;
+      controller.abort();
+      fixture.release();
+      expect(await observed).toBe(false);
+      expect(fixture.forwarded).toEqual([]);
+    },
+  );
+
+  it("settles a canceled observer while its node pairing lookup is still pending", async () => {
+    const fixture = createFixture("pairing");
+    const controller = new AbortController();
+    let settled = false;
+    const observed = fixture.service
+      .observe({
+        nodeId: "node",
+        control: false,
+        requester: {
+          signal: controller.signal,
+          isCurrent: () => !controller.signal.aborted,
+        },
+      })
+      .then(
+        () => {
+          settled = true;
+          return true;
+        },
+        () => {
+          settled = true;
+          return false;
+        },
+      );
+    await fixture.reached;
+    controller.abort();
+    await expect.poll(() => settled).toBe(true);
+    expect(await observed).toBe(false);
+    expect(fixture.forwarded).toEqual([]);
+    fixture.release();
+    await Promise.resolve();
+    expect(fixture.forwarded).toEqual([]);
+  });
+
+  it("keeps requester authority on the observer ticket after node attachment", async () => {
+    const fixture = createFixture("attachment");
+    const mint = vi.spyOn(observeBridge, "mintDesktopObserverToken");
+    const controller = new AbortController();
+    const client = { invalidated: false };
+    const requester = {
+      signal: controller.signal,
+      isCurrent: () => !client.invalidated,
+    };
+    const observed = fixture.service.observe({
+      nodeId: "node",
+      control: false,
+      credentials: { password: "synthetic-password" },
+      requester,
+    });
+    await fixture.reached;
+    fixture.attached.resolve({ stream: new PassThrough(), auth: "vnc-password" });
+
+    await expect(observed).resolves.toMatchObject({ transport: "rfb", control: false });
+    const mintedRequester = mint.mock.calls[0]?.[0].requester;
+    expect(mintedRequester).toBe(requester);
+    expect(mintedRequester?.isCurrent()).toBe(true);
+    client.invalidated = true;
+    expect(mintedRequester?.isCurrent()).toBe(false);
+    expect(controller.signal.aborted).toBe(false);
+  });
+
   it.each(["activation", "pairing"] as const)(
     "does not dispatch after policy changes during %s",
     async (boundary) => {

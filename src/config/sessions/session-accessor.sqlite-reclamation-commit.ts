@@ -1,9 +1,11 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import type { DatabaseSync } from "node:sqlite";
 import { openNodeSqliteDatabase } from "../../infra/node-sqlite.js";
 import { setSqliteBusyTimeout } from "../../infra/sqlite-busy-timeout.js";
+import { isSqliteLockError } from "../../infra/sqlite-error-diagnostics.js";
 import {
-  isSqliteLockError,
   runSqliteImmediateTransactionSync,
+  withSqliteWriteAdmissionService,
 } from "../../infra/sqlite-transaction.js";
 
 const COMMIT_DECISION_TIMEOUT_MS = 5_000;
@@ -12,11 +14,67 @@ const APPROVED = 1;
 const REJECTED = 2;
 const COMMITTING = 3;
 const SETTLED = 4;
+const REQUESTED = 5;
+
+/** Preserve the reclamation owner's context when an unrelated synchronous writer helps. */
+export async function withSqliteReclamationAuthorization<T>(
+  buffer: SharedArrayBuffer,
+  database: DatabaseSync,
+  assertCurrent: () => void,
+  run: (authorize: () => unknown[]) => Promise<T>,
+): Promise<T> {
+  const databasePath = database.location();
+  if (databasePath === null) {
+    throw new Error("SQLite reclamation authorization requires a file-backed database");
+  }
+  const shared = new Int32Array(buffer);
+  const inOwnerContext = AsyncLocalStorage.snapshot();
+  let consumed = false;
+  let failure: { error: unknown } | undefined;
+  let recovered: unknown[] = [];
+  const authorize = () => {
+    if (failure) {
+      throw failure.error;
+    }
+    if (consumed) {
+      return recovered;
+    }
+    consumed = true;
+    try {
+      recovered = inOwnerContext(
+        authorizeSqliteReclamationCommit,
+        buffer,
+        databasePath,
+        assertCurrent,
+      );
+      return recovered;
+    } catch (error) {
+      failure = { error };
+      throw error;
+    }
+  };
+  const service = () => {
+    if (Atomics.load(shared, 0) === REQUESTED) {
+      try {
+        authorize();
+      } catch {
+        // Rejection belongs to reclamation; its queued request propagates the error.
+      }
+    }
+  };
+  return await withSqliteWriteAdmissionService(database, service, () => run(authorize));
+}
 
 function rejectCommit(shared: Int32Array): void {
   Atomics.compareExchange(shared, 0, WAITING, REJECTED);
+  Atomics.compareExchange(shared, 0, REQUESTED, REJECTED);
   Atomics.compareExchange(shared, 0, APPROVED, REJECTED);
   Atomics.notify(shared, 0);
+}
+
+/** Revoke a pending request before a synchronous native close can wait on its writer lock. */
+export function revokeSqliteReclamationCommit(buffer: SharedArrayBuffer): void {
+  rejectCommit(new Int32Array(buffer));
 }
 
 /** Called by the Worker while its deletion transaction still owns the writer lock. */
@@ -25,8 +83,11 @@ export function waitForSqliteReclamationCommit(
   request: () => void,
 ): void {
   const shared = new Int32Array(buffer);
+  if (Atomics.compareExchange(shared, 0, WAITING, REQUESTED) !== WAITING) {
+    throw new Error("SQLite session reclamation commit was revoked");
+  }
   request();
-  Atomics.wait(shared, 0, WAITING, COMMIT_DECISION_TIMEOUT_MS);
+  Atomics.wait(shared, 0, REQUESTED, COMMIT_DECISION_TIMEOUT_MS);
   if (Atomics.compareExchange(shared, 0, APPROVED, COMMITTING) !== APPROVED) {
     rejectCommit(shared);
     throw new Error("SQLite session reclamation commit was not authorized");
@@ -43,7 +104,7 @@ export function markSqliteReclamationSettled(buffer: SharedArrayBuffer | undefin
 }
 
 /** Keep the live parent authority current until the Worker's transaction has settled. */
-export function authorizeSqliteReclamationCommit(
+function authorizeSqliteReclamationCommit(
   buffer: SharedArrayBuffer,
   databasePath: string,
   assertCurrent: () => void,
@@ -58,7 +119,7 @@ export function authorizeSqliteReclamationCommit(
     database = openNodeSqliteDatabase(databasePath);
     setSqliteBusyTimeout(database, COMMIT_DECISION_TIMEOUT_MS);
     assertCurrent();
-    if (Atomics.compareExchange(shared, 0, WAITING, APPROVED) !== WAITING) {
+    if (Atomics.compareExchange(shared, 0, REQUESTED, APPROVED) !== REQUESTED) {
       throw new Error("SQLite session reclamation commit checkpoint expired");
     }
     Atomics.notify(shared, 0);
@@ -71,9 +132,13 @@ export function authorizeSqliteReclamationCommit(
       try {
         // The Worker already owns BEGIN IMMEDIATE. Acquiring this lock proves
         // COMMIT, ROLLBACK, or connection close finished, even after abrupt exit.
-        runSqliteImmediateTransactionSync(database, () => {
-          settled = true;
-        });
+        runSqliteImmediateTransactionSync(
+          database,
+          () => {
+            settled = true;
+          },
+          { operationLabel: "session.reclamation.commit-settlement" },
+        );
       } catch (error) {
         if (recoveredErrors.length === 0) {
           recoveredErrors.push(error);

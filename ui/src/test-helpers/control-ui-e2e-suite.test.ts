@@ -14,6 +14,8 @@ const repoRoot = path.resolve(import.meta.dirname, "../../..");
 const helperPath = path.join(repoRoot, "ui/src/e2e/control-ui-e2e-suite.test-support.ts");
 
 type FixtureMode =
+  | "tracked-close-success"
+  | "tracked-close-failure"
   | "concurrent-close"
   | "close-failure"
   | "late-context"
@@ -45,6 +47,7 @@ function fixtureSource(mode: FixtureMode, root: string): string {
       ? `import { createOpenClawTestState } from ${JSON.stringify(path.join(repoRoot, "src/test-utils/openclaw-test-state.ts"))};`
       : "";
   return `
+import { EventEmitter } from "node:events";
 import fs from "node:fs";
 import { setImmediate as nextTurn } from "node:timers/promises";
 import { afterAll, expect, it, vi } from "vitest";
@@ -65,19 +68,20 @@ vi.mock("playwright", () => ({ chromium: { launch: async () => {
       if (${JSON.stringify(mode)} === "late-context") await new Promise(resolve => setTimeout(resolve, 40));
       state.arrived = true;
       const rejectClosedPage = async () => { throw new Error("synthetic page closed"); };
-      const closedPage = {
+      const closedPage = Object.assign(new EventEmitter(), {
         evaluate: rejectClosedPage,
         screenshot: rejectClosedPage,
         isClosed: () => true,
         url: () => "about:blank",
-      };
+      });
       return {
         setDefaultTimeout() {},
         pages: () => [],
         newPage: async () => closedPage,
         close: () => {
           state.closeCalls++;
-          if (${JSON.stringify(mode)} === "close-failure") return Promise.reject(state.closeFault);
+          record();
+          if (["close-failure", "tracked-close-failure"].includes(${JSON.stringify(mode)})) return Promise.reject(state.closeFault);
           return ${JSON.stringify(mode)} === "concurrent-close" && state.closeCalls === 1
             ? state.gate : Promise.resolve();
         }
@@ -97,6 +101,7 @@ fs.writeFileSync(${JSON.stringify(path.join(root, "worker.pid"))}, String(proces
 record();
 let sharedFixture;
 const suite = createControlUiE2eSuite({ name: "owned context fixture",
+  trackBrowserContexts: ${mode.startsWith("tracked-")},
   ...(${JSON.stringify(mode)}.startsWith("resources-") ? {
     resources: {
       retainedState: () => sharedFixture?.root,
@@ -136,6 +141,14 @@ suite.define(() => {
         expect(process.env.OPENCLAW_STATE_DIR).toBe(sharedFixture.stateDir);
         state.events.push(name); record();
       } });
+    });
+  } else if (${JSON.stringify(mode)}.startsWith("tracked-")) {
+    it("first ordinary case acquires a context", async () => {
+      await suite.newBrowserContext({});
+    });
+    it("next ordinary case starts only after context cleanup", async () => {
+      fs.writeFileSync(${JSON.stringify(path.join(root, "successor.txt"))}, "started");
+      await suite.newBrowserContext({});
     });
   } else if (${JSON.stringify(mode)} === "concurrent-close") {
     it("joins the first context close", async () => {
@@ -446,6 +459,26 @@ it.for(["resources-success", "resources-close-failure", "resources-late-setup"] 
       }
       if (mode === "resources-close-failure") {
         expect(result.output).toContain("synthetic shared resource close failure");
+      }
+    }),
+);
+
+it.for(["tracked-close-success", "tracked-close-failure"] as const)(
+  "fences ordinary cases after failed per-test cleanup: %s",
+  (mode, context) =>
+    runJoinedShutdownTest(context, async () => {
+      const result = await runFixture(mode, context.signal);
+      const success = mode === "tracked-close-success";
+      expect(result.code, result.output).toBe(success ? 0 : 1);
+      expect(result.successorStarted, result.output).toBe(success);
+      expect(result.journal).toMatchObject({
+        closeCalls: success ? 2 : 1,
+        browserClosed: success,
+        serverClosed: success,
+      });
+      if (!success) {
+        expect(result.output).toContain("synthetic context close failure");
+        expect(result.output).toContain("retiring owned fork");
       }
     }),
 );

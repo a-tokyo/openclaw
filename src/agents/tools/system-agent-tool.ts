@@ -23,6 +23,7 @@ import {
   type SystemAgentProposalRef,
 } from "../../system-agent/operator-approval.js";
 import { validateSystemAgentPluginInstallSpec } from "../../system-agent/plugin-install-spec.js";
+import { listAgentRoles } from "../agent-roles.js";
 import { stringEnum } from "../schema/typebox.js";
 import { textResult, ToolInputError, readToolStringParam, type AnyAgentTool } from "./common.js";
 
@@ -130,8 +131,11 @@ export function resolveSystemAgentProposalTransition(params: {
       operation,
     };
   }
-  // Executed or errored mutation: an armed approval is single-use either way.
-  return { proposal: undefined };
+  // Only admission consumes approval. A prevalidation error leaves the
+  // in-process proposal untouched and must do the same in CLI mirrors.
+  return params.resultText.startsWith(SYSTEM_AGENT_APPROVED_OPERATION_PREFIX)
+    ? { proposal: undefined }
+    : null;
 }
 
 const SYSTEM_AGENT_TOOL_ACTIONS = [
@@ -146,6 +150,7 @@ const SYSTEM_AGENT_TOOL_ACTIONS = [
   "config_get",
   "config_schema",
   "gateway_status",
+  "plugin_list",
   "plugin_search",
   // Host directives handled by the hosting chat after this turn.
   "connect_channel",
@@ -163,6 +168,7 @@ const SYSTEM_AGENT_TOOL_ACTIONS = [
   "config_set",
   "config_set_ref",
   "create_agent",
+  "create_team",
   "gateway_start",
   "gateway_stop",
   "gateway_restart",
@@ -176,7 +182,7 @@ const SystemAgentToolSchema = Type.Object({
   path: Type.Optional(
     Type.String({
       description:
-        "Config path for config_* actions; absolute packed archive path for plugin_activate_artifact",
+        "Dotted config key for config_* actions, e.g. gateway.port or agents.defaults.model; use . for the root schema. For plugin_activate_artifact only, an absolute archive file path.",
     }),
   ),
   sha256: Type.Optional(
@@ -191,6 +197,16 @@ const SystemAgentToolSchema = Type.Object({
   workspace: Type.Optional(Type.String({ description: "Workspace directory" })),
   agentId: Type.Optional(
     Type.String({ description: "Agent id for create_agent/open_agent/set_default_model" }),
+  ),
+  role: Type.Optional(
+    stringEnum(listAgentRoles(), {
+      description: "Bundled role for create_agent; coordinator is the chief of staff",
+    }),
+  ),
+  coordinatorId: Type.Optional(Type.String({ description: "Chief of staff id for create_team" })),
+  prefix: Type.Optional(Type.String({ description: "Prefix for every create_team member id" })),
+  workspaceRoot: Type.Optional(
+    Type.String({ description: "Parent directory for separate create_team workspaces" }),
   ),
   channel: Type.Optional(
     Type.String({
@@ -277,6 +293,8 @@ function operationForAction(params: Record<string, unknown>): SystemAgentOperati
     }
     case "gateway_status":
       return { kind: "gateway-status" };
+    case "plugin_list":
+      return { kind: "plugin-list" };
     case "connect_channel":
       return { kind: "channel-setup", channel: requireParam(params, "channel").toLowerCase() };
     case "configure_skills":
@@ -362,13 +380,29 @@ function operationForAction(params: Record<string, unknown>): SystemAgentOperati
       };
     }
     case "create_agent": {
+      const role = listAgentRoles().find((candidate) => candidate === params.role);
+      if (params.role !== undefined && !role) {
+        throw new ToolInputError(`openclaw: unknown role; choose ${listAgentRoles().join(", ")}`);
+      }
       const workspace = readToolStringParam(params, "workspace")?.trim();
       const model = readToolStringParam(params, "model")?.trim();
       return {
         kind: "create-agent",
         agentId: requireParam(params, "agentId"),
+        ...(role ? { role } : {}),
         ...(workspace ? { workspace } : {}),
         ...(model ? { model } : {}),
+      };
+    }
+    case "create_team": {
+      const coordinatorId = readToolStringParam(params, "coordinatorId")?.trim();
+      const prefix = readToolStringParam(params, "prefix")?.trim();
+      const workspaceRoot = readToolStringParam(params, "workspaceRoot")?.trim();
+      return {
+        kind: "create-team",
+        ...(coordinatorId ? { coordinatorId } : {}),
+        ...(prefix ? { prefix } : {}),
+        ...(workspaceRoot ? { workspaceRoot } : {}),
       };
     }
     case "config_set":
@@ -398,13 +432,13 @@ export function createSystemAgentTool(options: SystemAgentToolOptions): AnyAgent
     catalogMode: "direct-only",
     description: [
       "System agent. Setup, config, channels, plugins, agents, repair.",
-      "Read now: status, models, agents, channels, channel_info, config_get, config_schema, gateway_status, plugin_search, validate_config, doctor, audit.",
-      "Handoff: connect_channel, configure_skills, configure_search, configure_gateway, import_memory; open_setup target=channels|search|gateway; open_agent.",
+      "Read now: status, models, agents, channels, channel_info, config_get, config_schema, gateway_status, plugin_list, plugin_search, validate_config, doctor, audit.",
+      "Handoff: connect_channel, configure_skills, configure_search, configure_gateway, import_memory; open_setup target=channels|search|gateway; open_agent. connect_channel/open_setup collect credentials (channel tokens, API keys, passwords) through masked flows; never request them in chat.",
       "Personal model accounts: manage_model_accounts opens the human-owned account controls; no change is made by the handoff. Shared provider/auth setup: exit; run `openclaw onboard`. Never request credentials.",
-      "Write: setup, set_default_model (agentId optional; live-tested), config_set, config_set_ref, create_agent, gateway_*, plugin_install, plugin_activate_artifact, plugin_uninstall. Submit the exact proposal first. Direct chat: exact user approval, then approved=true. Delegated requests: host applies session permission policy and returns the final outcome. Host applies after turn; rechecks inference owner.",
+      "Write: setup, set_default_model (agentId optional; live-tested), config_set, config_set_ref, create_agent (optional role), create_team, gateway_*, plugin_install, plugin_activate_artifact, plugin_uninstall. Submit the exact proposal first. Direct chat: exact user approval, then approved=true. Delegated requests: host applies session permission policy and returns the final outcome. Host applies after turn; rechecks inference owner.",
       "plugin_install: ClawHub/bundled/official only. Arbitrary source: exit, trusted shell.",
       "plugin_activate_artifact: for a task-authored plugin built with openclaw plugins pack, pass its absolute archive path and sha256. Copies and reviews exact bytes before proposing; approval includes trusted backend code, declared capabilities, and native UI. No dependency fetching. Backend activation requires Gateway restart. Native UI separately requires enabling Settings > Labs > Custom plugin UI, then Gateway restart and browser reload; artifact approval does not enable Labs.",
-      "Unknown config: config_schema first. Secrets: config_set_ref env. No plaintext. No raw auth/models/env/secrets/$include, plugin install/load policy, default-route model/runtime/params, or agent identity/topology; use set_default_model / onboard.",
+      "Unknown config: config_schema first. Config writes are proposed, approved, then checked by the canonical config validator and writer. Validation or write errors return to you; propose one correction for fresh approval. Config writes do not test whether a model route or API key works. For secrets, follow the user's storage preference; use config_set_ref for env storage. Never echo secret values. set_default_model is the shortcut for switching the primary model.",
       "No doctor repair. Writes validated, audited. Invalid config: fix now.",
     ].join(" "),
     parameters: SystemAgentToolSchema,
@@ -454,6 +488,7 @@ export function createSystemAgentTool(options: SystemAgentToolOptions): AnyAgent
       }
       const persistent = isPersistentSystemAgentOperation(operation);
       if (persistent) {
+        signal?.throwIfAborted();
         const operationHash = hashSystemAgentOperation(operation);
         const armedForThisOperation =
           params.approved === true &&

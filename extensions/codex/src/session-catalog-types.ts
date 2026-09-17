@@ -10,8 +10,11 @@ import type {
   CodexThreadItemsListParams,
   CodexThreadItemsListResponse,
 } from "./app-server/protocol.js";
+import type { CodexCatalogPageDiagnostics } from "./session-catalog-diagnostics.js";
 
 export type CodexCatalogHome = {
+  /** Revalidate discovery before a new operation captures its source. */
+  assertCurrent(): void;
   sourceHomeId: string;
   hostId: string;
   label: string;
@@ -48,6 +51,8 @@ export type CodexSessionCatalogSession = {
 
 export type CodexSessionCatalogPage = {
   sessions: CodexSessionCatalogSession[];
+  /** Internal logical scan count; one page when omitted. */
+  scannedPages?: number;
   /** Internal provenance filtered before this page reaches the provider catalog. */
   managedThreads?: Array<{ threadId: string; rolloutPath?: string }>;
   nextCursor?: string;
@@ -75,7 +80,16 @@ export type CodexSessionCatalogControl = {
   clientId?: string;
   connectionFingerprint?: string;
   withPinnedConnection<T>(run: (control: CodexSessionCatalogControl) => Promise<T>): Promise<T>;
-  listPage(params: CodexSessionCatalogPageParams): Promise<CodexSessionCatalogPage>;
+  listPage(
+    params: CodexSessionCatalogPageParams,
+    diagnostics?: CodexCatalogPageDiagnostics | null,
+    options?: {
+      /** The caller is filling a page begun at the head, rather than an older discovery cursor. */
+      headWalk?: boolean;
+      /** Remaining logical pages in the caller's combined search and exclusion scan. */
+      maxScanPages?: number;
+    },
+  ): Promise<CodexSessionCatalogPage>;
   requireEligibleThread(threadId: string): Promise<CodexThread>;
   listDescendantPage(params: CodexThreadListParams): Promise<CodexThreadListResponse>;
   listTurnPage(params: CodexThreadTurnsListParams): Promise<CodexThreadTurnsListResponse>;
@@ -90,11 +104,17 @@ export type CodexSessionCatalogControl = {
 
 export type CodexSessionCatalogControlFactory = {
   forRequest(agentId: string, source?: CodexCatalogHome): CodexSessionCatalogControl;
-  homesForAgent(agentId: string): readonly CodexCatalogHome[];
+  /** Native default, with the shipped agent selector retained for explicitly configured sources. */
+  forNode(agentId?: string): Promise<{
+    control: CodexSessionCatalogControl;
+    sourceHomeId: string;
+    codexHome: string;
+  }>;
+  homesForAgent(agentId: string): Promise<readonly CodexCatalogHome[]>;
   forUpstream(
     agentId: string,
     connectionFingerprint: string,
-  ): CodexSessionCatalogControl | undefined;
+  ): Promise<CodexSessionCatalogControl | undefined>;
 };
 
 export type CodexSessionCatalogError = {

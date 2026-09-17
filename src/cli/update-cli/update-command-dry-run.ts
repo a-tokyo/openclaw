@@ -1,5 +1,6 @@
 import { theme } from "../../../packages/terminal-core/src/theme.js";
 import type { UpdateChannel } from "../../infra/update-channels.js";
+import type { UpdateFailureFact } from "../../infra/update-failure-facts.js";
 import { canResolveRegistryVersionForPackageTarget } from "../../infra/update-global.js";
 import { getUpdateRun } from "../../infra/update-run-ledger.js";
 import type { UpdateRunRecord } from "../../infra/update-run-record.js";
@@ -8,8 +9,33 @@ import { defaultRuntime } from "../../runtime.js";
 import type { OpenClawDatabaseSchemaPreflight } from "../../state/openclaw-database-preflight.js";
 import { printResult } from "./progress.js";
 import { formatSchemaRefusalLines, hasSchemaRefusal } from "./schema-preflight.js";
-import type { UpdateCommandOptions } from "./shared.js";
+import { UpdatePreMutationError, type UpdateCommandOptions } from "./shared.js";
 import type { ManagedServiceRootRedirect } from "./update-command-service-plan.js";
+
+export async function handleDryRunPreflightError(
+  error: unknown,
+  notes: string[],
+  refuseUpdate: (
+    reason: string,
+    message: string,
+    failureFacts?: readonly UpdateFailureFact[],
+  ) => Promise<void>,
+): Promise<OpenClawDatabaseSchemaPreflight> {
+  if (!(error instanceof UpdatePreMutationError)) {
+    throw error;
+  }
+  if (
+    error.reason === "database-schema-preflight" ||
+    error.reason === "target-metadata-preflight" ||
+    error.reason === "invalid-config"
+  ) {
+    // A best-effort preview reports incomplete admission; it never authorizes mutation.
+    notes.push(error.message.replace(/^Update refused:/u, "Would refuse update:"));
+    return { incompatible: [], indeterminate: [] };
+  }
+  await refuseUpdate(error.reason, error.message, error.failureFacts);
+  return { incompatible: [], indeterminate: [] };
+}
 
 type UpdateDryRunPreview = {
   runId: string;
@@ -28,6 +54,7 @@ type UpdateDryRunPreview = {
   tag: string;
   currentVersion: string | null;
   targetVersion: string | null;
+  targetVersionReason?: string;
   downgradeRisk: boolean;
   actions: string[];
   notes: string[];
@@ -52,6 +79,8 @@ function printDryRunPreview(preview: UpdateDryRunPreview, jsonMode: boolean): vo
   }
   if (preview.targetVersion) {
     defaultRuntime.log(`  Target version: ${theme.muted(preview.targetVersion)}`);
+  } else if (preview.targetVersionReason) {
+    defaultRuntime.log(`  Target version: unresolved (${preview.targetVersionReason})`);
   }
   if (preview.downgradeRisk) {
     defaultRuntime.log(theme.warn("  Downgrade confirmation would be required in a real run."));
@@ -94,6 +123,7 @@ export function printUpdateDryRun(params: {
   managedServiceRootRedirect: ManagedServiceRootRedirect | null;
   explicitTag: string | null;
   packageSchemaPreflight: OpenClawDatabaseSchemaPreflight;
+  preflightNotes?: readonly string[];
   opts: Pick<UpdateCommandOptions, "tag" | "json" | "run">;
 }): void {
   const actions: string[] = [];
@@ -123,7 +153,7 @@ export function printUpdateDryRun(params: {
       : "Skip restart (because --no-restart is set)",
   );
 
-  const notes: string[] = [];
+  const notes: string[] = [...(params.preflightNotes ?? [])];
   if (params.opts.tag && params.updateInstallKind === "git") {
     notes.push("--tag applies to npm installs only; git updates ignore it.");
   }
@@ -142,17 +172,23 @@ export function printUpdateDryRun(params: {
     notes.push(...formatSchemaRefusalLines(params.packageSchemaPreflight, true));
   }
   if (params.updateInstallKind === "git") {
-    // The git target revision is resolved inside the real update run, so its
-    // schema support cannot be previewed here without duplicating that flow.
     notes.push(
-      "Database schema compatibility of the git target is verified during the real update; this preview does not check it.",
+      "Git preview does not execute target scripts or select a build-tested development fallback. The real update repeats database admission before executing each update.",
     );
   }
 
+  const run = getUpdateRun(params.runId, { env: params.opts.run?.env });
+  const targetVersionReason = params.targetVersion
+    ? undefined
+    : params.updateInstallKind === "git"
+      ? "Git dry-runs do not select a build-tested target version."
+      : canResolveRegistryVersionForPackageTarget(params.packageInstallSpec ?? params.tag)
+        ? "The package target version could not be resolved."
+        : "The package artifact is not staged during a dry-run.";
   printDryRunPreview(
     {
       runId: params.runId,
-      run: getUpdateRun(params.runId, { env: params.opts.run?.env }),
+      run,
       dryRun: true,
       root: params.root,
       installKind: params.installKind,
@@ -165,8 +201,9 @@ export function printUpdateDryRun(params: {
       storedChannel: params.storedChannel,
       effectiveChannel: params.channel,
       tag: params.packageInstallSpec ?? params.tag,
-      currentVersion: params.currentVersion,
+      currentVersion: run?.before?.version ?? params.currentVersion,
       targetVersion: params.targetVersion,
+      ...(targetVersionReason ? { targetVersionReason } : {}),
       downgradeRisk: params.downgradeRisk,
       actions,
       notes,

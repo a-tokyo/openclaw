@@ -1,10 +1,8 @@
 import {
   executeSqliteQuerySync,
   executeSqliteQueryTakeFirstSync,
-  getNodeSqliteKysely,
 } from "../../infra/kysely-sync.js";
 import { withOpenClawAgentDatabaseReadOnly } from "../../state/openclaw-agent-db-readonly.js";
-import type { DB as OpenClawAgentKyselyDatabase } from "../../state/openclaw-agent-db.generated.js";
 import {
   runOpenClawAgentWriteTransaction,
   type OpenClawAgentDatabase,
@@ -13,8 +11,10 @@ import {
 import type { SessionAccessScope } from "./session-accessor.sqlite-contract.js";
 import { readSessionEntryInstanceId } from "./session-accessor.sqlite-entry-identity.js";
 import { resolveSqliteScope, toDatabaseOptions } from "./session-accessor.sqlite-scope.js";
-
-type SessionMemberDatabase = Pick<OpenClawAgentKyselyDatabase, "session_members">;
+import {
+  getSessionMemberKysely,
+  hasSessionMemberInDatabase,
+} from "./session-sharing-store.kernel.js";
 
 type SessionMember = {
   identityId: string;
@@ -22,14 +22,8 @@ type SessionMember = {
   addedAt: number;
 };
 
-const SESSION_MEMBERSHIP_QUERY_CHUNK_SIZE = 400;
-
 function resolveDatabaseOptions(scope: SessionAccessScope): OpenClawAgentDatabaseOptions {
   return toDatabaseOptions(resolveSqliteScope(scope));
-}
-
-function getSessionMemberKysely(database: Pick<OpenClawAgentDatabase, "db">) {
-  return getNodeSqliteKysely<SessionMemberDatabase>(database.db);
 }
 
 function readSessionMembers<T>(
@@ -61,62 +55,18 @@ export function listSessionMembers(scope: SessionAccessScope): SessionMember[] {
   });
 }
 
-export function listSessionMembershipKeys(
-  scope: SessionAccessScope,
-  sessionKeys: readonly string[],
-  identityId: string,
-): Set<string> {
-  const normalizedIdentityId = identityId.trim();
-  const normalizedSessionKeys = [...new Set(sessionKeys.map((key) => key.trim()).filter(Boolean))];
-  if (!normalizedIdentityId || normalizedSessionKeys.length === 0) {
-    return new Set();
-  }
-  return readSessionMembers(scope, new Set<string>(), (database) => {
-    const db = getSessionMemberKysely(database);
-    const memberships = new Set<string>();
-    for (
-      let offset = 0;
-      offset < normalizedSessionKeys.length;
-      offset += SESSION_MEMBERSHIP_QUERY_CHUNK_SIZE
-    ) {
-      const chunk = normalizedSessionKeys.slice(
-        offset,
-        offset + SESSION_MEMBERSHIP_QUERY_CHUNK_SIZE,
-      );
-      const rows = executeSqliteQuerySync(
-        database.db,
-        db
-          .selectFrom("session_members")
-          .select("session_key")
-          .where("identity_id", "=", normalizedIdentityId)
-          .where("session_key", "in", chunk),
-      ).rows;
-      for (const row of rows) {
-        memberships.add(row.session_key);
-      }
-    }
-    return memberships;
-  });
-}
-
 export function isSessionMember(scope: SessionAccessScope, identityId: string): boolean {
   const normalizedIdentityId = identityId.trim();
   if (!normalizedIdentityId) {
     return false;
   }
-  return readSessionMembers(scope, false, (database) => {
-    const db = getSessionMemberKysely(database);
-    return Boolean(
-      executeSqliteQueryTakeFirstSync(
-        database.db,
-        db
-          .selectFrom("session_members")
-          .select("identity_id")
-          .where("session_key", "=", resolveSqliteScope(scope).sessionKey)
-          .where("identity_id", "=", normalizedIdentityId),
-      ),
-    );
-  });
+  return readSessionMembers(scope, false, (database) =>
+    hasSessionMemberInDatabase(
+      database,
+      resolveSqliteScope(scope).sessionKey,
+      normalizedIdentityId,
+    ),
+  );
 }
 
 // Membership is bound to a live session entry, never a transcript placeholder.

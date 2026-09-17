@@ -9,6 +9,10 @@ import {
 import type { PluginSubagentRequesterContext } from "../plugins/runtime/subagent-requester-context.js";
 import type { RuntimePluginToolGrant } from "../plugins/runtime/tool-grant.js";
 import { readInProcessAgentRuntimeIdentity } from "./in-process-agent-runtime-identity.js";
+import {
+  bindInProcessSubagentResume,
+  readInProcessSubagentResume,
+} from "./in-process-subagent-resume.js";
 import { authorizeGatewaySessionCreation } from "./operator-role-policy.js";
 import { ADMIN_SCOPE, WRITE_SCOPE } from "./operator-scopes.js";
 import {
@@ -88,6 +92,7 @@ export function runWithOperatorToolGatewayCleanupContext<T>(run: () => T): T {
 }
 
 type DispatchGatewayMethodInProcessOptions = {
+  privateCompletion?: true;
   allowSyntheticModelOverride?: boolean;
   allowSyntheticCronRunContinuation?: boolean;
   agentToolCaller?: TrustedAgentToolCaller;
@@ -250,6 +255,9 @@ function resolveInProcessGatewayDispatch(
     agentRuntimeIdentity || options?.nodeInvokeStream
       ? {
           ...(scopedStreamClient ?? baseSyntheticClient),
+          ...(agentRuntimeIdentity && !scopedStreamClient
+            ? { connId: `agent-runtime:${agentRuntimeIdentity.operationalRunInstance.instanceId}` }
+            : {}),
           ...(scopedStreamClient
             ? {
                 connect: {
@@ -291,6 +299,15 @@ function resolveInProcessGatewayDispatch(
     cancelSubagentCompletionToolHandoff(delegatedToolPolicyHandoffId);
     throw new Error(`In-process gateway dispatch requires a scoped client (method: ${method}).`);
   }
+  const client =
+    options?.forceSyntheticClient === true ? syntheticClient : (scopedClient ?? syntheticClient);
+  const resume = readInProcessSubagentResume(options);
+  if (resume) {
+    if (method !== "agent" || options?.forceSyntheticClient !== true || !client.internal) {
+      throw new Error("Task resume requires a synthetic agent admission.");
+    }
+    bindInProcessSubagentResume(client.internal, resume);
+  }
   return {
     assertContextCurrent: () => {
       if ((resolveGatewayContext ? resolveGatewayContext() : scope?.context) !== context) {
@@ -299,8 +316,7 @@ function resolveInProcessGatewayDispatch(
         );
       }
     },
-    client:
-      options?.forceSyntheticClient === true ? syntheticClient : (scopedClient ?? syntheticClient),
+    client,
     context,
     delegatedToolPolicyHandoffId,
     isWebchatConnect,
@@ -443,6 +459,7 @@ export async function dispatchGatewayMethodInProcess<T>(
       return method === "agent"
         ? await facade.dispatch<T>(params as AgentRunRequest, {
             assertAdmissionCurrent: options?.sessionMutationCommitGuard,
+            privateCompletion: options?.privateCompletion,
             cancelOnDeadline: options?.cancelOnDeadline,
             expectFinal: options?.expectFinal,
             onAccepted: options?.onAccepted,

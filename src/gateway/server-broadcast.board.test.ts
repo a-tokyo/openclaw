@@ -4,12 +4,18 @@ import {
   GATEWAY_CLIENT_CAPS,
   GATEWAY_CLIENT_IDS,
 } from "../../packages/gateway-protocol/src/client-info.js";
+import {
+  persistSubagentRunsToDiskOrThrow,
+  clearSubagentRunsReadCacheForTest,
+} from "../agents/subagents/registry/subagent-registry-state.js";
+import type { SubagentRunRecord } from "../agents/subagents/registry/subagent-registry.types.js";
 import { setRuntimeConfigSnapshot } from "../config/io.js";
 import {
   deleteSessionEntryLifecycle,
   upsertSessionEntryCore,
 } from "../config/sessions/session-accessor.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { onSessionLifecycleEvent } from "../sessions/session-lifecycle-events.js";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import { boardStore } from "./board-store.js";
 import { progressCardStore } from "./progress-card-store.js";
@@ -22,6 +28,7 @@ import { createBoardHandlers } from "./server-methods/board.js";
 import { createProgressCardHandlers } from "./server-methods/progress-card.js";
 import { flushPendingSessionsChangedEvents } from "./server-methods/session-change-event.js";
 import type { GatewayRequestContext, RespondFn } from "./server-methods/types.js";
+import { createLifecycleEventBroadcastHandler } from "./server-session-events.js";
 import { GatewayClientRegistry } from "./server/client-registry.js";
 import type { GatewayWsClient } from "./server/ws-types.js";
 import { createSessionObserverAudience } from "./session-observer-audience.js";
@@ -68,7 +75,7 @@ function makeClient(
 }
 
 describe("read-capable operator event scope guards", () => {
-  it.each(["skills.changed", "users.prefs.changed"] as const)(
+  it.each(["skills.changed", "users.prefs.changed", "plugins.changed"] as const)(
     "delivers %s only to read-capable operators",
     (event) => {
       const pairing = makeClient("pairing", "operator", ["operator.pairing"]);
@@ -85,7 +92,9 @@ describe("read-capable operator event scope guards", () => {
         event,
         event === "users.prefs.changed"
           ? { profileId: "profile-1", keys: ["ui.accent"] }
-          : { reason: "remote-node" },
+          : event === "plugins.changed"
+            ? { generation: 1 }
+            : { reason: "remote-node" },
       );
 
       expect(pairing.socket.events).toEqual([]);
@@ -93,6 +102,43 @@ describe("read-capable operator event scope guards", () => {
       expect(read.socket.events).toEqual([event]);
       expect(write.socket.events).toEqual([event]);
       expect(admin.socket.events).toEqual([event]);
+    },
+  );
+});
+
+describe("Talk voice event scope guards", () => {
+  it.each(["requested", "cancelled"])(
+    "delivers a %s voice change only to targeted Talk-capable operators",
+    (phase) => {
+      const owner = makeClient("owner", "operator", ["operator.talk"]);
+      const writer = makeClient("writer", "operator", ["operator.write"]);
+      const admin = makeClient("admin", "operator", ["operator.admin"]);
+      const observer = makeClient("observer", "operator", ["operator.talk"]);
+      const reader = makeClient("reader", "operator", ["operator.read"]);
+      const node = makeClient("node", "node", ["operator.talk"]);
+      const targets = [owner, writer, admin, reader, node];
+      const { broadcastToConnIds } = createGatewayBroadcaster({
+        clients: new GatewayClientRegistry([...targets, observer].map((entry) => entry.client)),
+      });
+
+      broadcastToConnIds(
+        "talk.voice.change",
+        {
+          phase,
+          changeId: "change-1",
+          voiceSessionId: "voice-1",
+          sessionKey: "main",
+          voice: "ember",
+        },
+        new Set(targets.map((entry) => entry.client.connId)),
+      );
+
+      for (const allowed of [owner, writer, admin]) {
+        expect(allowed.socket.events).toEqual(["talk.voice.change"]);
+      }
+      for (const denied of [observer, reader, node]) {
+        expect(denied.socket.events).toEqual([]);
+      }
     },
   );
 });
@@ -281,8 +327,8 @@ describe("board and progress event session ownership", () => {
             sessionKey: "agent:work:global",
             markdown: "Ordinary session",
           });
-          expect(progressCardStore.get("global", "work")).toBeNull();
-          expect(progressCardStore.get("agent:work:global", "work")?.markdown).toBe(
+          expect(await progressCardStore.get("global", "work")).toBeNull();
+          expect((await progressCardStore.get("agent:work:global", "work"))?.markdown).toBe(
             "Ordinary session",
           );
           const changed = (revision: number | null) => ({
@@ -307,7 +353,7 @@ describe("board and progress event session ownership", () => {
           content: { kind: "html", html: "<p>Working</p>" },
           declared: { tools: ["status.refresh"] },
         });
-        const widget = boardStore.getSnapshot(target).widgets[0]!;
+        const widget = (await boardStore.getSnapshot(target)).widgets[0]!;
         const rawGrant = await invoke("board.widget.grant", {
           ...target,
           name: "status",
@@ -325,7 +371,7 @@ describe("board and progress event session ownership", () => {
           agentId: "main",
           ops: [{ kind: "tab_create", tabId: "main-notes", title: "Main notes" }],
         });
-        expect(boardStore.getSnapshot(target)).toMatchObject({
+        expect(await boardStore.getSnapshot(target)).toMatchObject({
           sessionKey: "global",
           revision: 3,
           widgets: [{ name: "status", grantState: "granted" }],
@@ -522,36 +568,88 @@ describe("collaboration event scope guards", () => {
     expect(unsubscribed.socket.events).toEqual([]);
   });
 
-  it("prepares session subscription lookups once per ordinary broadcast", () => {
-    const first = makeClient("first", "operator", ["operator.read"]);
-    const second = makeClient("second", "operator", ["operator.read"]);
-    const unrelated = makeClient("unrelated", "operator", ["operator.read"]);
-    const legacy = makeClient("legacy", "operator", ["operator.read"]);
-    for (const entry of [first, second, unrelated]) {
-      entry.client.connect.caps = [GATEWAY_CLIENT_CAPS.SESSION_SCOPED_EVENTS];
-    }
-    const subscribers = createSessionMessageSubscriberRegistry();
-    subscribers.subscribe(first.client.connId, "session-a");
-    subscribers.subscribe(second.client.connId, "session-a");
-    const getSubscribers = vi.spyOn(subscribers, "get");
-    const { broadcast } = createGatewayBroadcaster({
-      clients: new GatewayClientRegistry([
-        first.client,
-        second.client,
-        unrelated.client,
-        legacy.client,
-      ]),
-      sessionMessageSubscribers: subscribers,
-    });
+  it.each([
+    { visibility: "draft" as const },
+    { visibility: "shared" as const, incognito: true as const },
+  ])(
+    "authorizes only subscription recipients and rechecks $visibility visibility",
+    async (hidden) => {
+      await withOpenClawTestState({ scenario: "minimal" }, async () => {
+        const cfg = rolePolicyConfig();
+        setRuntimeConfigSnapshot(cfg, cfg);
+        const sessionKey = "agent:main:subscription-filter";
+        const target = { agentId: "main", sessionKey };
+        const entry = {
+          sessionId: "subscription-filter",
+          updatedAt: 1,
+          visibility: "shared" as const,
+          createdActor: { type: "human" as const, source: "profile" as const, id: "other-owner" },
+        };
+        await upsertSessionEntryCore(target, entry);
+        invalidateSessionSharingSnapshot(sessionKey);
+        const subscribed = makeClient("subscribed", "operator", ["operator.read"]);
+        const unrelated = Array.from({ length: 32 }, (_, i) =>
+          makeClient(`unrelated-${i}`, "operator", ["operator.read"]),
+        );
+        const unscoped = makeClient("unscoped", "operator", ["operator.read"]);
+        const peers = [subscribed, ...unrelated, unscoped];
+        const identity = roleClient("view", "reader");
+        for (const peer of peers) {
+          Object.assign(peer.client, identity, { connect: { ...identity.connect } });
+        }
+        const subscribers = createSessionMessageSubscriberRegistry();
+        for (const peer of [subscribed, ...unrelated]) {
+          peer.client.connect.caps = [GATEWAY_CLIENT_CAPS.SESSION_SCOPED_EVENTS];
+          subscribers.subscribe(
+            peer.client.connId,
+            peer === subscribed ? sessionKey : "agent:main:other",
+          );
+        }
+        const getSubscribers = vi.spyOn(subscribers, "get");
+        const filter = vi.fn(
+          (
+            client: GatewayWsClient,
+            sessionKeys: readonly string[],
+            agentId?: string,
+            event?: string,
+            payload?: unknown,
+          ) =>
+            canReceiveSessionEventForClient({ cfg, client, sessionKeys, agentId, event, payload }),
+        );
+        const { broadcast } = createGatewayBroadcaster({
+          clients: new GatewayClientRegistry(peers.map(({ client }) => client)),
+          sessionMessageSubscribers: subscribers,
+          canReceiveSessionEvent: filter,
+        });
+        const payload = { sessionKey, state: "delta" };
+        broadcast("chat", payload);
+        const frame = { type: "event", event: "chat", payload, seq: 1 };
+        const frames = (peer: (typeof peers)[number]) =>
+          peer.socket.send.mock.calls.map(([wire]) => JSON.parse(String(wire)));
+        expect(frames(subscribed)).toEqual([frame]);
+        expect(frames(unscoped)).toEqual([frame]);
+        for (const peer of unrelated) {
+          expect(frames(peer)).toEqual([]);
+        }
+        expect(getSubscribers).toHaveBeenCalledExactlyOnceWith(sessionKey);
+        expect(filter).toHaveBeenCalledTimes(2);
 
-    broadcast("chat", { sessionKey: "session-a", state: "delta" });
-
-    expect(getSubscribers).toHaveBeenCalledExactlyOnceWith("session-a");
-    expect(first.socket.events).toEqual(["chat"]);
-    expect(second.socket.events).toEqual(["chat"]);
-    expect(unrelated.socket.events).toEqual([]);
-    expect(legacy.socket.events).toEqual(["chat"]);
-  });
+        await upsertSessionEntryCore(target, { ...entry, ...hidden, updatedAt: 2 });
+        invalidateSessionSharingSnapshot(sessionKey);
+        filter.mockClear();
+        broadcast("chat", payload);
+        broadcast("tick", {});
+        for (const peer of peers) {
+          const received = peer === subscribed || peer === unscoped;
+          expect(frames(peer)).toEqual([
+            ...(received ? [frame] : []),
+            { type: "event", event: "tick", payload: {}, seq: received ? 2 : 1 },
+          ]);
+        }
+        expect(filter).toHaveBeenCalledTimes(2);
+      });
+    },
+  );
 
   it("suppresses session.tool mirrors for scoped clients without a matching subscription", () => {
     const subscribed = makeClient("subscribed", "operator", ["operator.read"]);
@@ -796,6 +894,124 @@ describe("collaboration event scope guards", () => {
     expect(pairing.socket.events).toEqual([]);
     expect(reader.socket.events).toEqual(["session.typing"]);
     expect(unrelated.socket.events).toEqual([]);
-    expect(canReceiveSessionEvent).toHaveBeenCalledTimes(4);
+    expect(canReceiveSessionEvent).toHaveBeenCalledTimes(3);
+  });
+});
+
+it("delivers committed collector updates to a parent-only cross-agent viewer", async () => {
+  await withOpenClawTestState({ scenario: "minimal" }, async () => {
+    const cfg: OpenClawConfig = {
+      ...rolePolicyConfig(),
+      agents: { ownership: "explicit", entries: { ops: {}, research: {} } },
+    };
+    setRuntimeConfigSnapshot(cfg, cfg);
+    clearSubagentRunsReadCacheForTest();
+    const peers = ["parent-viewer", "child-viewer"].map((name) => {
+      const peer = makeClient(name, "operator", ["operator.read"]);
+      Object.assign(peer.client, roleClient("view", name));
+      return peer;
+    });
+    const parent = { sessionKey: "global", agentId: "ops" };
+    const child = { sessionKey: "agent:research:subagent:collector", agentId: "research" };
+    for (const [index, target] of [parent, child].entries()) {
+      await upsertSessionEntryCore(target, {
+        sessionId: peers[index]!.client.connId,
+        updatedAt: 1,
+        visibility: "draft",
+        createdActor: {
+          type: "human",
+          source: "profile",
+          id: peers[index]!.client.authenticatedUserProfile!.profileId,
+        },
+      });
+    }
+    invalidateSessionSharingSnapshot();
+    expect(
+      canReceiveSessionEventForClient({
+        cfg,
+        client: peers[0]!.client,
+        sessionKeys: [child.sessionKey],
+        agentId: child.agentId,
+        event: "sessions.changed",
+      }),
+    ).toBe(false);
+    const { broadcastToConnIds } = createGatewayBroadcaster({
+      clients: new GatewayClientRegistry(peers.map(({ client }) => client)),
+      canReceiveSessionEvent: (client, sessionKeys, agentId, event, payload) =>
+        canReceiveSessionEventForClient({ cfg, client, sessionKeys, agentId, event, payload }),
+    });
+    const unsubscribe = onSessionLifecycleEvent(
+      createLifecycleEventBroadcastHandler({
+        broadcastToConnIds,
+        sessionEventSubscribers: {
+          getAll: () => new Set(peers.map(({ client }) => client.connId)),
+        },
+        chatAbortControllers: new Map([
+          [
+            "parent-run",
+            {
+              controller: new AbortController(),
+              sessionId: "parent-viewer",
+              sessionKey: parent.sessionKey,
+              agentId: parent.agentId,
+              startedAtMs: 1,
+              expiresAtMs: Date.now() + 60_000,
+              projectSessionActive: true,
+              executionStarted: true,
+            },
+          ],
+        ]),
+      }),
+    );
+    const run: SubagentRunRecord = {
+      runId: "collector",
+      childSessionKey: child.sessionKey,
+      requesterSessionKey: "agent:research:private-delivery",
+      requesterDisplayKey: "private child",
+      swarmRequesterSessionKey: parent.sessionKey,
+      requesterAgentId: parent.agentId,
+      collect: true,
+      groupId: "opaque-batch",
+      createdAt: 1,
+      cleanup: "keep",
+      task: "child-private task",
+      execution: { status: "queued" },
+      completion: { required: false },
+      delivery: { status: "not_required" },
+    };
+    const runs = new Map([[run.runId, run]]);
+    try {
+      persistSubagentRunsToDiskOrThrow(runs, [run.runId]);
+      run.execution = { status: "running", startedAt: 2 };
+      persistSubagentRunsToDiskOrThrow(runs, [run.runId]);
+      run.execution = { status: "terminal", endedAt: 3, outcome: { status: "error" } };
+      run.collectorCompletion = {
+        status: "failed",
+        structured: { private: "child-private result" },
+      };
+      persistSubagentRunsToDiskOrThrow(runs, [run.runId]);
+      runs.clear();
+      persistSubagentRunsToDiskOrThrow(runs, [run.runId]);
+      expect(peers[0]!.socket.events).toEqual(Array(4).fill("sessions.changed"));
+      expect(peers[1]!.socket.events).toEqual([]);
+      for (const [raw] of peers[0]!.socket.send.mock.calls) {
+        const event = JSON.parse(raw);
+        expect(event.payload).toMatchObject({
+          sessionKey: "global",
+          agentId: "ops",
+          reason: "swarm",
+          status: "running",
+          hasActiveRun: true,
+          activeRunIds: ["parent-run"],
+        });
+        expect(event.payload).not.toHaveProperty("phase");
+        expect(raw).not.toContain("child-private");
+        expect(raw).not.toContain(child.sessionKey);
+      }
+    } finally {
+      unsubscribe();
+      clearSubagentRunsReadCacheForTest();
+      invalidateSessionSharingSnapshot();
+    }
   });
 });

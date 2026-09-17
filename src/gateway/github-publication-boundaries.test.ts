@@ -1,5 +1,7 @@
 import os from "node:os";
 import { describe, expect, it, vi } from "vitest";
+import { insertRegistryWorktree } from "../agents/worktrees/registry.js";
+import { readGitHubPublicationSessionLifecycle } from "../state/github-publication-session-lifecycles.js";
 import {
   closeOpenClawStateDatabaseForTest,
   openOpenClawStateDatabase,
@@ -17,6 +19,7 @@ import {
   createTestGitHubPublicationRuntime as createGitHubPublicationRuntime,
   githubPublicationTestMocks,
   installGitHubPublicationTestHarness,
+  persistPublicationTestSession,
   root,
   seedLocalPublication,
 } from "./github-publication.test-support.js";
@@ -25,11 +28,58 @@ import {
   seedActivePlacement,
 } from "./worker-environments/placement-dispatch-test-fixtures.js";
 import { createWorkerSessionPlacementStore } from "./worker-environments/placement-store.js";
+import { seedAttachedPlacementEnvironment } from "./worker-environments/placement-test-fixtures.js";
 
 const mocks = githubPublicationTestMocks();
 
 describe("Gateway GitHub publication boundaries", () => {
   installGitHubPublicationTestHarness();
+
+  it.each(["retained", "missing"] as const)(
+    "does not rebind a %s receipt lifecycle when replaying after the real reset",
+    async (bindingState) => {
+      const session = await persistPublicationTestSession(REQUEST.sessionKey);
+      const placements = createWorkerSessionPlacementStore({
+        database: openOpenClawStateDatabase(),
+      });
+      const requested = placements.startDispatch(REQUEST);
+      placements.fail({
+        sessionId: REQUEST.sessionId,
+        expectedGeneration: requested.generation,
+        recoveryError: "Provisioning stopped before allocation",
+      });
+      const coordinator = createTestGitHubPublicationCoordinator({ placements });
+      const input = {
+        sessionKey: REQUEST.sessionKey,
+        agentId: REQUEST.agentId,
+        idempotencyKey: "deferred-before-reset",
+      };
+      const accepted = await coordinator.requestForSession(input);
+      expect(accepted.status).toBe("requested");
+      const binding = { publicationKind: "shared" as const, requestId: accepted.requestId };
+      const originalLifecycle = readGitHubPublicationSessionLifecycle(binding);
+      expect(originalLifecycle).toEqual({ lifecycle_revision: session.read().lifecycleRevision });
+      if (bindingState === "missing") {
+        openOpenClawStateDatabase()
+          .db.prepare(
+            "DELETE FROM github_publication_session_lifecycles WHERE publication_kind = 'shared' AND request_id = ?",
+          )
+          .run(accepted.requestId);
+      }
+      await session.reset(placements);
+      const replay = await coordinator.requestForSession(input);
+      expect(replay).toMatchObject({ status: "failed", code: "session_changed" });
+      expect(readGitHubPublicationSessionLifecycle(binding)).toEqual(
+        bindingState === "retained" ? originalLifecycle : undefined,
+      );
+      await coordinator.resumeSessionRequests();
+      expect(coordinator.read(accepted.requestId)).toMatchObject({
+        status: "failed",
+        code: "session_changed",
+      });
+      expect(commands.some((argv) => argv.includes("push") || argv.includes("POST"))).toBe(false);
+    },
+  );
 
   it.each([
     ["URL rewrite", "url.https://attacker.invalid/.insteadof https://github.com/"],
@@ -501,6 +551,78 @@ describe("Gateway GitHub publication boundaries", () => {
     });
   });
 
+  it("continues settling other receipts when one workspace still needs Git recovery", async () => {
+    const database = openOpenClawStateDatabase({ env: { OPENCLAW_STATE_DIR: root } });
+    const coordinator = createTestGitHubPublicationCoordinator({
+      placements: createWorkerSessionPlacementStore({ database }),
+    });
+    coordinator.read("create-schema");
+    seedLocalPublication(database, { requestId: "blocked", status: "publishing" });
+    seedLocalPublication(database, { requestId: "following", status: "requested" });
+    seedLocalPublication(database, {
+      requestId: "stale",
+      status: "publishing",
+      repositoryFingerprint: "replaced-fingerprint",
+    });
+    database.db
+      .prepare("UPDATE github_publication_requests SET created_at_ms = ? WHERE request_id = ?")
+      .run(1_001, "following");
+    database.db
+      .prepare("UPDATE github_publication_requests SET created_at_ms = ? WHERE request_id = ?")
+      .run(1_002, "stale");
+    const otherSession = "agent:main:other-publication";
+    const otherWorktree = {
+      ...mocks.findWorktree("session", otherSession),
+      id: "worktree-2",
+      path: "/repo/other-worktree",
+    };
+    insertRegistryWorktree(process.env, {
+      ...otherWorktree,
+      name: "other",
+      createdAt: 1,
+      lastActiveAt: 1,
+    });
+    database.db
+      .prepare(
+        "UPDATE github_publication_requests SET worktree_id = ?, session_id = ?, session_key = ? WHERE request_id = ?",
+      )
+      .run(otherWorktree.id, "session-other", otherSession, "stale");
+    const loadSession = mocks.loadSession.getMockImplementation()!;
+    mocks.loadSession.mockImplementation((key: string) => {
+      const loaded = loadSession(key);
+      return key === otherSession
+        ? {
+            ...loaded,
+            entry: {
+              ...loaded.entry,
+              sessionId: "session-other",
+              worktree: { id: otherWorktree.id, branch: BRANCH, repoRoot: "/repo" },
+            },
+          }
+        : loaded;
+    });
+    const findWorktree = mocks.findWorktree.getMockImplementation()!;
+    mocks.findWorktree.mockImplementation((kind: string, key: string) =>
+      key === otherSession ? otherWorktree : findWorktree(kind, key),
+    );
+    mocks.updateIndex.mockImplementationOnce(async () => {
+      const { GitHubPublicationRecoveryPendingError } = await vi.importActual<
+        typeof import("./github-publication-git-index.js")
+      >("./github-publication-git-index.js");
+      throw new GitHubPublicationRecoveryPendingError("workspace recovery is pending");
+    });
+    await expect(coordinator.resumeSessionRequests()).rejects.toThrow(
+      "workspace recovery is pending",
+    );
+    expect(coordinator.read("blocked")).toMatchObject({ status: "publishing" });
+    expect(coordinator.read("following")).toMatchObject({ status: "requested" });
+    expect(coordinator.read("stale")).toMatchObject({
+      status: "failed",
+      code: "workspace_changed",
+    });
+    expect(commands.some((argv) => argv.includes("push") || argv.includes("POST"))).toBe(false);
+  });
+
   it("reports missing managed credentials as an identity failure after admission", async () => {
     const database = openOpenClawStateDatabase({ env: { OPENCLAW_STATE_DIR: root } });
     const coordinator = createTestGitHubPublicationCoordinator({
@@ -641,6 +763,11 @@ describe("Gateway GitHub publication boundaries", () => {
   ])("queues a cloud session publication with $label", async ({ claimRunId, expectedRunId }) => {
     const database = openOpenClawStateDatabase({ env: { OPENCLAW_STATE_DIR: root } });
     const placements = createWorkerSessionPlacementStore({ database });
+    seedAttachedPlacementEnvironment(database, {
+      environmentId: "environment-deferred-request",
+      sessionId: REQUEST.sessionId,
+      ownerEpoch: 2,
+    });
     const active = seedActivePlacement(placements, {
       environmentId: "environment-deferred-request",
       ownerEpoch: 2,
@@ -688,6 +815,11 @@ describe("Gateway GitHub publication boundaries", () => {
   it("publishes deferred session requests alongside an accepted turn claim", async () => {
     const database = openOpenClawStateDatabase({ env: { OPENCLAW_STATE_DIR: root } });
     const placements = createWorkerSessionPlacementStore({ database });
+    seedAttachedPlacementEnvironment(database, {
+      environmentId: "environment-accepted-deferred",
+      sessionId: REQUEST.sessionId,
+      ownerEpoch: 2,
+    });
     const active = seedActivePlacement(placements, {
       environmentId: "environment-accepted-deferred",
       ownerEpoch: 2,
@@ -725,6 +857,11 @@ describe("Gateway GitHub publication boundaries", () => {
   it("defers an orphaned turn request and publishes it when the workspace is quiescent", async () => {
     const database = openOpenClawStateDatabase({ env: { OPENCLAW_STATE_DIR: root } });
     const placements = createWorkerSessionPlacementStore({ database });
+    seedAttachedPlacementEnvironment(database, {
+      environmentId: "environment-1",
+      sessionId: REQUEST.sessionId,
+      ownerEpoch: 2,
+    });
     const active = seedActivePlacement(placements, {
       environmentId: "environment-1",
       ownerEpoch: 2,
@@ -763,6 +900,11 @@ describe("Gateway GitHub publication boundaries", () => {
   it("defers snapshot preparation failures without blocking workspace acceptance", async () => {
     const database = openOpenClawStateDatabase({ env: { OPENCLAW_STATE_DIR: root } });
     const placements = createWorkerSessionPlacementStore({ database });
+    seedAttachedPlacementEnvironment(database, {
+      environmentId: "environment-snapshot-failure",
+      sessionId: REQUEST.sessionId,
+      ownerEpoch: 2,
+    });
     const active = seedActivePlacement(placements, {
       environmentId: "environment-snapshot-failure",
       ownerEpoch: 2,

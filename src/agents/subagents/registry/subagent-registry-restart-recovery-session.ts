@@ -11,14 +11,29 @@ import type { InternalSessionEntry } from "../../../config/sessions/types.js";
 import type { GatewayRecoveryRuntime } from "../../../gateway/server-instance-runtime.types.js";
 import { listAgentRunsForSession } from "../../../infra/agent-run-registry.js";
 import { isSessionWorkAdmissionActive } from "../../../sessions/session-lifecycle-admission.js";
-import { isRetiredRunningSubagent } from "./subagent-registry-restart-recovery-helpers.js";
+import {
+  INTERNAL_MESSAGE_CHANNEL,
+  isInternalNonDeliveryChannel,
+} from "../../../utils/message-channel-constants.js";
+import { normalizeMessageChannel } from "../../../utils/message-channel-core.js";
+import { isRetiredSubagentExecution } from "./subagent-registry-restart-recovery-helpers.js";
 import type { SubagentRunRecord } from "./subagent-registry.types.js";
 
 const RECOVERY_RESUMED_NOTICE = "Resumed your interrupted task after the Gateway restart.";
 
 export function shouldConfirmAcceptedRecoveryResumption(owner: SubagentRunRecord): boolean {
   const origin = owner.requesterOrigin;
-  return owner.expectsCompletionMessage !== false && Boolean(origin?.channel && origin.to);
+  const channel = normalizeMessageChannel(origin?.channel);
+  // Native sessions observe recovery through session events; they have no outbound transport.
+  return (
+    owner.expectsCompletionMessage !== false &&
+    Boolean(
+      channel &&
+      channel !== INTERNAL_MESSAGE_CHANNEL &&
+      !isInternalNonDeliveryChannel(channel) &&
+      origin?.to,
+    )
+  );
 }
 
 export async function loadSubagentRecoverySession(params: {
@@ -39,7 +54,7 @@ export async function loadSubagentRecoverySession(params: {
     sessionEntry?.abortedLastRun === true ||
     sessionEntry?.status !== "running" ||
     sessionEntry.lifecycleRunId !== params.entry.runId ||
-    !isRetiredRunningSubagent(params.entry)
+    !isRetiredSubagentExecution(params.entry)
   ) {
     return { agentId, storePath, sessionEntry };
   }
@@ -47,7 +62,7 @@ export async function loadSubagentRecoverySession(params: {
   const target = { sessionKey, sessionId };
   const isCurrent = () =>
     params.isOwnerCurrent() &&
-    isRetiredRunningSubagent(params.entry) &&
+    isRetiredSubagentExecution(params.entry) &&
     listAgentRunsForSession(target).length === 0 &&
     !isSessionWorkAdmissionActive(storePath, [sessionKey, sessionId]);
   const interrupted = await patchSessionEntryCore(

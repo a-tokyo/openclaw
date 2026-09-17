@@ -18,17 +18,17 @@ import {
   DEFAULT_MAX_ENTRY_BYTES,
   loadZipArchiveWithPreflight,
 } from "../infra/archive.js";
-import {
-  downloadClawHubPackageArchive,
-  normalizeClawHubSha256Integrity,
-  normalizeClawHubSha256Hex,
-} from "../infra/clawhub-artifacts.js";
+import { downloadClawHubPackageArchive } from "../infra/clawhub-artifacts.js";
 import {
   ClawHubRequestError,
   isDefaultClawHubBaseUrl,
   resolveClawHubBaseUrl,
 } from "../infra/clawhub-client.js";
 import { checkClawHubPackageTrust } from "../infra/clawhub-install-trust.js";
+import {
+  normalizeClawHubSha256Integrity,
+  normalizeClawHubSha256Hex,
+} from "../infra/clawhub-integrity.js";
 import {
   fetchClawHubPackageArtifact,
   fetchClawHubPackageDetail,
@@ -296,6 +296,7 @@ type ClawHubResolvedArtifactWire = {
   sha256?: string | null;
   npmIntegrity?: string | null;
   npmShasum?: string | null;
+  size?: number | null;
   downloadUrl?: string | null;
 };
 
@@ -316,6 +317,7 @@ function resolveTopLevelNpmPackArtifact(
     sha256: wire.artifactSha256 ?? wire.sha256 ?? null,
     npmIntegrity: wire.npmIntegrity,
     npmShasum: wire.npmShasum ?? null,
+    size: wire.size ?? null,
     downloadUrl: wire.downloadUrl ?? null,
   };
 }
@@ -1450,7 +1452,6 @@ export async function installPluginFromClawHub(
     const installResult = await installPluginFromArchive(
       copyPluginInstallTransactionRequest(params, {
         archivePath: archive.archivePath,
-        dangerouslyForceUnsafeInstall: params.dangerouslyForceUnsafeInstall,
         onInstallPolicyWarning: params.onInstallPolicyWarning,
         trustedSourceLinkedOfficialInstall:
           officialClawHubPackage || isTrustedSourceLinkedOfficialPackage(detail.package!),

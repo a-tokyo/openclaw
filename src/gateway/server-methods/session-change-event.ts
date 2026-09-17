@@ -1,5 +1,6 @@
 // Shared sessions.changed broadcaster for gateway RPC and chat-command mutations.
 import { parseAgentSessionKey } from "../../routing/session-key.js";
+import { bumpGatewayAccessRevision } from "../gateway-access-revision.js";
 import { hasSessionChangeReceivers } from "../session-change-receivers.js";
 import { buildGatewaySessionSnapshot } from "../session-event-payload.js";
 import {
@@ -10,6 +11,10 @@ import {
 import { invalidateSessionSharingSnapshot } from "../session-sharing.js";
 import { loadGatewaySessionRow } from "../session-utils.js";
 import { resolveVisibleActiveSessionRunState } from "./session-active-runs.js";
+import {
+  readSessionPlacementFields,
+  type SessionPlacementReadContext,
+} from "./session-placement-read-projection.js";
 import type { GatewayRequestContext } from "./types.js";
 
 type SessionChangedPayload = {
@@ -20,14 +25,15 @@ type SessionChangedPayload = {
   compacted?: boolean;
 };
 
-type SessionChangeContext = Pick<
-  GatewayRequestContext,
-  | "broadcastToConnIds"
-  | "chatAbortControllers"
-  | "getRuntimeConfig"
-  | "getSessionEventSubscriberConnIds"
-  | "mentionInbox"
->;
+type SessionChangeContext = SessionPlacementReadContext &
+  Pick<
+    GatewayRequestContext,
+    | "broadcastToConnIds"
+    | "chatAbortControllers"
+    | "getRuntimeConfig"
+    | "getSessionEventSubscriberConnIds"
+    | "mentionInbox"
+  >;
 
 type PendingSessionChange = {
   context: SessionChangeContext;
@@ -89,6 +95,11 @@ function broadcastSessionsChanged(
     return;
   }
   const sessionRow = loadGatewaySessionRow(payload.sessionKey, { agentId: routingAgentId });
+  // Coalescing can replace the mutation reason; read the latest placement with its exact row.
+  const placement =
+    context.workerSessionPlacementService && sessionRow?.sessionId
+      ? readSessionPlacementFields(context, sessionRow.sessionId)
+      : undefined;
   const activeRunState =
     sessionRow && (sessionRow.key !== "global" || routingAgentId !== undefined)
       ? resolveVisibleActiveSessionRunState({
@@ -112,6 +123,9 @@ function broadcastSessionsChanged(
               activeRunState,
             }),
           }
+        : {}),
+      ...(placement
+        ? { placement: placement.placement ?? null, placementMove: placement.placementMove ?? null }
         : {}),
     },
     connIds,
@@ -146,11 +160,19 @@ export function flushPendingSessionsChangedEvents(context?: object): void {
   }
 }
 
-export function emitSessionsChanged(context: SessionChangeContext, payload: SessionChangedPayload) {
+export function emitSessionsChanged(
+  context: SessionChangeContext,
+  payload: SessionChangedPayload,
+  options: { accessChanged?: boolean } = {},
+) {
   // This counter is the sessions.list projection fence: every mutation advances it
   // synchronously, before event coalescing, so work started on an older value is never
   // joined or cached by a request that begins after the mutation.
   sessionsMutationVersions.set(context, readSessionsMutationVersion(context) + 1);
+  // Only a committed producer may certify unchanged access; unknown changes stay conservative.
+  if (options.accessChanged !== false) {
+    bumpGatewayAccessRevision();
+  }
   invalidateSessionSharingSnapshot(payload.sessionKey);
   // Inbox subscriptions are independent of session-list subscriptions, including a closed sidebar.
   context.mentionInbox?.invalidate();

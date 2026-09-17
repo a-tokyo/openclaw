@@ -61,6 +61,7 @@ export function createPlacementStartupHarness(
     get state() {
       return state;
     },
+    invalidate: vi.fn(),
     refresh: vi.fn(async () => undefined),
     subscribe: vi.fn(() => () => undefined),
   } as unknown as SessionCapability;
@@ -88,7 +89,7 @@ export function createPlacementStartupHarness(
   }
   return {
     startup,
-    input: { recovery, persistRecovery: true, recovering: false, createdAt: 1_000 },
+    input: { recovery, persistRecovery: true, mode: "dispatch" as const, createdAt: 1_000 },
     client,
     gateway,
     sessions,

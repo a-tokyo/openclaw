@@ -43,10 +43,8 @@ vi.mock("./cdp.js", () => ({
 }));
 
 type ScopedCdpClientOptions = {
-  cdpUrl?: unknown;
   fn?: unknown;
   page?: unknown;
-  targetId?: unknown;
 };
 
 function requireScopedCdpClientOptions(): ScopedCdpClientOptions {
@@ -98,9 +96,7 @@ describe("pw-tools-core aria snapshot storage", () => {
     expect(ensurePageState).toHaveBeenCalledWith(page);
     expect(withPageScopedCdpClient).toHaveBeenCalledTimes(1);
     const scopedClientOptions = requireScopedCdpClientOptions();
-    expect(scopedClientOptions.cdpUrl).toBe("http://127.0.0.1:9222");
     expect(scopedClientOptions.page).toBe(page);
-    expect(scopedClientOptions.targetId).toBe("tab-1");
     expect(typeof scopedClientOptions.fn).toBe("function");
     expect(markBackendDomRefsOnPage).toHaveBeenCalledWith({
       page,
@@ -573,10 +569,10 @@ describe("pw-tools-core aria snapshot storage", () => {
       cdpUrl: "http://127.0.0.1:9222",
       targetId: "tab-1",
       expectedDocumentIdentity: "cdp:loader-1",
-      refs: {
-        e1: { role: "button", name: "Save", nth: 0, backendDOMNodeId: 42 },
-        e2: { role: "button", name: "Save", nth: 1, backendDOMNodeId: 84 },
-      },
+      refs: Object.freeze({
+        e1: Object.freeze({ role: "button", name: "Save", nth: 0, backendDOMNodeId: 42 }),
+        e2: Object.freeze({ role: "button", name: "Save", nth: 1, backendDOMNodeId: 84 }),
+      }),
     });
 
     expect(storeRoleRefsForTarget).toHaveBeenCalledWith({

@@ -70,6 +70,9 @@ export async function runManagerInitializeSession(params: {
         ...(requestedModel ? { model: requestedModel } : {}),
         ...(requestedModel && input.modelExplicit ? { modelExplicit: true } : {}),
         ...(requestedThinking ? { thinking: requestedThinking } : {}),
+        ...(requestedThinking && input.thinkingExplicit !== undefined
+          ? { thinkingExplicit: input.thinkingExplicit }
+          : {}),
         cwd: requestedCwd,
       }),
     fallbackCode: "ACP_SESSION_INIT_FAILED",
@@ -77,13 +80,18 @@ export async function runManagerInitializeSession(params: {
   });
   const handle = { ...ensured, agentId, sessionKey };
   const effectiveCwd = normalizeText(handle.cwd) ?? requestedCwd;
-  const effectiveModel = resolveEffectiveSessionModel({
-    requestedModel,
-    appliedModel: handle.appliedModel,
-  });
   const effectiveRuntimeOptions = normalizeRuntimeOptions({
     ...initialRuntimeOptions,
-    model: effectiveModel,
+    model: handle.appliedModel
+      ? handle.appliedModel.kind === "applied"
+        ? handle.appliedModel.model
+        : undefined
+      : requestedModel,
+    thinking: handle.appliedThinking
+      ? handle.appliedThinking.kind === "applied"
+        ? handle.appliedThinking.thinking
+        : undefined
+      : requestedThinking,
     ...(effectiveCwd ? { cwd: effectiveCwd } : {}),
   });
 
@@ -147,17 +155,6 @@ export async function runManagerInitializeSession(params: {
     meta,
     sessionEntry: persisted,
   };
-}
-
-function resolveEffectiveSessionModel(params: {
-  requestedModel: string | undefined;
-  appliedModel: AcpRuntimeHandle["appliedModel"];
-}): string | undefined {
-  const { appliedModel } = params;
-  if (!appliedModel) {
-    return params.requestedModel;
-  }
-  return appliedModel.kind === "applied" ? appliedModel.model : undefined;
 }
 
 async function persistInitializedSessionMeta(params: {

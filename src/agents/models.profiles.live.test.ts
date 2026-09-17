@@ -11,11 +11,7 @@ import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { coerceSecretRef, type SecretInput } from "../config/types.secrets.js";
 import { parseLiveCsvFilter } from "../media-generation/live-test-helpers.js";
 import { runTasksWithConcurrency } from "../utils/run-with-concurrency.js";
-import {
-  discoverAuthStorage,
-  discoverModels,
-  normalizeDiscoveredAgentModel,
-} from "./agent-model-discovery.js";
+import { discoverAuthStorage, discoverModels } from "./agent-model-discovery.js";
 import { resolveDefaultAgentDir } from "./agent-scope.js";
 import { externalCliDiscoveryForProviders } from "./auth-profiles/external-cli-discovery.js";
 import { ensureCustomApiRegistered } from "./custom-api-registry.js";
@@ -23,6 +19,10 @@ import { extractEmbeddedAssistantText } from "./embedded-agent-utils.js";
 import { isRateLimitErrorMessage } from "./failover/classify.js";
 import { collectProviderApiKeys } from "./live-auth-keys.js";
 import { isModelNotFoundErrorMessage } from "./live-model-errors.js";
+import {
+  resolveLiveCompletionSessionId,
+  resolveLiveSystemPrompt,
+} from "./live-model-session-id.js";
 import {
   isLiveProfileKeyModeEnabled,
   isLiveTestEnabled,
@@ -39,6 +39,7 @@ import {
   requireApiKey,
   resolveUsableCustomProviderApiKey,
 } from "./model-auth.js";
+import { normalizeDiscoveredAgentModel } from "./model-discovery-normalize.js";
 import { shouldSuppressBuiltInModelCore } from "./model-suppression.js";
 import { ensureOpenClawModelsJson } from "./models-config.js";
 import type { StreamFn } from "./runtime/index.js";
@@ -1277,30 +1278,7 @@ function resolveTestReasoning(
   return "low";
 }
 
-function resolveLiveSystemPrompt(model: Model): string | undefined {
-  if (model.provider === "openai") {
-    return "You are a concise assistant. Follow the user's instruction exactly.";
-  }
-  return undefined;
-}
-
 describe("resolveLiveSystemPrompt", () => {
-  it("adds instructions for openai probes", () => {
-    expect(
-      resolveLiveSystemPrompt({
-        provider: "openai",
-      } as Model),
-    ).toContain("Follow the user's instruction exactly.");
-  });
-
-  it("keeps other providers unchanged", () => {
-    expect(
-      resolveLiveSystemPrompt({
-        provider: "ollama",
-      } as Model),
-    ).toBeUndefined();
-  });
-
   it("matches OpenAI Codex HTML interruption pages", () => {
     expect(
       isOpenAiCodexHtmlInterruption(
@@ -1341,6 +1319,7 @@ async function completeSimpleWithTimeout<TApi extends Api>(
       Promise.race([
         completeSimple(completionModel, context, {
           ...options,
+          sessionId: options?.sessionId ?? resolveLiveCompletionSessionId(model),
           signal: controller.signal,
         }),
         timeout,

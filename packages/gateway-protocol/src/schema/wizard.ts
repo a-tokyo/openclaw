@@ -37,13 +37,16 @@ export const WizardNextParamsSchema = closedObject({
   answer: Type.Optional(WizardAnswerSchema),
 });
 
-/** Shared session-id-only params for cancel and status requests. */
+/** Session-id-only params for status requests. */
 const WizardSessionIdParamsSchema = closedObject({
   sessionId: NonEmptyString,
 });
 
-/** Cancels an active wizard session. */
-export const WizardCancelParamsSchema = WizardSessionIdParamsSchema;
+/** Cancels a wizard or closes input when its client view is discarded. */
+export const WizardCancelParamsSchema = closedObject({
+  sessionId: NonEmptyString,
+  closeInput: Type.Optional(Type.Boolean()),
+});
 
 /** Reads status for an active or recently completed wizard session. */
 export const WizardStatusParamsSchema = WizardSessionIdParamsSchema;
@@ -111,6 +114,7 @@ const WizardResultFields = {
   modelActivation: Type.Optional(
     closedObject({
       modelRef: NonEmptyString,
+      modelTarget: Type.Optional(Type.Literal("utility")),
       gatewayRestartRequired: Type.Optional(Type.Literal(true)),
     }),
   ),

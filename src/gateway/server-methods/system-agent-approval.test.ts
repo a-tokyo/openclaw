@@ -3,7 +3,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { expectDefined } from "@openclaw/normalization-core";
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../../test/helpers/promise.js";
 import { createTempDirTracker } from "../../../test/helpers/temp-dir.js";
 import { createOperationalRunInstanceRef } from "../../agents/admitted-run-context.js";
@@ -23,11 +23,11 @@ import {
 import { resetPluginStateStoreForTests } from "../../plugin-state/plugin-state-store.js";
 import { resetCommandQueueStateForTest } from "../../process/command-queue.test-support.js";
 import { AsyncWorkScope } from "../../shared/async-work-scope.js";
-import { closeOpenClawStateDatabaseByPath } from "../../state/openclaw-state-db.js";
+import { closeOpenClawStateDatabaseByPath } from "../../state/openclaw-state-db-cache.js";
 import { SystemAgentChatEngine } from "../../system-agent/chat-engine.js";
 import {
   createSystemAgentVerifiedInferenceTestFixture,
-  installSystemAgentPluginMetadataTestSnapshot,
+  createSystemAgentPluginMetadataTestSnapshot,
   readLastSystemAgentAuditEntry,
   type SystemAgentPluginMetadataTestSnapshot,
 } from "../../system-agent/system-agent.test-helpers.js";
@@ -66,11 +66,7 @@ describe("Full Access delegated chat", () => {
   let pluginMetadataSnapshot: SystemAgentPluginMetadataTestSnapshot | undefined;
 
   beforeAll(() => {
-    pluginMetadataSnapshot = installSystemAgentPluginMetadataTestSnapshot(verifiedConfig);
-  });
-
-  afterAll(() => {
-    pluginMetadataSnapshot?.restore();
+    pluginMetadataSnapshot = createSystemAgentPluginMetadataTestSnapshot(verifiedConfig);
   });
 
   afterEach(async () => {
@@ -83,20 +79,22 @@ describe("Full Access delegated chat", () => {
     resetPluginStateStoreForTests();
     resetCommandQueueStateForTest();
     vi.unstubAllEnvs();
-    pluginMetadataSnapshot?.rebindForCurrentEnv();
+
     systemAgentTempDirs.cleanup();
   });
 
   async function createDelegatedChatFixture(
-    source: "typed" | "model tool" | "planner" = "typed",
+    source: "typed" | "model tool" | "repair" = "typed",
     previousRun = "live",
   ) {
     const stateDir = systemAgentTempDirs.make("openclaw-full-access-change-");
     vi.stubEnv("OPENCLAW_STATE_DIR", stateDir);
     vi.stubEnv("OPENCLAW_CONFIG_PATH", path.join(stateDir, "openclaw.json"));
     fs.writeFileSync(path.join(stateDir, "openclaw.json"), JSON.stringify(verifiedConfig));
-    pluginMetadataSnapshot?.rebindForCurrentEnv();
-    const fixture = await createSystemAgentVerifiedInferenceTestFixture(verifiedConfig);
+
+    const fixture = await pluginMetadataSnapshot!.run(() =>
+      createSystemAgentVerifiedInferenceTestFixture(verifiedConfig),
+    );
     setupInferenceMocks.resolvePersistentApplyInference.mockResolvedValue(
       fixture.binding.execution,
     );
@@ -122,11 +120,8 @@ describe("Full Access delegated chat", () => {
         runConfigSet,
       },
       runAgentTurn: async (params) => {
-        if (source === "typed" || proposed) {
+        if (source === "typed" || (proposed && source !== "repair")) {
           return { text: "Config verified." };
-        }
-        if (source === "planner") {
-          return null;
         }
         proposed = true;
         const tool = createSystemAgentTool({
@@ -137,14 +132,10 @@ describe("Full Access delegated chat", () => {
         });
         await tool.execute("propose-config", {
           action: "config_set",
-          path: "logging.level",
-          value: "debug",
+          path: source === "repair" ? "gateway.port" : "logging.level",
+          value: source === "repair" ? "18789" : "debug",
         });
         return { text: "Change proposed." };
-      },
-      planWithAssistant: async () => {
-        proposed = true;
-        return { reply: "Change proposed.", command: "config set logging.level debug" };
       },
     });
     vi.spyOn(engine, "loadOverview").mockResolvedValue({
@@ -203,15 +194,17 @@ describe("Full Access delegated chat", () => {
     const callChat = async (params: Record<string, unknown>) => {
       const respond = vi.fn<(ok: boolean, payload?: unknown, error?: unknown) => void>();
       const handler = expectDefined(systemAgentHandlers["openclaw.chat"], "chat handler");
-      await handler({
-        params,
-        respond,
-        context,
-        client: {
-          connId: "conn-test",
-          connect: { device: { id: "device-test" } },
-        } as GatewayClient,
-      } as never);
+      await pluginMetadataSnapshot!.run(() =>
+        handler({
+          params,
+          respond,
+          context,
+          client: {
+            connId: "conn-test",
+            connect: { device: { id: "device-test" } },
+          } as GatewayClient,
+        } as never),
+      );
       const [ok, payload, error] = expectDefined(respond.mock.calls[0], "chat response");
       return { ok, payload, error };
     };
@@ -230,6 +223,178 @@ describe("Full Access delegated chat", () => {
       approvalDatabasePath,
     };
   }
+
+  it.each([
+    "apply",
+    "closed-before",
+    "closed-after",
+    "tool-cancelled",
+    "denied",
+    "failed-correction",
+  ] as const)("settles a separately approved correction with outcome %s", async (outcome) => {
+    const {
+      engine,
+      manager,
+      authority,
+      operationalRunInstance,
+      runConfigSet,
+      broadcast,
+      callChat,
+      requested,
+    } = await createDelegatedChatFixture("repair");
+    runConfigSet.mockRejectedValueOnce(
+      new Error(
+        "Config validation failed: gateway.port: Invalid input: expected number, received string",
+      ),
+    );
+    if (outcome === "failed-correction") {
+      runConfigSet.mockRejectedValue(new Error("fixture correction failed"));
+    }
+    if (outcome === "closed-before") {
+      const resolve = engine.resolveOperatorApproval.bind(engine);
+      vi.spyOn(engine, "resolveOperatorApproval").mockImplementationOnce(async (...args) => {
+        const reply = await resolve(...args);
+        releaseAgentRunDelegatedAuthority(authority);
+        return reply;
+      });
+    }
+    const controller = new AbortController();
+    let settled = false;
+    const pending = withGatewayToolCallerIdentity(
+      {
+        agentId: "main",
+        sessionKey: "agent:main:main",
+        operationalRunInstance,
+        approvalSignals: [controller.signal],
+      },
+      () =>
+        callChat({
+          sessionId: "delegate-full",
+          message: "config set gateway.port banana",
+          delegation: { agentId: "main", sessionKey: "agent:main:main" },
+        }),
+    ).then((reply) => {
+      settled = true;
+      return reply;
+    });
+    try {
+      await requested.promise;
+      const original = expectDefined(manager.listPendingRecords()[0], "original approval");
+      const correctionRequested = createDeferred();
+      broadcast.mockImplementation((event) => {
+        if (event === "openclaw.approval.requested") {
+          correctionRequested.resolve();
+        }
+      });
+      expect(runConfigSet).not.toHaveBeenCalled();
+      expect(manager.resolve(original.id, "allow-once", "operator")).toBe(true);
+      if (outcome === "closed-before") {
+        await pending;
+        expect(manager.listPendingRecords()).toEqual([]);
+        expect(engine.getPendingOperatorProposal()).toBeNull();
+        expect(runConfigSet).toHaveBeenCalledOnce();
+        expect(
+          broadcast.mock.calls.filter(([event]) => event === "openclaw.approval.requested"),
+        ).toHaveLength(1);
+        return;
+      }
+      expect(
+        await Promise.race([
+          correctionRequested.promise.then(() => "requested"),
+          pending.then(() => "completed"),
+        ]),
+      ).toBe("requested");
+      const correction = expectDefined(manager.listPendingRecords()[0], "corrective approval");
+      expect(
+        broadcast.mock.calls.filter(([event]) => event === "openclaw.approval.requested"),
+      ).toHaveLength(2);
+      expect(correction.id).not.toBe(original.id);
+      expect(correction.request.proposalHash).not.toBe(original.request.proposalHash);
+      await runSystemAgentGatewayTask(async () => undefined);
+      expect(settled).toBe(false);
+      expect(runConfigSet).toHaveBeenCalledOnce();
+      expect(manager.resolve(original.id, "allow-once", "stale-operator")).toBe(false);
+      if (outcome === "closed-after" || outcome === "tool-cancelled" || outcome === "denied") {
+        if (outcome === "closed-after") {
+          releaseAgentRunDelegatedAuthority(authority);
+          manager.forceDenyIfRuntimeAuthorityClosed(correction.id);
+        } else if (outcome === "tool-cancelled") {
+          controller.abort();
+        } else {
+          expect(manager.resolve(correction.id, "deny", "operator")).toBe(true);
+        }
+        expect((await pending).payload).toMatchObject({
+          reply: expect.stringContaining(outcome === "denied" ? "Denied" : "cancelled"),
+        });
+        expect(runConfigSet).toHaveBeenCalledOnce();
+        expect(engine.getPendingOperatorProposal()).toBeNull();
+        expect(manager.listPendingRecords()).toEqual([]);
+        return;
+      }
+      expect(manager.resolve(correction.id, "allow-once", "operator")).toBe(true);
+      const result = await pending;
+      expect(result.payload).toMatchObject({
+        reply: expect.stringContaining("gateway.port: Invalid input"),
+      });
+      if (outcome === "failed-correction") {
+        expect(result.payload).toMatchObject({
+          reply: expect.stringContaining("stopped after one corrective attempt"),
+        });
+        expect(
+          broadcast.mock.calls.filter(([event]) => event === "openclaw.approval.requested"),
+        ).toHaveLength(2);
+      }
+      expect(runConfigSet).toHaveBeenCalledTimes(2);
+      expect(runConfigSet).toHaveBeenLastCalledWith({
+        path: "gateway.port",
+        value: "18789",
+        cliOptions: {},
+        beforePersistentApply: expect.any(Function),
+      });
+      expect(engine.getPendingOperatorProposal()).toBeNull();
+    } finally {
+      for (const record of manager.listPendingRecords()) {
+        manager.resolve(record.id, "deny", "cleanup");
+      }
+      await pending;
+    }
+  });
+
+  it.each([false, true])(
+    "bounds Full Access repair when the correction fails=%s",
+    async (fails) => {
+      const { engine, manager, operationalRunInstance, runConfigSet, callChat } =
+        await createDelegatedChatFixture("repair");
+      runConfigSet.mockRejectedValueOnce(
+        new Error("Config validation failed: fixture write rejected"),
+      );
+      if (fails) {
+        runConfigSet.mockRejectedValue(new Error("fixture correction failed"));
+      }
+      const reply = await withGatewayToolCallerIdentity(
+        {
+          agentId: "main",
+          sessionKey: "agent:main:main",
+          operationalRunInstance,
+          fullPermission: true,
+        },
+        () =>
+          callChat({
+            sessionId: "delegate-full",
+            message: "config set gateway.port banana",
+            delegation: { agentId: "main", sessionKey: "agent:main:main" },
+          }),
+      );
+      expect(runConfigSet).toHaveBeenCalledTimes(2);
+      expect(manager.listPendingRecords()).toEqual([]);
+      expect(engine.getPendingOperatorProposal()).toBeNull();
+      expect(reply.payload).toMatchObject({
+        reply: expect.stringContaining(
+          fails ? "stopped after one corrective attempt" : "[openclaw] done: config.set",
+        ),
+      });
+    },
+  );
 
   it.each([
     "allow",
@@ -420,7 +585,7 @@ describe("Full Access delegated chat", () => {
   );
 
   it.each([
-    ...(["typed", "model tool", "planner"] as const).flatMap((source) =>
+    ...(["typed", "model tool"] as const).flatMap((source) =>
       (["closed", "live", "live-restricted"] as const).map((previousRun) => ({
         source,
         previousRun,

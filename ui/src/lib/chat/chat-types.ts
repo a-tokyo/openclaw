@@ -7,6 +7,8 @@ import type {
   ChatSendIntent,
   QueueMode,
 } from "../../../../packages/gateway-protocol/src/schema/logs-chat.js";
+import type { MessageClientSource } from "../../../../src/chat/message-client-source.js";
+import type { ClawHubRecommendation } from "../../../../src/shared/clawhub-recommendations.js";
 import type { BrowserTabTarget } from "../../components/browser/browser-target.ts";
 import type { toolIcons } from "../../components/icons-tools.ts";
 import type { SenderIdentity } from "./sender-label.ts";
@@ -21,6 +23,20 @@ export type BrowserAnnotationAttachment = {
   inspectedElement: boolean;
 };
 
+export type ChatSelectionSource = {
+  text: string;
+  messageId?: string;
+  entryId?: string;
+  /** UTF-16 offsets in the source bubble’s concatenated DOM text nodes. */
+  start: number;
+  end: number;
+};
+
+export type ChatSelectionAnnotation = ChatSelectionSource & {
+  comment: string;
+  sessionKey: string;
+};
+
 export type ChatAttachment = {
   id: string;
   dataUrl?: string;
@@ -30,6 +46,7 @@ export type ChatAttachment = {
   sizeBytes?: number;
   /** UI-local context that must remain coupled to its annotated screenshot. */
   browserAnnotation?: BrowserAnnotationAttachment;
+  selectionAnnotation?: ChatSelectionAnnotation;
 };
 
 // Shared payload contract: draft and outbox storage must not import each other's runtime.
@@ -39,6 +56,7 @@ export type DurableComposerDraftAttachment = {
   fileName?: string;
   sizeBytes?: number;
   browserAnnotation?: BrowserAnnotationAttachment;
+  selectionAnnotation?: ChatSelectionAnnotation;
 };
 
 export type ChatComposerDraftRetry = {
@@ -190,6 +208,10 @@ export type ChatStreamSegment = {
   boundaryMarker?: true;
   /** Hidden durable replacement; cumulative text still owns the prefix baseline. */
   persisted?: true;
+  /** Keyed item that consumed this cumulative occurrence; late updates cannot consume another. */
+  retiredItemId?: string;
+  /** In-flight handoff owned by the retired cumulative prefix, not its live display. */
+  pendingCommentary?: { text: string; prefixLength: number };
   toolCallId?: string;
   itemId?: string;
 };
@@ -248,16 +270,45 @@ export type MessageGroup = {
   senderLabel?: string | null;
   senderSession?: { sessionKey?: string; agentId?: string } | null;
   sender?: SenderIdentity;
+  sourceClients?: MessageClientSource[];
   replyToSender?: SenderIdentity;
-  messages: Array<{ message: unknown; key: string; duplicateCount?: number }>;
+  messages: Array<{
+    message: unknown;
+    key: string;
+    duplicateCount?: number;
+    /** Rendered reply content, excluding assistant thinking tags. */
+    hasVisibleContent: boolean;
+  }>;
   visibleContent: "none" | "text" | "non-text";
   timestamp: number;
   isStreaming: boolean;
   runId?: string;
 };
 
+export type MessageImageSource = {
+  url?: string;
+  dataUrl?: string;
+  preferData?: true;
+  mimeType?: string;
+  artifactId?: string;
+  fileName?: string;
+  openUrl?: string;
+  alt?: string;
+  sizeBytes?: number;
+  width?: number;
+  height?: number;
+};
+
 /** Content item types in a normalized message */
 export type MessageContentItem =
+  | ClawHubRecommendation
+  | {
+      type: "image";
+      sources: MessageImageSource[];
+      /** Canonical image blocks consume a persisted inline-layout slot, even if empty. */
+      inlineSlot?: true;
+      expiresAtMs?: number;
+    }
   | {
       type: "text" | "tool_call" | "tool_result";
       text?: string;
@@ -315,6 +366,7 @@ export type NormalizedMessage = {
   senderLabel?: string | null;
   senderSession?: { sessionKey?: string; agentId?: string } | null;
   sender?: SenderIdentity;
+  sourceClients?: MessageClientSource[];
   audioAsVoice?: boolean;
   replyPreview?: { text: string; senderLabel?: string | null };
   replyTarget?:
@@ -332,6 +384,8 @@ export type NormalizedMessage = {
 export type ToolCard = {
   id: string;
   callId?: string;
+  runId?: string;
+  parentToolCallId?: string;
   name: string;
   args?: unknown;
   inputText?: string;
@@ -350,6 +404,8 @@ export type ToolCard = {
   messageId?: string;
   /** UI-local preview identity for results without a call or transcript id. */
   previewRevision?: string;
+  /** Tab actions can identify a route without a previewable page URL. */
+  browserTab?: BrowserTabTarget;
   preview?:
     | {
         kind: "canvas";
@@ -375,4 +431,4 @@ export type ToolCard = {
     | (BrowserTabTarget & { kind: "browser-tab"; url?: string; title?: string });
 };
 
-export type ToolCardOutcome = "running" | "succeeded" | "failed" | "unknown";
+export type ToolCardOutcome = "running" | "succeeded" | "failed" | "skipped" | "unknown";

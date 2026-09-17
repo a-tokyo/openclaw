@@ -1,3 +1,4 @@
+import "./subagent-spawn-model.mocks.shared.js";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -45,6 +46,7 @@ import {
   setDetachedTaskLifecycleRuntime,
 } from "../../../tasks/detached-task-runtime.test-support.js";
 import { captureEnv, setTestEnvValue } from "../../../test-utils/env.js";
+import { cleanupSessionStateForTest } from "../../../test-utils/session-state-cleanup.js";
 import { createOperationalRunInstanceRef } from "../../admitted-run-context.js";
 import { withGatewayToolCallerIdentity } from "../../tools/gateway-caller-context.js";
 import { subagentRuns } from "../registry/subagent-registry-memory.js";
@@ -221,6 +223,7 @@ describe("spawnSubagentDirect in-process Gateway collector launch", () => {
     resetDetachedTaskLifecycleRuntimeForTests();
     clearRuntimeConfigSnapshot();
     clearConfigCache();
+    await cleanupSessionStateForTest({ stateDir });
     envSnapshot.restore();
     if (stateDir) {
       await rm(stateDir, { recursive: true, force: true });
@@ -539,7 +542,11 @@ describe("spawnSubagentDirect in-process Gateway collector launch", () => {
     });
     const requests: Array<{ method: string; params: Record<string, unknown> }> = [];
     let launchCount = 0;
+    const transport = vi.fn(async () => {
+      throw new Error("Hosted collector cleanup must not open a Gateway transport");
+    });
     subagentSpawnTesting.setDepsForTest({
+      callGateway: transport,
       dispatchGatewayMethodInProcess: async <T>(
         method: string,
         params: Record<string, unknown>,
@@ -615,6 +622,7 @@ describe("spawnSubagentDirect in-process Gateway collector launch", () => {
         swarmLaunchPending: false,
       });
     });
+    expect(transport).not.toHaveBeenCalled();
   });
 
   it("hands a registered collector launch to Gateway as the host", async () => {
@@ -878,7 +886,7 @@ describe("spawnSubagentDirect in-process Gateway collector launch", () => {
 
   it("keeps the queued registry row when a collector starts out of process", async () => {
     const gatewayContext = makeGatewayContext();
-    const trackingModes: string[] = [];
+    const trackingModes: ReturnType<typeof resolveGatewayAgentTaskTrackingMode>[] = [];
     subagentSpawnTesting.setDepsForTest({
       hasInProcessGatewayContext: () => false,
       callGateway: async <T>(request: { method: string; params?: unknown }) => {

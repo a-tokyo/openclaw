@@ -1,4 +1,4 @@
-import type { TemplateResult } from "lit";
+import type { nothing, TemplateResult } from "lit";
 import type { SystemInfoResult } from "../../../../packages/gateway-protocol/src/index.js";
 import type { QueueMode } from "../../../../packages/gateway-protocol/src/schema/logs-chat.js";
 import type {
@@ -19,7 +19,7 @@ import type { WebPushSnapshot } from "../../app/web-push.ts";
 import type { JsonSchema } from "../../components/config-form.shared.ts";
 import type { ConfigSchemaAnalysis } from "../../components/config-form.ts";
 import type { Locale } from "../../i18n/index.ts";
-import type { RealtimeTalkInputDevice } from "../chat/realtime-talk-input.ts";
+import type { RealtimeTalkInputDevice } from "../chat/talk/input.ts";
 import type { SessionObserverModelSelection } from "./session-observer-settings.ts";
 
 type SettingsMediaDeviceState = {
@@ -87,6 +87,8 @@ export type ConfigProps = {
   /** Control UI rows that belong to the active schema section but are not Gateway config. */
   sectionPrelude?: TemplateResult;
   showSectionDocs?: boolean;
+  /** Curated content inside the active section; receives the canonical schema editor. */
+  renderSection?: (editor: TemplateResult | typeof nothing) => TemplateResult;
   formValue: Record<string, unknown> | null;
   originalValue: Record<string, unknown> | null;
   activeSection: string | null;
@@ -194,6 +196,9 @@ export type ConfigProps = {
   composerHoldToRecord?: boolean;
   setComposerHoldToRecord?: (enabled: boolean) => void;
   gatewayUrl: string;
+  pluginsHref?: string;
+  installedSessionSourcePluginIds?: ReadonlySet<string> | null;
+  sessionSourcePluginsLoading?: boolean;
   assistantName: string;
   configPath?: string | null;
   navRootLabel?: string;

@@ -58,8 +58,22 @@ type SessionListDeliveryContext = {
   threadId?: string | number;
 };
 
+type SessionInventoryMetadata = Pick<
+  SessionRow,
+  | "createdActor"
+  | "owner"
+  | "worktree"
+  | "repositoryWorkspaceId"
+  | "repository"
+  | "execCwd"
+  | "spawnedCwd"
+  | "spawnedWorkspaceDir"
+  | "projectId"
+  | "workspaceDir"
+>;
+
 /** Full Gateway session row consumed by session orchestration internals. */
-export type GatewaySessionListRow = {
+export type GatewaySessionListRow = SessionInventoryMetadata & {
   key: string;
   agentId?: string;
   classification: NonNullable<SessionRow["classification"]>;
@@ -115,7 +129,7 @@ export type GatewaySessionListRow = {
 };
 
 /** Focused model-facing row returned by sessions_list. */
-export type SessionListRow = {
+export type SessionListRow = SessionInventoryMetadata & {
   key: string;
   sessionId?: string;
   agentId: string;
@@ -144,6 +158,7 @@ export type SessionListRow = {
 export function resolveSessionToolContext(opts?: {
   agentId?: string;
   agentSessionKey?: string;
+  sessionReadScopeKey?: string;
   requesterAgentIdOverride?: string;
   sandboxed?: boolean;
   config?: OpenClawConfig;
@@ -152,13 +167,14 @@ export function resolveSessionToolContext(opts?: {
   return {
     cfg,
     a2aPolicy: createAgentToAgentPolicy(cfg),
-    sessionVisibility: resolveEffectiveSessionToolsVisibility({
-      cfg,
-      sandboxed: opts?.sandboxed === true,
-    }),
+    // Only read-tool constructors accept this host-bound scope. The temporary
+    // auxiliary run keeps its execution identity but can read just the observed session.
+    sessionVisibility: opts?.sessionReadScopeKey
+      ? ("self" as const)
+      : resolveEffectiveSessionToolsVisibility({ cfg, sandboxed: opts?.sandboxed === true }),
     ...resolveSandboxedSessionToolContext({
       cfg,
-      agentSessionKey: opts?.agentSessionKey,
+      agentSessionKey: opts?.sessionReadScopeKey ?? opts?.agentSessionKey,
       requesterAgentId: opts?.requesterAgentIdOverride ?? opts?.agentId,
       sandboxed: opts?.sandboxed,
     }),

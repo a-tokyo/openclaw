@@ -283,7 +283,6 @@ type PackageLookupCall = {
 
 type ArchiveInstallCall = {
   archivePath?: string;
-  dangerouslyForceUnsafeInstall?: boolean;
   expectedPluginId?: string;
   onInstallPolicyWarning?: unknown;
   installPolicyRequest?: {
@@ -1244,6 +1243,7 @@ describe("installPluginFromClawHub", () => {
         sha256: DEMO_CLAWPACK_SHA256,
         npmIntegrity: "sha512-clawpack",
         npmShasum: "1".repeat(40),
+        size: 4096,
       } as unknown as ClawHubResolvedArtifact,
     });
     downloadClawHubPackageArchiveMock.mockResolvedValueOnce({
@@ -1268,6 +1268,7 @@ describe("installPluginFromClawHub", () => {
     expect(success.clawhub?.npmIntegrity).toBe("sha512-clawpack");
     expect(success.clawhub?.npmShasum).toBe("1".repeat(40));
     expect(success.clawhub?.clawpackSha256).toBe(DEMO_CLAWPACK_SHA256);
+    expect(success.clawhub?.clawpackSize).toBe(4096);
     expect(fetchClawHubPackageVersionMock).not.toHaveBeenCalled();
     expect(archiveDownloadCall().artifact).toBe("clawpack");
     expect(archiveDownloadCall().name).toBe("demo");
@@ -1895,16 +1896,6 @@ describe("installPluginFromClawHub", () => {
     expect(archiveCleanupMock).not.toHaveBeenCalled();
   });
 
-  it("passes dangerous force unsafe install through to archive installs", async () => {
-    await installPluginFromClawHub({
-      spec: "clawhub:demo",
-      dangerouslyForceUnsafeInstall: true,
-    });
-
-    expect(archiveInstallCall().archivePath).toBe("/tmp/clawhub-demo/archive.zip");
-    expect(archiveInstallCall().dangerouslyForceUnsafeInstall).toBe(true);
-  });
-
   it("passes install policy acknowledgement through to archive installs", async () => {
     const onInstallPolicyWarning = vi.fn().mockResolvedValue({ status: "approved" });
 
@@ -1914,6 +1905,7 @@ describe("installPluginFromClawHub", () => {
     });
 
     expect(archiveInstallCall().onInstallPolicyWarning).toBe(onInstallPolicyWarning);
+    expect(archiveInstallCall().archivePath).toBe("/tmp/clawhub-demo/archive.zip");
   });
 
   it("cleans up the downloaded archive even when archive install fails", async () => {

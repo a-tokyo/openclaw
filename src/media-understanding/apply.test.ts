@@ -4,6 +4,7 @@ import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { createDeferred } from "../../test/helpers/promise.js";
 import type { MsgContext } from "../auto-reply/templating.js";
 import type { OpenClawConfig } from "../config/types.js";
 import { resolvePreferredOpenClawTmpDir } from "../infra/tmp-openclaw-dir.js";
@@ -32,14 +33,18 @@ const readRemoteMediaBufferMock = vi.hoisted(() => vi.fn());
 const runFfmpegMock = vi.hoisted(() => vi.fn());
 const convertHeicToJpegMock = vi.hoisted(() => vi.fn());
 const runExecMock = vi.hoisted(() => vi.fn());
+const extractFileContentFromBufferMock = vi.hoisted(() => vi.fn());
 
 let applyMediaUnderstanding: typeof import("./apply.js").applyMediaUnderstanding;
-let clearMediaUnderstandingBinaryCacheForTests: typeof import("./runner.test-support.js").clearMediaUnderstandingBinaryCacheForTests;
 const mockedResolveApiKey = resolveApiKeyForProviderCoreMock;
 const mockedReadRemoteMediaBuffer = readRemoteMediaBufferMock;
 const mockedRunFfmpeg = runFfmpegMock;
 const mockedConvertHeicToJpeg = convertHeicToJpegMock;
 const mockedRunExec = runExecMock;
+const mockedExtractFileContentFromBuffer = extractFileContentFromBufferMock;
+let actualExtractFileContentFromBuffer:
+  | typeof import("../media/input-files.js").extractFileContentFromBuffer
+  | undefined;
 
 const TEMP_MEDIA_PREFIX = "openclaw-media-";
 const SHA256_HEX_PATTERN = /^[0-9a-f]{64}$/;
@@ -350,10 +355,20 @@ describe("applyMediaUnderstanding", () => {
     vi.doMock("../media/media-services.js", () => ({
       runFfmpeg: runFfmpegMock,
       convertHeicToJpeg: convertHeicToJpegMock,
+      readImageMetadataFromHeader: () => null,
     }));
     vi.doMock("../process/exec.js", () => ({
       runExec: runExecMock,
     }));
+    vi.doMock("../media/input-files.js", async () => {
+      const actual =
+        await vi.importActual<typeof import("../media/input-files.js")>("../media/input-files.js");
+      actualExtractFileContentFromBuffer = actual.extractFileContentFromBuffer;
+      return {
+        ...actual,
+        extractFileContentFromBuffer: extractFileContentFromBufferMock,
+      };
+    });
     vi.doMock("./provider-registry.js", async () => {
       const actual =
         await vi.importActual<typeof import("./provider-registry.js")>("./provider-registry.js");
@@ -385,7 +400,6 @@ describe("applyMediaUnderstanding", () => {
       };
     });
     ({ applyMediaUnderstanding } = await import("./apply.js"));
-    ({ clearMediaUnderstandingBinaryCacheForTests } = await import("./runner.test-support.js"));
 
     const baseDir = resolvePreferredOpenClawTmpDir();
     await fs.mkdir(baseDir, { recursive: true });
@@ -405,6 +419,12 @@ describe("applyMediaUnderstanding", () => {
     mockedConvertHeicToJpeg.mockReset();
     mockedConvertHeicToJpeg.mockResolvedValue(Buffer.from("jpeg-normalized"));
     mockedRunExec.mockReset();
+    // Extraction stays real unless a case overrides it; the mock exists so
+    // scanned-PDF render outcomes can be produced without the extract plugin.
+    mockedExtractFileContentFromBuffer.mockReset();
+    if (actualExtractFileContentFromBuffer) {
+      mockedExtractFileContentFromBuffer.mockImplementation(actualExtractFileContentFromBuffer);
+    }
     mockedReadRemoteMediaBuffer.mockResolvedValue({
       buffer: createSafeAudioFixtureBuffer(2048),
       contentType: "audio/ogg",
@@ -896,10 +916,9 @@ describe("applyMediaUnderstanding", () => {
   });
 
   it("auto-detects sherpa for audio when binary and model files are available", async () => {
-    clearMediaUnderstandingBinaryCacheForTests();
     const binDir = await createTempMediaDir();
     const modelDir = await createTempMediaDir();
-    await createMockExecutable(binDir, "sherpa-onnx-offline");
+    const executablePath = await createMockExecutable(binDir, "sherpa-onnx-offline");
     await fs.writeFile(path.join(modelDir, "tokens.txt"), "a");
     await fs.writeFile(path.join(modelDir, "encoder.onnx"), "a");
     await fs.writeFile(path.join(modelDir, "decoder.onnx"), "a");
@@ -920,7 +939,7 @@ describe("applyMediaUnderstanding", () => {
 
     expect(ctx.Transcript).toBe("sherpa ok");
     const [command, args, options] = getRunExecCall();
-    expect(command).toBe("sherpa-onnx-offline");
+    expect(command).toBe(executablePath);
     expect(args).toEqual([
       `--tokens=${path.join(modelDir, "tokens.txt")}`,
       `--encoder=${path.join(modelDir, "encoder.onnx")}`,
@@ -932,10 +951,9 @@ describe("applyMediaUnderstanding", () => {
   });
 
   it("skips auto-detected sherpa audio when structured output has empty text", async () => {
-    clearMediaUnderstandingBinaryCacheForTests();
     const binDir = await createTempMediaDir();
     const modelDir = await createTempMediaDir();
-    await createMockExecutable(binDir, "sherpa-onnx-offline");
+    const executablePath = await createMockExecutable(binDir, "sherpa-onnx-offline");
     await fs.writeFile(path.join(modelDir, "tokens.txt"), "a");
     await fs.writeFile(path.join(modelDir, "encoder.onnx"), "a");
     await fs.writeFile(path.join(modelDir, "decoder.onnx"), "a");
@@ -959,14 +977,13 @@ describe("applyMediaUnderstanding", () => {
     expect(ctx.Transcript).toBeUndefined();
     expect(ctx.Body).toBe("[Audio attachment could not be analyzed]");
     const [command] = getRunExecCall();
-    expect(command).toBe("sherpa-onnx-offline");
+    expect(command).toBe(executablePath);
   });
 
   it("auto-detects whisper-cli when sherpa is unavailable", async () => {
-    clearMediaUnderstandingBinaryCacheForTests();
     const binDir = await createTempMediaDir();
     const modelDir = await createTempMediaDir();
-    await createMockExecutable(binDir, "whisper-cli");
+    const executablePath = await createMockExecutable(binDir, "whisper-cli");
     const modelPath = path.join(modelDir, "tiny.bin");
     await fs.writeFile(modelPath, "model");
 
@@ -985,8 +1002,8 @@ describe("applyMediaUnderstanding", () => {
     );
 
     expect(ctx.Transcript).toBe("whisper cpp ok");
-    const [command, args, options] = getRunExecCallForCommand("whisper-cli");
-    expect(command).toBe("whisper-cli");
+    const [command, args, options] = getRunExecCallForCommand(executablePath);
+    expect(command).toBe(executablePath);
     if (!Array.isArray(args)) {
       throw new Error("expected whisper-cli args");
     }
@@ -1008,10 +1025,9 @@ describe("applyMediaUnderstanding", () => {
   });
 
   it("transcodes non-wav audio before auto-detected whisper-cli runs", async () => {
-    clearMediaUnderstandingBinaryCacheForTests();
     const binDir = await createTempMediaDir();
     const modelDir = await createTempMediaDir();
-    await createMockExecutable(binDir, "whisper-cli");
+    const executablePath = await createMockExecutable(binDir, "whisper-cli");
     const modelPath = path.join(modelDir, "tiny.bin");
     await fs.writeFile(modelPath, "model");
 
@@ -1061,8 +1077,8 @@ describe("applyMediaUnderstanding", () => {
     expect(String(ffmpegArgs[11])).toContain("telegram-voice.wav");
     expect(String(ffmpegArgs[11]).endsWith(".part")).toBe(true);
 
-    const [command, args, options] = getRunExecCallForCommand("whisper-cli");
-    expect(command).toBe("whisper-cli");
+    const [command, args, options] = getRunExecCallForCommand(executablePath);
+    expect(command).toBe(executablePath);
     if (!Array.isArray(args)) {
       throw new Error("expected whisper-cli transcode args");
     }
@@ -1073,7 +1089,6 @@ describe("applyMediaUnderstanding", () => {
   });
 
   it("skips audio auto-detect when no supported binaries or provider keys are available", async () => {
-    clearMediaUnderstandingBinaryCacheForTests();
     const emptyBinDir = await createTempMediaDir();
     const isolatedAgentDir = await createTempMediaDir();
     const ctx = await createAudioCtx({
@@ -1106,7 +1121,6 @@ describe("applyMediaUnderstanding", () => {
   });
 
   it("does not probe Gemini CLI during media auto-detect", async () => {
-    clearMediaUnderstandingBinaryCacheForTests();
     const binDir = await createTempMediaDir();
     const isolatedAgentDir = await createTempMediaDir();
     await createMockExecutable(binDir, "gemini");
@@ -1140,7 +1154,6 @@ describe("applyMediaUnderstanding", () => {
   });
 
   it("does not auto-detect Antigravity CLI for images", async () => {
-    clearMediaUnderstandingBinaryCacheForTests();
     const binDir = await createTempMediaDir();
     await createMockExecutable(binDir, "agy");
     const imagePath = await createTempMediaFile({
@@ -1169,7 +1182,6 @@ describe("applyMediaUnderstanding", () => {
   });
 
   it("suppresses markers only for images the ACP caller actually delivers", async () => {
-    clearMediaUnderstandingBinaryCacheForTests();
     const binDir = await createTempMediaDir();
     await createMockExecutable(binDir, "agy");
     const deliveredPath = await createTempMediaFile({
@@ -1593,6 +1605,7 @@ describe("applyMediaUnderstanding", () => {
       outcome: "no-attachment",
       attachments: [],
       attachmentDispositions: {},
+      attachmentProcessing: {},
     });
   });
 
@@ -2165,6 +2178,82 @@ describe("applyMediaUnderstanding", () => {
     expectPolicyRejectedFileApplied({ ctx, result, mime: "application/pdf" });
   });
 
+  it.each(["completed", "timed-out"] as const)(
+    "preserves earlier provider bytes when a %s PDF extractor mutates its input",
+    async (outcome) => {
+      const original = Buffer.alloc(2048, 0x20);
+      original.write("%PDF-1.7\nfixture");
+      const ctx = await createAudioCtx({
+        fileName: "mutable.txt",
+        mediaType: "audio/ogg",
+        content: original,
+      });
+      const followingFile = await createTempMediaFile({
+        fileName: "following.txt",
+        content: "Following document survives",
+      });
+      ctx.media?.push({ path: followingFile, contentType: "text/plain" });
+      let borrowed: Buffer | undefined;
+      const transcribeAudio = vi.fn<NonNullable<MediaUnderstandingProvider["transcribeAudio"]>>(
+        async (request) => {
+          borrowed = request.buffer;
+          throw new Error("Not an audio document");
+        },
+      );
+      const started = createDeferred();
+      const finish = createDeferred();
+      const finished = createDeferred();
+      let extractionInput: Buffer | undefined;
+      const pdf = await import("../media/pdf-extract.js");
+      const extract = vi.spyOn(pdf, "extractPdfContent").mockImplementation(async ({ buffer }) => {
+        extractionInput = buffer;
+        started.resolve();
+        if (outcome === "timed-out") {
+          await finish.promise;
+        }
+        buffer.fill(0);
+        finished.resolve();
+        return { text: "extracted PDF", images: [] };
+      });
+      vi.useFakeTimers();
+      try {
+        const application = applyMediaUnderstanding({
+          ctx,
+          cfg: {
+            ...createGroqAudioConfig(),
+            gateway: { http: { endpoints: { responses: { files: { timeoutMs: 10 } } } } },
+          },
+          providers: { groq: { id: "groq", transcribeAudio } },
+        });
+        await started.promise;
+        if (outcome === "timed-out") {
+          await vi.advanceTimersByTimeAsync(10);
+        }
+        const result = await application;
+        expect(result.appliedFile).toBe(true);
+        expect(transcribeAudio).toHaveBeenCalledOnce();
+        expect(ctx.Body).toContain("Following document survives");
+        if (outcome === "timed-out") {
+          expect(ctx.Body).toContain("[Attachment could not be read]");
+          expect(extractionInput).toEqual(original);
+          finish.resolve();
+          await finished.promise;
+          expect(ctx.Body).not.toContain("extracted PDF");
+        } else {
+          expect(ctx.Body).toContain("extracted PDF");
+        }
+        expect(borrowed).toEqual(original);
+      } finally {
+        finish.resolve();
+        if (extractionInput) {
+          await finished.promise;
+        }
+        extract.mockRestore();
+        vi.useRealTimers();
+      }
+    },
+  );
+
   it("respects configured allowedMimes for text-like attachments", async () => {
     const tsvText = "a\tb\tc\n1\t2\t3";
     const tsvPath = await createTempMediaFile({
@@ -2323,6 +2412,47 @@ describe("applyMediaUnderstanding", () => {
     expect(ctx.Body).toContain('<file name="totally-not-a-spreadsheet.txt"');
   });
 
+  it.each(["files-only", "audio-and-files"] as const)(
+    "delivers pasted text without image interpretation in %s mode",
+    async (processingMode) => {
+      const filePath = await createTempMediaFile({
+        fileName: "pasted-text-123.txt",
+        content: "Synthetic diagnostic: connection refused",
+      });
+      const imagePath = await createTempMediaFile({ fileName: "photo.jpg", content: "image" });
+      const describeImage = vi.fn(async () => ({ text: "image description" }));
+      const ctx: MsgContext = {
+        Body: "Is this related?",
+        media: [
+          { path: filePath, contentType: "text/plain" },
+          { path: imagePath, contentType: "image/jpeg" },
+        ],
+      };
+      const result = await applyMediaUnderstanding({
+        ctx,
+        cfg: {
+          tools: {
+            media: {
+              models: [{ provider: "openai", model: "gpt-5.4", capabilities: ["image"] }],
+              image: { enabled: true },
+            },
+          },
+        },
+        providers: { openai: { id: "openai", describeImage } },
+        processingMode,
+      });
+      expect(result.appliedFile).toBe(true);
+      expect(result.decisions.map((decision) => decision.capability)).toEqual(
+        processingMode === "files-only" ? [] : ["audio"],
+      );
+      expect(ctx.agentText).toContain("Is this related?");
+      expect(ctx.agentText).toContain("Synthetic diagnostic: connection refused");
+      expect(ctx.agentText).toContain('<<<EXTERNAL_UNTRUSTED_CONTENT id="');
+      expect(describeImage).not.toHaveBeenCalled();
+      expect(result.appliedImage).toBe(false);
+    },
+  );
+
   it("wraps extracted file text as untrusted external content", async () => {
     const filePath = await createTempMediaFile({
       fileName: "prompt.txt",
@@ -2450,6 +2580,48 @@ describe("applyMediaUnderstanding", () => {
       mime: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     });
     expect(ctx.Body).not.toContain("approved local file path");
+  });
+
+  it("keeps agent enrichment separate when its setter changes published media text", async () => {
+    const ctx = await createAudioCtx({ body: "caption" });
+    const filePath = await createTempMediaFile({
+      fileName: "accessor-notes.txt",
+      content: "retained file context",
+    });
+    ctx.media = [...(ctx.media ?? []), { path: filePath, contentType: "text/plain" }];
+    let agentText: string | undefined;
+    Object.defineProperty(ctx, "agentText", {
+      configurable: true,
+      enumerable: true,
+      get: () => agentText,
+      set: (value: string | undefined) => {
+        agentText = value;
+        const output = ctx.MediaUnderstanding?.[0];
+        if (output) {
+          output.text = "changed transcript";
+        }
+      },
+    });
+
+    const result = await applyMediaUnderstanding({
+      ctx,
+      cfg: createGroqAudioConfig(),
+      providers: createGroqProviders("first transcript"),
+      processingMode: "audio-and-files",
+    });
+
+    expect(result).toMatchObject({ appliedAudio: true, appliedFile: true });
+    expect(ctx.agentText).toContain("Transcript:\nfirst transcript");
+    expect(ctx.agentText).not.toContain("changed transcript");
+    expect(ctx.Body).toContain("Transcript:\nchanged transcript");
+    expect(ctx.Body).not.toContain("first transcript");
+    expect(ctx.BodyForAgent).toBe(ctx.agentText);
+    expect(ctx.Transcript).toBe("first transcript");
+    for (const body of [ctx.agentText, ctx.Body]) {
+      expect(body).toContain('<file name="accessor-notes.txt" mime="text/plain">');
+      expect(body).toContain("retained file context");
+    }
+    await expect(fs.readFile(filePath, "utf8")).resolves.toBe("retained file context");
   });
 
   it.each(["prepared transcript", ""])(
@@ -2602,6 +2774,107 @@ describe("applyMediaUnderstanding", () => {
     expect(result.appliedFile).toBe(true);
     expect(ctx.Body).toContain("<file");
     expect(ctx.Body).toContain("vendor-json");
+  });
+
+  describe("renderInboundDocumentContext", () => {
+    it("renders a document attachment without mutating ctx", async () => {
+      const { renderInboundDocumentContext } = await import("./file-context.js");
+      const mediaPath = await createTempMediaFile({
+        fileName: "steer-note.txt",
+        content: "document body for the steered run",
+      });
+      const ctx: MsgContext = {
+        Body: "see attached",
+        media: [{ path: mediaPath, contentType: "text/plain" }],
+      };
+
+      const context = await renderInboundDocumentContext({ ctx, cfg: {} as OpenClawConfig });
+
+      expect(context?.text).toContain('<file name="steer-note.txt" mime="text/plain">');
+      expect(context?.text).toContain("document body for the steered run");
+      expect(context?.images).toEqual([]);
+      // Read-only on ctx: a rejected steer falls back to reply dispatch, which
+      // must extract exactly once through the full pipeline.
+      expect(ctx.Body).toBe("see attached");
+      expect(ctx.media?.[0]?.path).toBe(mediaPath);
+    });
+
+    it("returns empty for image attachments owned by the injected images channel", async () => {
+      const { renderInboundDocumentContext } = await import("./file-context.js");
+      const mediaPath = await createTempMediaFile({
+        fileName: "steer.png",
+        content: createSafeAudioFixtureBuffer(16),
+      });
+      const ctx: MsgContext = {
+        Body: "see attached",
+        media: [{ path: mediaPath, contentType: "image/png" }],
+      };
+
+      const context = await renderInboundDocumentContext({ ctx, cfg: {} as OpenClawConfig });
+
+      expect(context?.text).toBe("");
+      expect(context?.images).toEqual([]);
+      expect(ctx.Body).toBe("see attached");
+    });
+
+    it("returns empty context when the steer carries no attachments", async () => {
+      const { renderInboundDocumentContext } = await import("./file-context.js");
+      const context = await renderInboundDocumentContext({
+        ctx: { Body: "plain steer" } as MsgContext,
+        cfg: {} as OpenClawConfig,
+      });
+      expect(context).toEqual({ text: "", images: [] });
+    });
+
+    it("returns rendered PDF page images for a scanned document", async () => {
+      const { renderInboundDocumentContext } = await import("./file-context.js");
+      const mediaPath = await createTempMediaFile({
+        fileName: "scan.pdf",
+        content: Buffer.from("%PDF-1.4\n", "utf8"),
+      });
+      mockedExtractFileContentFromBuffer.mockResolvedValueOnce({
+        text: "",
+        images: [
+          { type: "image", data: "page-1-bytes", mimeType: "image/png" },
+          { type: "image", data: "page-2-bytes", mimeType: "image/png" },
+        ],
+      });
+      const ctx: MsgContext = {
+        Body: "see attached",
+        media: [{ path: mediaPath, contentType: "application/pdf" }],
+      };
+
+      const context = await renderInboundDocumentContext({ ctx, cfg: createMediaDisabledConfig() });
+
+      // The marker alone would tell the model the document exists while the
+      // injected images channel carries nothing; the pages must ride along.
+      expect(context?.text).toContain("[PDF content rendered to images]");
+      expect(context?.images).toEqual([
+        { type: "image", data: "page-1-bytes", mimeType: "image/png", attachmentIndex: 0 },
+        { type: "image", data: "page-2-bytes", mimeType: "image/png", attachmentIndex: 0 },
+      ]);
+    });
+
+    it("applies the skipped-attachment marker budget to steer blocks", async () => {
+      const { renderInboundDocumentContext } = await import("./file-context.js");
+      const olePayload = Buffer.from("Root Entry WordDocument legacy preview", "utf8");
+      const media: { path: string; contentType: string }[] = [];
+      for (let i = 0; i < 7; i += 1) {
+        const filePath = await createTempMediaFile({
+          fileName: `legacy-${i}.doc`,
+          content: olePayload,
+        });
+        media.push({ path: filePath, contentType: "application/msword" });
+      }
+      const ctx: MsgContext = { Body: "see attached", media };
+
+      const context = await renderInboundDocumentContext({ ctx, cfg: createMediaDisabledConfig() });
+
+      const markerCount = context?.text.split("[Unsupported document format").length ?? 0;
+      expect(markerCount - 1).toBe(5);
+      expect(context?.text).toContain("[2 more attachments skipped]");
+      expect(context?.images).toEqual([]);
+    });
   });
 });
 /* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */
