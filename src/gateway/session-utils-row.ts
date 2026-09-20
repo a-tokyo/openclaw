@@ -90,6 +90,10 @@ import { projectWorkerPlacementAgentRuntime } from "./worker-environments/placem
 export function readSessionRowInputs(params: {
   cfg: OpenClawConfig;
   storePath: string;
+  storeAgentId?: string;
+  active?: boolean;
+  /** A supplied resident model avoids transcript reads; null uses only stored model facts. */
+  activeModel?: { provider: string; model: string } | null;
   store: Record<string, SessionEntry>;
   modelSource?: GatewaySessionModelSource;
   key: string;
@@ -154,6 +158,7 @@ export function readSessionRowInputs(params: {
           maxTranscriptBytes: params.transcriptUsageMaxBytes,
           rowContext,
           agentId,
+          storeAgentId: params.storeAgentId,
         })
       : undefined;
   const { provider, model } = selectedModel;
@@ -167,6 +172,9 @@ export function readSessionRowInputs(params: {
   // Display aliases do not change the selected route's catalog or runtime policy.
   const activeModel = resolveGatewaySessionActiveModel({
     cfg,
+    active: params.active,
+    activeModel: params.activeModel,
+    storeAgentId: params.storeAgentId,
     selectedModel,
     projectedAgentRuns: (rowContext.projectedAgentRuns ??= buildProjectedAgentRunIndex()),
     entry,
@@ -180,7 +188,7 @@ export function readSessionRowInputs(params: {
   let lastMessagePreview: string | undefined;
   if (entry?.sessionId && (params.includeDerivedTitles || params.includeLastMessage)) {
     const fields = readScopedSessionTitleFieldsFromTranscript({
-      agentId,
+      agentId: params.storeAgentId ?? agentId,
       sessionEntry: entry,
       sessionId: entry.sessionId,
       sessionKey: key,
@@ -342,10 +350,12 @@ export function buildGatewaySessionRow(
   return presentSessionRow(materializeSessionRow(inputs), presentation);
 }
 
-export function resolveGatewaySessionActiveModel(params: {
+function resolveGatewaySessionActiveModel(params: {
   cfg: OpenClawConfig;
   active?: boolean;
+  activeModel?: { provider: string; model: string } | null;
   agentId?: string;
+  storeAgentId?: string;
   sessionId?: string;
   sessionKey: string;
   projectedAgentRuns: ProjectedAgentRunIndex;
@@ -382,21 +392,26 @@ export function resolveGatewaySessionActiveModel(params: {
     return undefined;
   }
 
+  const fallbackEntry =
+    params.activeModel === undefined
+      ? readSessionFallbackModel({
+          selectedProvider: selectedModel.provider,
+          selectedModel: selectedModel.model,
+          sessionEntry: params.entry,
+          config: params.cfg,
+          sessionScope: {
+            agentId: params.storeAgentId ?? params.agentId,
+            sessionKey: params.sessionKey,
+            storePath: params.storePath,
+          },
+        })
+      : params.activeModel
+        ? { modelProvider: params.activeModel.provider, model: params.activeModel.model }
+        : undefined;
   const { selected, active } = resolveSelectedAndActiveModel({
     selectedProvider: selectedModel.provider,
     selectedModel: selectedModel.model,
-    sessionEntry:
-      readSessionFallbackModel({
-        selectedProvider: selectedModel.provider,
-        selectedModel: selectedModel.model,
-        sessionEntry: params.entry,
-        config: params.cfg,
-        sessionScope: {
-          agentId: params.agentId,
-          sessionKey: params.sessionKey,
-          storePath: params.storePath,
-        },
-      }) ?? params.entry,
+    sessionEntry: fallbackEntry ?? params.entry,
   });
   return resolveActiveFallbackState({
     selectedModelRef: selected.label,

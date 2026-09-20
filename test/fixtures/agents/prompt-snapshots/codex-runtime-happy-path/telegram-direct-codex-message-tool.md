@@ -254,8 +254,8 @@ This is the deterministic model-bound layer stack OpenClaw can snapshot for the 
     "roughTokens": 0
   },
   "dynamicToolsJson": {
-    "chars": 65182,
-    "roughTokens": 16296
+    "chars": 64885,
+    "roughTokens": 16222
   },
   "openClawDeveloperInstructions": {
     "chars": 2629,
@@ -266,16 +266,16 @@ This is the deterministic model-bound layer stack OpenClaw can snapshot for the 
     "roughTokens": 127
   },
   "totalTextOnly": {
-    "chars": 26463,
-    "roughTokens": 6616
+    "chars": 26549,
+    "roughTokens": 6638
   },
   "totalWithDynamicToolsJson": {
-    "chars": 91647,
-    "roughTokens": 22912
+    "chars": 91436,
+    "roughTokens": 22859
   },
   "userInputText": {
-    "chars": 793,
-    "roughTokens": 199
+    "chars": 879,
+    "roughTokens": 220
   }
 }
 ```
@@ -543,6 +543,7 @@ For the exact current time, use `session_status`.</openclaw_temporal_context>
 ### User: Turn Input Text
 
 ````text
+[OpenClaw conversation info: sender={"id":"1000001","name":"Pash","username":"pash"}]
 OpenClaw runtime context for this turn:
 Treat this OpenClaw-provided context as supporting project/user reference for the current request.
 

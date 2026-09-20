@@ -140,7 +140,7 @@ export type ChatProps = Omit<
     pullRequestsStatus?: ControlUiSessionPullRequestSnapshot["status"];
     pullRequestsExpanded?: boolean;
     onOpenSessionDiff?: () => void;
-    onExpandPullRequests?: () => void;
+    onTogglePullRequests?: () => void;
     onDismissPullRequest?: (pullRequest: ControlUiSessionPullRequest) => void;
     githubPublication?: import("../../lib/sessions/github-publication-controller.ts").GitHubPublicationView;
   };
@@ -217,7 +217,7 @@ export function renderChat(props: ChatProps) {
             ? (selection, anchorRect) => {
                 const focusComposer = () =>
                   props.transcript.scrollElement
-                    ?.closest(".card.chat")
+                    ?.closest(".chat")
                     ?.querySelector<HTMLElement>(".agent-chat__composer-combobox > textarea")
                     ?.focus({ preventScroll: true });
                 showChatAnnotationEditor({
@@ -258,7 +258,7 @@ export function renderChat(props: ChatProps) {
         // Portaled menus can outlive a render; resolve focus from the current session owner.
         onFocusComposer: () =>
           props.transcript.scrollElement
-            ?.closest(".card.chat")
+            ?.closest(".chat")
             ?.querySelector<HTMLElement>(
               "openclaw-plugin-view[data-plugin-composer], .agent-chat__composer-combobox > textarea",
             )
@@ -365,7 +365,7 @@ export function renderChat(props: ChatProps) {
 
   return html`
     <section
-      class="card chat"
+      class="chat"
       style=${styleMap(
         props.chatMessageMaxWidth
           ? {
@@ -506,7 +506,7 @@ export function renderChat(props: ChatProps) {
                     branch: props.pullRequestsBranch,
                     status: props.pullRequestsStatus ?? "ready",
                     expanded: props.pullRequestsExpanded === true,
-                    onExpand: () => props.onExpandPullRequests?.(),
+                    onToggle: () => props.onTogglePullRequests?.(),
                     onDismiss: (pullRequest) => props.onDismissPullRequest?.(pullRequest),
                     onOpenSessionDiff: props.onOpenSessionDiff,
                     publication: props.githubPublication,

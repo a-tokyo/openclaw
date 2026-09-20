@@ -4,10 +4,16 @@ import { toErrorObject } from "@openclaw/normalization-core/error-coercion";
 import { killProcessTree } from "../kill-tree.js";
 import { GRACEFUL_CANCEL_TIMEOUT_MS } from "../supervisor/cancellation-policy.js";
 import { hasLiveOwnedProcessGroupMembers } from "../supervisor/service-child-group-ownership.js";
+import { serializeExecaError } from "./execa-protocol.js";
 import { startBrokerExeca } from "./execa-worker.js";
 import { createBrokerReceiver } from "./ipc.js";
 import { holdPipeForTransfer, takePipePrefix } from "./pipe.js";
-import { serializeBrokerError, type BrokerRequest, type BrokerResponse } from "./protocol.js";
+import {
+  serializeBrokerError,
+  SpawnBrokerError,
+  type BrokerRequest,
+  type BrokerResponse,
+} from "./protocol.js";
 import { createWorkerSender } from "./worker-sender.js";
 
 type ExecaRun = Awaited<ReturnType<typeof startBrokerExeca>>;
@@ -104,7 +110,7 @@ function disposeFailedChild(child: ChildProcess | undefined): void {
   if (child.connected) {
     child.disconnect();
   }
-  for (const stream of child.stdio) {
+  for (const stream of child.stdio ?? []) {
     stream?.destroy();
   }
 }
@@ -113,13 +119,32 @@ async function launch(
   message: Extract<BrokerRequest, { type: "spawn" | "spawn-execa" }>,
 ): Promise<void> {
   if (stopping || owned.size + starting.size >= 256) {
+    const error = new SpawnBrokerError("Spawn broker request capacity exceeded");
+    // The ordered failed-admission result proves no native work was started.
+    // No command metadata exists because this guard precedes spawn preparation.
+    await report({
+      type: "execa-result",
+      id: message.id,
+      result: {
+        failed: true,
+        code: error.code,
+        timedOut: false,
+        isCanceled: false,
+        isGracefullyCanceled: false,
+        isMaxBuffer: false,
+        isTerminated: false,
+        isForcefullyTerminated: false,
+        command: "",
+        escapedCommand: "",
+        cwd: process.cwd(),
+        durationMs: 0,
+        error: serializeExecaError(error),
+      },
+    });
     await report({
       type: "error",
       id: message.id,
-      error: {
-        message: "Spawn broker request capacity exceeded",
-        code: "ERR_SPAWN_BROKER_UNAVAILABLE",
-      },
+      error: serializeBrokerError(error),
       resultUnavailable: true,
     });
     return;
@@ -151,6 +176,17 @@ async function launch(
         throw new Error("Spawn broker command did not start");
       }
       if (!execa) {
+        // EMFILE/ENFILE can return before stdio exists; Node still owns error and close.
+        if (child.stdio === undefined) {
+          const closed = new Promise<void>((resolve) => {
+            child.once("close", () => resolve());
+          });
+          const error = await new Promise<Error>((resolve) => {
+            child.once("error", resolve);
+          });
+          await closed;
+          throw error;
+        }
         for (const [fd, stream] of child.stdio.entries()) {
           if (fd > 0 && stream instanceof Socket) {
             holdPipeForTransfer(stream);

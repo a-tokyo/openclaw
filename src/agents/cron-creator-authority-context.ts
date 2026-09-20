@@ -59,6 +59,14 @@ const activeCronCreatorAuthority = new AsyncLocalStorage<CronCreatorAuthorityRun
 const activeCronCreatorAuthorityResolver =
   new AsyncLocalStorage<CronCreatorAuthorityResolverScope>();
 
+/** Retain the Cron-only fence when tools materialize outside their creator scope. */
+export function bindActiveCronAuthorityCurrentness(
+  runId: string | undefined,
+): (() => boolean) | undefined {
+  const scope = activeCronCreatorAuthority.getStore();
+  return scope?.active && scope.runId === runId?.trim() ? scope.isCurrent : undefined;
+}
+
 /** Retain the exact scope for callbacks invoked outside their creation context. */
 export function bindRequesterYieldCronAuthority(
   runId: string | undefined,
@@ -180,10 +188,14 @@ export function bindCronManagementGrant(runId: string | undefined) {
   };
 }
 
-/** Retains native provenance before late CLI admission without minting execution authority. */
+/** Retains authenticated provenance before late CLI admission without execution authority. */
 export function captureCronRequesterGrantIssuer(runId: string | undefined) {
   const scope = activeCronCreatorAuthority.getStore();
-  if (!scope || !hasCronChannelRequester(scope) || scope.runId !== runId) {
+  if (
+    !scope ||
+    (scope.callerOrigin.kind !== "local" && !hasCronChannelRequester(scope)) ||
+    scope.runId !== runId
+  ) {
     return undefined;
   }
   return (
@@ -206,7 +218,7 @@ export function captureCronRequesterGrantIssuer(runId: string | undefined) {
   };
 }
 
-/** Captures the requester independently of optional full tool-surface materialization. */
+/** Captures authenticated requester facts independently of full tool-surface materialization. */
 export function bindCronRequesterGrant(runId: string | undefined) {
   const issue = captureCronRequesterGrantIssuer(runId);
   const authority = getGatewayToolCallerIdentity()?.approvalAuthority;
@@ -288,6 +300,9 @@ function bindCronCreatorAuthorityResolver(params: {
     const operationSignal = options?.signal;
     authority.signal.throwIfAborted();
     operationSignal?.throwIfAborted();
+    if (authority.isCurrent?.() === false) {
+      throw new Error("Automation caller authority is no longer active.");
+    }
     const signal = operationSignal
       ? AbortSignal.any([authority.signal, operationSignal])
       : authority.signal;

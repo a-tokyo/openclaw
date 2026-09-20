@@ -305,7 +305,6 @@ export const en: TranslationMap & {
   sessionProgressCard: {
     title: "Progress",
     composerTitle: "Task progress",
-    gestureHint: "Drag or scroll up on the header to open; move down to close. Click to toggle.",
     shortCount: "{completed} of {total}",
     noteLabel: "Progress note",
     dismiss: "Dismiss progress card",
@@ -3904,6 +3903,7 @@ export const en: TranslationMap & {
       checksRunning: "Running",
       checksSkipped: "Skipped",
       showMore: "Show {count} more",
+      showLess: "Show less",
       rateLimited:
         "GitHub API rate limit reached. Pull request status may be out of date until the limit resets.",
       unavailable:

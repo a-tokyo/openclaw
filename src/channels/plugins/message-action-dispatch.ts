@@ -5,6 +5,7 @@
  */
 import type { AgentToolResult } from "../../agents/runtime/index.js";
 import type { MessageActionAuthorization } from "../../gateway/message-action-turn-capability.js";
+import { assertOutboundHandoffCurrent } from "../../infra/outbound/deliver-handoff.js";
 import {
   prepareMessageActionWriteAuthority,
   withMessageActionWriteAuthority,
@@ -540,15 +541,6 @@ function prepareScheduledMessageWriteContext(
   if (!policy || !ctx.messageActionAuthorization?.scheduled) {
     return undefined;
   }
-  if (
-    policy === "provider" &&
-    prepared.enforcement.kind === "provider-owned" &&
-    prepared.enforcement.pluginTrust === "bundled" &&
-    !prepared.plugin.actions?.writeAuthorityActions?.includes(action)
-  ) {
-    // Retain existing bundled provider admission until its adapter opts into this fence.
-    return undefined;
-  }
   const accountId =
     ctx.accountId ?? resolveChannelDefaultAccountId({ plugin: prepared.plugin, cfg: ctx.cfg });
   const access = resolveScheduledMessageActionAccess({
@@ -730,7 +722,7 @@ export async function dispatchChannelMessageAction(
       ) {
         return null;
       }
-      authorizedActionContext.assertDirectAdapterHandoff?.();
+      assertOutboundHandoffCurrent(authorizedActionContext.assertDirectAdapterHandoff);
       prepared.assertReadAuthorityCurrent?.();
       if (typeof match === "function") {
         prepared.assertAliasAuthorityCurrent();

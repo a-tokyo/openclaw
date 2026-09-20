@@ -48,6 +48,8 @@ const repositoryScriptEntries = [
   "scripts/dev/computer-use-macos-live-proof.ts!",
   "scripts/dev/ios-node-e2e.ts!",
   "scripts/diffs-shiki-curated.ts!",
+  // The Doctor migration guide invokes this source-checkout replay by path.
+  "scripts/doctor-config-upgrade-replay.mjs!",
   // Reusable Docker workflows invoke this from the downloaded .release-harness tree.
   "scripts/docker-e2e.mts!",
   // Docker and package-install harnesses invoke this verifier by path.
@@ -303,6 +305,7 @@ const rootEntries = [
   "src/plugins/build-smoke-entry.ts!",
   // Required metadata readers load this tsdown entry by computed source/dist path.
   "src/plugins/plugin-metadata-readers.runtime.ts!",
+  "src/commands/doctor/shared/legacy-config-binding-repair.runtime.ts!",
   // Released Gateways still import this stable entry after an on-disk update.
   "src/gateway/plugin-channel-reload-targets.ts!",
   // Package-script owners invoke these generated-artifact modules directly.

@@ -17,6 +17,9 @@ export type InputProvenance = {
   sourceChannel?: string;
   sourceTool?: string;
   sourceRole?: "subagent";
+  sourcePromptPrefix?: string;
+  jobId?: string;
+  runId?: string;
 };
 
 export const MAIN_SESSION_RESTART_RECOVERY_SOURCE_TOOL = "main_session_restart_recovery" as const;
@@ -57,6 +60,9 @@ export function normalizeInputProvenance(value: unknown): InputProvenance | unde
     "sourceSessionKey",
     "sourceChannel",
     "sourceTool",
+    "sourcePromptPrefix",
+    "jobId",
+    "runId",
   ] as const) {
     const normalized = normalizeOptionalString(record[key]);
     if (normalized) {
@@ -92,11 +98,12 @@ export function isInterSessionInputProvenance(value: unknown): boolean {
 }
 
 /** Child coordination stays available to the model without becoming a chat reply. */
-export function isSubagentCoordinationInputProvenance(value: unknown): boolean {
-  const provenance = normalizeInputProvenance(value);
+export function isSubagentCoordinationInputProvenance(
+  provenance: InputProvenance | undefined,
+): boolean {
   return (
     provenance?.kind === "inter_session" &&
-    provenance.sourceTool === "sessions_send" &&
+    normalizeOptionalString(provenance.sourceTool) === "sessions_send" &&
     provenance.sourceRole === "subagent"
   );
 }

@@ -14,6 +14,7 @@ import {
 } from "../active-jobs.js";
 import { describeUnavailableCronAgent } from "../agent-availability.js";
 import { resolveCronJobConfigRevision } from "../config-revision.js";
+import { withCronMutationCommitHook } from "../mutation-completion.js";
 import { cronSchedulingInputsEqual } from "../schedule-identity.js";
 import { removeCronJobBaseSession } from "../session-reaper.js";
 import { removeStaleCronJobFamilyRows } from "../store.js";
@@ -22,7 +23,10 @@ import {
   systemOwnedDeclarationKeyNamespace,
 } from "../system-owned-declaration.js";
 import { normalizeCronTaskRunJobId } from "../task-run-history.js";
-import { resolveCronAuthenticatedChannelRequester } from "../tools-allow-provenance.js";
+import {
+  resolveCronAuthenticatedCallerOrigin,
+  resolveCronAuthenticatedChannelRequester,
+} from "../tools-allow-provenance.js";
 import type { CronJob, CronJobCreate, CronJobPatch } from "../types.js";
 import { declarativeFields } from "./jobs-declarative.js";
 import { cloneCronJobForMutation, finalizeUpdatedJob } from "./jobs-mutation.js";
@@ -103,6 +107,7 @@ async function persistUpdatedJob(params: {
   previousJob: CronJob;
   nextJob: CronJob;
   persistStore: typeof persistOrRestore;
+  mutationMethod: "cron.add" | "cron.update";
 }) {
   const { state, snapshot, previousJob, nextJob, persistStore } = params;
   const reservation = state.queuedRunReservationsByJobId.get(nextJob.id);
@@ -147,18 +152,23 @@ async function persistUpdatedJob(params: {
     (triggerStateChanged &&
       Boolean(
         resolveCronAuthenticatedChannelRequester(previousJob) ||
-        resolveCronAuthenticatedChannelRequester(nextJob),
+        resolveCronAuthenticatedChannelRequester(nextJob) ||
+        resolveCronAuthenticatedCallerOrigin(previousJob) ||
+        resolveCronAuthenticatedCallerOrigin(nextJob),
       ));
   await persistStore(state, snapshot, {
     suppressScheduledJobId: nextJob.id,
-    transactionHooks: cronRunReceiptMutationHooks({
-      state,
-      jobId: nextJob.id,
-      ownerChanged,
-      triggerStateChanged,
-      messageActionAuthorityChanged,
-      ...(scheduleChanged ? { scheduleChangedJob: nextJob } : {}),
-    }),
+    transactionHooks: withCronMutationCommitHook(
+      params.mutationMethod,
+      cronRunReceiptMutationHooks({
+        state,
+        jobId: nextJob.id,
+        ownerChanged,
+        triggerStateChanged,
+        messageActionAuthorityChanged,
+        ...(scheduleChanged ? { scheduleChangedJob: nextJob } : {}),
+      }),
+    ),
   });
   if (isJobEnabled(previousJob) && !isJobEnabled(nextJob)) {
     requestActiveCronJobCancellation(nextJob.id, "Cron job disabled by operator.");
@@ -271,7 +281,14 @@ export async function add(
         return { ...existing, created: false, updated: false, job: existing };
       }
       const snapshot = snapshotStoreForRollback(state);
-      await persistUpdatedJob({ state, snapshot, previousJob: existing, nextJob, persistStore });
+      await persistUpdatedJob({
+        state,
+        snapshot,
+        previousJob: existing,
+        nextJob,
+        persistStore,
+        mutationMethod: "cron.add",
+      });
       return { ...nextJob, created: false, updated: true, job: nextJob };
     }
 
@@ -321,6 +338,7 @@ export async function add(
     await persistStore(state, snapshot, {
       postPersistNotifications,
       suppressScheduledJobId: job.id,
+      transactionHooks: withCronMutationCommitHook("cron.add"),
     });
     armTimer(state);
 
@@ -436,9 +454,18 @@ async function updateLoadedJob(params: {
     previousJob: job,
     toolsAllowProvenance: opts?.toolsAllowProvenance,
     reauthorize: patch.payload !== undefined && Object.hasOwn(patch.payload, "toolsAllow"),
+    reauthorizeCallerOrigin:
+      patch.payload !== undefined && Object.hasOwn(patch.payload, "toolsAllow"),
   });
   const snapshot = snapshotStoreForRollback(state);
-  await persistUpdatedJob({ state, snapshot, previousJob: job, nextJob, persistStore });
+  await persistUpdatedJob({
+    state,
+    snapshot,
+    previousJob: job,
+    nextJob,
+    persistStore,
+    mutationMethod: "cron.update",
+  });
   return nextJob;
 }
 
@@ -515,6 +542,7 @@ export async function remove(
     await persistStore(state, snapshot, {
       postPersistNotifications,
       suppressScheduledJobId: id,
+      transactionHooks: withCronMutationCommitHook("cron.remove"),
     });
     const activeMarker = noteActiveCronJobRemoval(id, opts?.commitGuard);
     const agentId = resolveEffectiveJobAgentId(removedJob, resolveCurrentDefaultAgentId(state));

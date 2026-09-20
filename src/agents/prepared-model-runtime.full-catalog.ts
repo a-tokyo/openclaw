@@ -208,6 +208,22 @@ export function mergePreparedProviderCatalog(
   };
 }
 
+/** A failed renewal keeps rows but must not retain a successful discovery deadline. */
+export function expirePreparedModelCatalogProviders(
+  inventory: PreparedModelCatalogInventory,
+  providerIds?: readonly string[],
+): PreparedModelCatalogInventory {
+  const providers = new Map(inventory.providers);
+  for (const provider of providerIds ?? providers.keys()) {
+    const facts = providers.get(provider);
+    if (facts) {
+      const { source, credentials } = facts;
+      providers.set(provider, { source, credentials });
+    }
+  }
+  return { ...inventory, providers };
+}
+
 export function prepareModelCatalogPublication(
   discovered: ModelCatalogSnapshot,
   runtimeModels: ReadonlyMap<string, readonly Model[]>,

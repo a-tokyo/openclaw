@@ -121,20 +121,7 @@ const PACKED_PLUGIN_SDK_SETUP_CONSUMER_FIXTURE = new URL(
   "./fixtures/packed-plugin-sdk-setup-consumer.ts",
   import.meta.url,
 );
-const PACKED_PLUGIN_SDK_SETUP_DECLARATIONS = [
-  "dist/plugin-sdk/setup.d.ts",
-  "dist/plugin-sdk/setup-runtime.d.ts",
-] as const;
 const PACKED_PLUGIN_SDK_SETUP_SURFACE_OMISSION_VERSIONS = new Set(["2026.7.33"]);
-
-export function packedPluginSdkSupportsSetupSurface(installedOpenClawRoot: string): boolean {
-  return PACKED_PLUGIN_SDK_SETUP_DECLARATIONS.every((relativePath) => {
-    const declarationPath = join(installedOpenClawRoot, relativePath);
-    return (
-      existsSync(declarationPath) && readFileSync(declarationPath, "utf8").includes("setupSurface")
-    );
-  });
-}
 
 export function packedPluginSdkMayOmitSetupSurface(packageVersion: string): boolean {
   return PACKED_PLUGIN_SDK_SETUP_SURFACE_OMISSION_VERSIONS.has(packageVersion);
@@ -613,7 +600,8 @@ export function createPackedCliSmokeEnv(
     process.platform === "win32"
       ? `${nodeBinDir};${windowsRoot}\\System32;${windowsRoot}`
       : `${nodeBinDir}:${SAFE_UNIX_SMOKE_PATH}`;
-  const homeDir = overrides.HOME ?? env.HOME ?? overrides.USERPROFILE ?? env.USERPROFILE ?? "";
+  const homeDir = overrides.HOME ?? env.HOME ?? env.USERPROFILE ?? "";
+  const stateDir = overrides.OPENCLAW_STATE_DIR;
 
   return {
     ...Object.fromEntries(
@@ -635,7 +623,7 @@ export function createPackedCliSmokeEnv(
     OPENCLAW_NO_ONBOARD: "1",
     OPENCLAW_SERVICE_REPAIR_POLICY: "external",
     OPENCLAW_SUPPRESS_NOTES: "1",
-    ...overrides,
+    ...(typeof stateDir === "string" ? { OPENCLAW_STATE_DIR: stateDir } : {}),
   };
 }
 
@@ -807,28 +795,25 @@ function runPackedPluginSdkTypescriptSmoke(
     });
 
     const installedOpenClawRoot = join(consumerDir, "node_modules", "openclaw");
-    if (!target.setupConsumerOnly && !packedPluginSdkSupportsSetupSurface(installedOpenClawRoot)) {
+    if (!target.setupConsumerOnly) {
       const installedPackageVersion = (
         JSON.parse(readFileSync(join(installedOpenClawRoot, "package.json"), "utf8")) as {
           version?: unknown;
         }
       ).version;
       if (
-        typeof installedPackageVersion !== "string" ||
-        !packedPluginSdkMayOmitSetupSurface(installedPackageVersion)
+        typeof installedPackageVersion === "string" &&
+        packedPluginSdkMayOmitSetupSurface(installedPackageVersion)
       ) {
-        throw new Error(
-          `release-check: packed plugin SDK ${String(installedPackageVersion)} is missing setupSurface declarations`,
+        const indexPath = join(consumerDir, "src", "index.ts");
+        writeFileSync(
+          indexPath,
+          readFileSync(indexPath, "utf8").replace(
+            'import "./packed-plugin-sdk-setup-consumer.js";\n',
+            "",
+          ),
         );
       }
-      const indexPath = join(consumerDir, "src", "index.ts");
-      writeFileSync(
-        indexPath,
-        readFileSync(indexPath, "utf8").replace(
-          'import "./packed-plugin-sdk-setup-consumer.js";\n',
-          "",
-        ),
-      );
     }
     const tscPath = [
       join(consumerDir, "node_modules", "typescript", "bin", "tsc"),
@@ -895,7 +880,6 @@ function runPackedBundledPluginActivationSmoke(packageRoot: string, tmpRoot: str
   mkdirSync(homeDir, { recursive: true });
   const env = createPackedCliSmokeEnv(process.env, {
     HOME: homeDir,
-    OPENAI_API_KEY: "sk-openclaw-release-check",
   });
 
   writePackedBundledPluginActivationConfig(homeDir);
@@ -958,7 +942,6 @@ function runPackedCliSmoke(params: {
   const env = createPackedCliSmokeEnv(process.env, {
     HOME: params.homeDir,
     OPENCLAW_STATE_DIR: params.stateDir,
-    OPENAI_API_KEY: "sk-openclaw-release-check",
   });
   const windowsRoot = env.SystemRoot ?? env.WINDIR ?? "C:\\Windows";
   const trustedCmdPath = join(windowsRoot, "System32", "cmd.exe");

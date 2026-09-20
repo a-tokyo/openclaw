@@ -24,6 +24,8 @@ import type {
   SessionHistoryWorkerRequest,
   SessionHistoryWorkerResult,
 } from "./session-history-types.js";
+import { sessionHistoryCleanupError } from "./session-history-worker-errors.js";
+import type { SessionMember } from "./session-sharing-store.kernel.js";
 import { SessionTranscriptProjectionUnavailableError } from "./session-transcript-projection-error.js";
 import {
   runWithSessionTranscriptReadFence,
@@ -65,6 +67,13 @@ export type SessionRowPresenceWorkerInput = {
   scope: SessionAccessScope & { databaseAgentId: string };
 };
 
+export type SessionMembersWorkerInput = {
+  kind: "session-members";
+  database: { agentId: string; path: string };
+  sessionKey: string;
+  env: NodeJS.ProcessEnv;
+};
+
 export type SessionBranchSummaryWorkerInput = {
   kind: "branch-summaries";
   request: SessionBranchSummaryReadRequest;
@@ -74,6 +83,7 @@ type SessionTranscriptWorkerValues = {
   "branch-summaries": SessionBranchSummaryReadResult;
   "history-page": SessionHistoryWorkerResult;
   "session-row-presence": boolean;
+  "session-members": SessionMember[];
   "model-context": ReturnType<typeof readSessionTranscriptModelContext>;
   "session-entry": {
     entry: SessionFileEntry | null;
@@ -134,7 +144,11 @@ async function withHistoryDatabase<T>(
     return { value };
   } catch (error) {
     // The parent joins worker retirement on failure, including a failed native close.
-    scope.close();
+    try {
+      scope.close();
+    } catch (cleanupError) {
+      throw sessionHistoryCleanupError(error, cleanupError, "database close");
+    }
     throw error;
   }
 }
@@ -147,12 +161,29 @@ serveWorkerTasks(
       | SessionEntryWorkerInput
       | SessionTranscriptHistoryWorkerInput
       | SessionRowPresenceWorkerInput
+      | SessionMembersWorkerInput
       | SessionBranchSummaryWorkerInput;
     try {
       if (request.kind === "branch-summaries") {
         const { readSessionBranchSummariesInWorker } =
           await import("./session-accessor.sqlite-branches.js");
         return { ok: true, value: readSessionBranchSummariesInWorker(request.request) };
+      }
+      if (request.kind === "session-members") {
+        const { withOpenClawAgentDatabaseReadOnly } =
+          await import("../../state/openclaw-agent-db-readonly.js");
+        const { listSessionMembersInDatabase } = await import("./session-sharing-store.kernel.js");
+        return {
+          ok: true,
+          ...(await withHistoryDatabase(request.database, () => {
+            const result = withOpenClawAgentDatabaseReadOnly(
+              (database) => listSessionMembersInDatabase(database, request.sessionKey),
+              { ...request.database, env: request.env },
+              { throwOnMissingTable: true },
+            );
+            return result.found ? result.value : [];
+          })),
+        };
       }
       if (request.kind === "session-row-presence") {
         const { loadSessionEntryReadOnlyInScope } =
@@ -195,6 +226,7 @@ serveWorkerTasks(
                     }),
                     readOnly: true,
                     deferProfileDisplay: true,
+                    resolveCronJobName: () => undefined,
                   };
                   if (request.request.kind === "rpc") {
                     const { readChatHistoryPageKernel } =

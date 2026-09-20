@@ -100,6 +100,9 @@ scripts/lib/failed-trailer.mts
 scripts/lib/gateway-server-test-plan.mts
 scripts/lib/local-check-runtime.mts
 scripts/lib/managed-child-process.mts
+scripts/lib/managed-windows-job-entrypoint.mts
+scripts/lib/managed-windows-job-launcher.mts
+scripts/lib/managed-windows-job.mts
 scripts/lib/merge-head-diff-base.mjs
 scripts/lib/native-session-catalogs.json
 scripts/lib/numeric-options.mjs
@@ -245,12 +248,14 @@ src/cli/parse-bytes.ts
 src/cli/parse-duration.ts
 src/cli/profile-utils.ts
 src/cli/program/command-descriptor-utils.ts
+src/cli/signal-exit-barrier.ts
 src/cli/wait.ts
 src/commands/doctor/shared/channel-legacy-config-migrate.ts
 src/commands/doctor/shared/codex-route-agent-entries.ts
 src/commands/doctor/shared/codex-route-model-ref.ts
 src/commands/doctor/shared/configured-channel-ids.ts
 src/commands/doctor/shared/include-migration-ownership.ts
+src/commands/doctor/shared/legacy-config-binding-repair-input.ts
 src/commands/doctor/shared/legacy-config-compat.ts
 src/commands/doctor/shared/legacy-config-issues.ts
 src/commands/doctor/shared/legacy-config-migrations.audio.ts
@@ -342,6 +347,8 @@ src/config/io.plugin-metadata.ts
 src/config/io.read-helpers.ts
 src/config/io.recovery.ts
 src/config/io.runtime.ts
+src/config/io.snapshot-preparation.ts
+src/config/io.snapshot-preparation.types.ts
 src/config/io.snapshot-shared.ts
 src/config/io.snapshot.ts
 src/config/io.state.ts
@@ -425,6 +432,7 @@ src/config/validation-plugin-config.ts
 src/config/validation-plugin-registry.ts
 src/config/validation-plugin-rules.ts
 src/config/validation.ts
+src/config/validation.types.ts
 src/config/version.ts
 src/config/web-search-legacy-provider-keys.ts
 src/config/write-lock.ts
@@ -652,6 +660,7 @@ src/infra/sqlite-schema-header.ts
 src/infra/sqlite-schema-issues.ts
 src/infra/sqlite-schema-sql.ts
 src/infra/sqlite-snapshot-source.ts
+src/infra/sqlite-snapshot-staging.ts
 src/infra/sqlite-source-handle.ts
 src/infra/sqlite-strict.ts
 src/infra/sqlite-terminal-open-latch.ts
@@ -957,6 +966,7 @@ src/process/spawn-broker/execa-message.ts
 src/process/spawn-broker/execa-protocol.ts
 src/process/spawn-broker/pipe.ts
 src/process/spawn-broker/protocol.ts
+src/process/supervisor/service-child-windows-job-native.ts
 src/process/windows-command.ts
 src/proxy-capture/env.ts
 src/proxy-capture/header-redaction.ts
@@ -998,6 +1008,7 @@ src/sessions/session-diff-parser.ts
 src/sessions/session-diff-revisions.ts
 src/sessions/session-diff.runtime.ts
 src/sessions/session-key-utils.ts
+src/sessions/session-row-changes.ts
 src/shared/assistant-error-format.ts
 src/shared/avatar-limits.ts
 src/shared/avatar-policy.ts
@@ -1017,6 +1028,7 @@ src/shared/incognito-session-key.ts
 src/shared/json-schema-defaults.ts
 src/shared/lazy-promise.ts
 src/shared/lazy-runtime.ts
+src/shared/listeners.ts
 src/shared/model-key.ts
 src/shared/path-array-index.ts
 src/shared/pid-alive.ts

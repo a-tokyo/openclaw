@@ -6,9 +6,31 @@ import {
 import type { DB as OpenClawAgentKyselyDatabase } from "../../state/openclaw-agent-db.generated.js";
 import type { OpenClawAgentDatabase } from "../../state/openclaw-agent-db.js";
 
-type SessionMemberDatabase = Pick<OpenClawAgentKyselyDatabase, "session_members">;
+export type SessionMember = {
+  identityId: string;
+  addedBy: string;
+  addedAt: number;
+};
 
-const SESSION_MEMBERSHIP_QUERY_CHUNK_SIZE = 400;
+export function listSessionMembersInDatabase(
+  database: Pick<OpenClawAgentDatabase, "db">,
+  sessionKey: string,
+): SessionMember[] {
+  return executeSqliteQuerySync(
+    database.db,
+    getSessionMemberKysely(database)
+      .selectFrom("session_members")
+      .select(["identity_id", "added_by", "added_at"])
+      .where("session_key", "=", sessionKey)
+      .orderBy("identity_id"),
+  ).rows.map((row) => ({
+    identityId: row.identity_id,
+    addedBy: row.added_by,
+    addedAt: row.added_at,
+  }));
+}
+
+type SessionMemberDatabase = Pick<OpenClawAgentKyselyDatabase, "session_members">;
 
 export function getSessionMemberKysely(database: Pick<OpenClawAgentDatabase, "db">) {
   return getNodeSqliteKysely<SessionMemberDatabase>(database.db);
@@ -29,32 +51,4 @@ export function hasSessionMemberInDatabase(
         .where("identity_id", "=", normalizedIdentityId),
     ),
   );
-}
-
-export function listSessionMembershipKeysInDatabase(
-  database: Pick<OpenClawAgentDatabase, "db">,
-  normalizedSessionKeys: readonly string[],
-  normalizedIdentityId: string,
-): Set<string> {
-  const db = getSessionMemberKysely(database);
-  const memberships = new Set<string>();
-  for (
-    let offset = 0;
-    offset < normalizedSessionKeys.length;
-    offset += SESSION_MEMBERSHIP_QUERY_CHUNK_SIZE
-  ) {
-    const chunk = normalizedSessionKeys.slice(offset, offset + SESSION_MEMBERSHIP_QUERY_CHUNK_SIZE);
-    const rows = executeSqliteQuerySync(
-      database.db,
-      db
-        .selectFrom("session_members")
-        .select("session_key")
-        .where("identity_id", "=", normalizedIdentityId)
-        .where("session_key", "in", chunk),
-    ).rows;
-    for (const row of rows) {
-      memberships.add(row.session_key);
-    }
-  }
-  return memberships;
 }
