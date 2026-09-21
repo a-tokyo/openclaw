@@ -16,7 +16,6 @@ import type {
   stageSessionPendingInput,
 } from "../../config/sessions/session-accessor.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
-import { buildProjectedAgentRunIndex } from "../../infra/agent-run-registry.js";
 import { resetDiagnosticEventsForTest } from "../../infra/diagnostic-events.js";
 import { trackAsyncWork } from "../../shared/async-work-scope.js";
 import {
@@ -35,7 +34,9 @@ import {
   waitForAssertion,
 } from "./agent-clock.test-helpers.js";
 import { agentIdentityHandlers } from "./agent-identity.js";
+import { createAgentTestSessionRowProjection } from "./agent-session-projection.test-support.js";
 import { agentHandlers } from "./agent.js";
+import { createAgentTestUserTurnRecorder } from "./agent.user-turn-recorder.test-support.js";
 import { flushPendingSessionsChangedEvents } from "./session-change-event.js";
 import { suspendHandlers } from "./suspend.js";
 import type { GatewayRequestContext } from "./types.js";
@@ -184,21 +185,11 @@ vi.mock("../../sessions/user-turn-transcript.js", async () => {
     createUserTurnTranscriptRecorder: (
       params: Parameters<typeof actual.createUserTurnTranscriptRecorder>[0],
     ) =>
-      actual.createUserTurnTranscriptRecorder({
-        ...params,
-        // Handler-unit fixtures mock session loading with ordered returns. The
-        // gateway-server suites own real target revalidation and SQLite proof.
-        target: mocks.userTurnStorePath
-          ? params.target
-          : {
-              sessionId: "test-session-id",
-              expectedSessionId: "test-session-id",
-              sessionKey: "agent:main:main",
-              sessionEntry: { sessionId: "test-session-id", updatedAt: Date.now() },
-              storePath: "/tmp/sessions.json",
-              agentId: "main",
-            },
-      }),
+      createAgentTestUserTurnRecorder(
+        actual.createUserTurnTranscriptRecorder,
+        params,
+        mocks.userTurnStorePath,
+      ),
   };
 });
 
@@ -305,7 +296,8 @@ vi.mock("../../agents/agent-scope.js", async () => {
   };
 });
 
-vi.mock("../../infra/agent-events.js", () => ({
+vi.mock("../../infra/agent-events.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../infra/agent-events.js")>()),
   assertAgentRunLifecycleGenerationCurrent: (lifecycleGeneration: string) => {
     if (lifecycleGeneration === mocks.lifecycleGeneration) {
       return;
@@ -314,17 +306,11 @@ vi.mock("../../infra/agent-events.js", () => ({
     error.name = "AbortError";
     throw error;
   },
-  claimAgentRunContext: mocks.registerAgentRunContext,
-  clearAgentRunContext: mocks.clearAgentRunContext,
   emitAgentEvent: mocks.emitAgentEvent,
   getAgentEventLifecycleGeneration: () => mocks.lifecycleGeneration,
-  getAgentRunContext: vi.fn(() => undefined),
-  resolveProjectedAgentRunProgressState: vi.fn(() => undefined),
   isAgentEventLifecycleGenerationCurrent: (generation: string) =>
     generation === mocks.lifecycleGeneration,
   registerAgentEventLifecycleRotationHandler: vi.fn(),
-  registerAgentRunContext: mocks.registerAgentRunContext,
-  onAgentEvent: vi.fn(),
 }));
 vi.mock("../../infra/agent-run-registry.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../../infra/agent-run-registry.js")>()),
@@ -435,16 +421,10 @@ export const makeContext = (session?: {
     ...bindSessionRowProjection(
       {},
       () =>
-        ({
-          get state() {
-            return { rowContext: { projectedAgentRuns: buildProjectedAgentRunIndex() } };
-          },
-          capture: () => undefined,
-          ensureMaterialized: async () => {},
-          snapshot: ({ key, agentId }: { key: string; agentId: string }) => ({
-            row: session?.agentId === agentId && session.row.key === key ? session.row : null,
-          }),
-        }) as unknown as SessionRowProjection,
+        createAgentTestSessionRowProjection(
+          resolveAgentTestConfig,
+          session,
+        ) as unknown as SessionRowProjection,
     ),
   }) as unknown as GatewayRequestContext;
 
@@ -539,7 +519,7 @@ export function mockMainSessionEntry(
 ) {
   mocks.loadSessionEntry.mockReturnValue({
     cfg,
-    storePath: "/tmp/sessions.json",
+    storePath: mocks.userTurnStorePath ?? "/tmp/sessions.json",
     entry: {
       sessionId: "existing-session-id",
       updatedAt: Date.now(),
@@ -894,7 +874,7 @@ export function setupCronContinuationReleaseFixture() {
   };
   mocks.loadSessionEntry.mockReturnValue({
     cfg: {},
-    storePath: "/tmp/sessions.json",
+    storePath: mocks.userTurnStorePath ?? "/tmp/sessions.json",
     canonicalKey: sessionKey,
     entry,
   });
@@ -1101,12 +1081,10 @@ export function applyGatewaySubagentRegistryTestDeps(
   overrides?: Parameters<typeof setSubagentRegistryDepsForTest>[0],
 ) {
   setSubagentRegistryDepsForTest({
-    // Direct handler tests have no live Gateway owner. Keep registry polling
-    // deterministic so a real connection timeout cannot cross test boundaries.
+    // Registration alone does not complete a child. Completion fixtures supply
+    // their own terminal observation before exercising cleanup or announcement.
     callGateway: (async () => ({
-      status: "ok",
-      startedAt: Date.now(),
-      endedAt: Date.now(),
+      status: "pending",
     })) as SubagentRegistryDeps["callGateway"],
     loadAgentRuntimePluginRegistryHandle: () => undefined,
     // Handler fixtures own no browser sessions; lifecycle cleanup has separate coverage.

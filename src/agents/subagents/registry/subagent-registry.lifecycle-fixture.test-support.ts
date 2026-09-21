@@ -26,6 +26,8 @@ export type SessionStoreEntry = {
 
 type GatewayAgentRequestParams = {
   sessionKey?: string;
+  idempotencyKey?: string;
+  message?: string;
   inputProvenance?: {
     sourceSessionKey?: string;
   };
@@ -35,3 +37,27 @@ type GatewayAgentRequestParams = {
 export type GatewayRequest = Omit<CallGatewayOptions, "params"> & {
   params?: GatewayAgentRequestParams;
 };
+
+export function getAgentResultsForChildSession(
+  requests: readonly GatewayRequest[],
+  childSessionKey: string,
+): string[] {
+  return requests
+    .filter((request) => {
+      const inputProvenance = request.params?.inputProvenance;
+      if (!inputProvenance || typeof inputProvenance !== "object") {
+        return false;
+      }
+      return (
+        (inputProvenance as { sourceSessionKey?: unknown }).sourceSessionKey === childSessionKey
+      );
+    })
+    .flatMap((request) => {
+      const internalEvents = request.params?.internalEvents;
+      const event =
+        Array.isArray(internalEvents) && internalEvents[0] && typeof internalEvents[0] === "object"
+          ? (internalEvents[0] as { result?: string })
+          : undefined;
+      return typeof event?.result === "string" ? [event.result] : [];
+    });
+}

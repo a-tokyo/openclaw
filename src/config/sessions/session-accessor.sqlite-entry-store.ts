@@ -259,7 +259,7 @@ export function deleteSessionEntryRows(
       database.db,
       db.deleteFrom("session_nodes").where("session_key", "=", sessionKey),
     );
-    publishSessionEntryCacheInvalidation(database);
+    publishSessionEntryCacheInvalidation(database, { sessionKey });
     return;
   }
   const remainingWindow = executeSqliteQueryTakeFirstSync(
@@ -279,14 +279,14 @@ export function deleteSessionEntryRows(
       sessionKey,
       updatedAt: remainingWindow.updated_at,
     });
-    publishSessionEntryCacheInvalidation(database);
+    publishSessionEntryCacheInvalidation(database, { sessionKey });
     return;
   }
   executeSqliteQuerySync(
     database.db,
     db.deleteFrom("session_nodes").where("session_key", "=", sessionKey),
   );
-  publishSessionEntryCacheInvalidation(database);
+  publishSessionEntryCacheInvalidation(database, { sessionKey });
 }
 
 /** Remove the logical entry while retaining its node-owned transcript windows. */
@@ -412,8 +412,9 @@ export function deleteLegacySessionEntryRows(
       database.db,
       db.deleteFrom("session_nodes").where("session_key", "=", legacyKey),
     );
-    publishSessionEntryCacheInvalidation(database);
+    publishSessionEntryCacheInvalidation(database, { sessionKey: legacyKey });
   }
+  publishSessionEntryCacheInvalidation(database, { sessionKey });
 }
 
 /** Move retained generations to the canonical node before removing key aliases. */
@@ -444,6 +445,8 @@ export function writeSessionEntry(
   entry: SessionEntry,
   options: {
     allowStoredAliases?: boolean;
+    /** Only the personal involvement owner may replace this logical-node state. */
+    profileInvolvement?: SessionEntry["profileInvolvement"];
     /** Canonical row revalidated in this write transaction; null proves absence. */
     canonicalPreviousEntry?: SessionEntry | null;
     consumePendingReset?: boolean;
@@ -492,6 +495,23 @@ export function writeSessionEntry(
   // ordinary writes cannot restamp a logical node's creator.
   if (!options.allowStoredAliases || canonicalPreviousEntry?.sandbox === "required") {
     normalizedEntry = preserveCreationStamp(normalizedEntry, canonicalPreviousEntry);
+  }
+  // Personal choices follow the logical node through reset and relocation. A
+  // fork has a different key; stale entry writers cannot replace committed choices.
+  const involvement =
+    options.profileInvolvement ??
+    canonicalPreviousEntry?.profileInvolvement ??
+    (entry.profileInvolvement?.key === sessionKey || options.allowStoredAliases
+      ? entry.profileInvolvement
+      : undefined);
+  if (involvement) {
+    normalizedEntry = {
+      ...normalizedEntry,
+      profileInvolvement: { ...involvement, key: sessionKey },
+    };
+  } else if (normalizedEntry.profileInvolvement) {
+    const { profileInvolvement: _sourceInvolvement, ...forkEntry } = normalizedEntry;
+    normalizedEntry = forkEntry;
   }
   const previousEntry =
     options.previousEntry === undefined

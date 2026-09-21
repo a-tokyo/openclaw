@@ -13,6 +13,7 @@ import {
   createGatewayHarness,
   createSessions,
   mountSidebar,
+  mountSessionCatalogSidebar,
   type TestSessionMenu,
 } from "../app-sidebar.ts";
 import "../../components/app-sidebar.ts";
@@ -63,6 +64,7 @@ describe("AppSidebar session catalog pagination", () => {
         agentId: "main",
         limitPerHost: 40,
         progressId: expect.any(String),
+        allowPartialResults: true,
       });
     } finally {
       vi.useRealTimers();
@@ -243,7 +245,7 @@ describe("AppSidebar session catalog pagination", () => {
         ?.content,
     ).toBe("#107302 · Draft");
     expect(linkedRow?.querySelector('[data-sidebar-session-pin="true"]')).not.toBeNull();
-    expect(linkedRow?.querySelector('[data-session-menu="true"]')).not.toBeNull();
+    expect(linkedRow?.querySelector("[data-sidebar-session-archive]")).not.toBeNull();
     linkedRow?.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true }));
     await sidebar.updateComplete;
     const linkedMenu = sidebar.querySelector<TestSessionMenu>("openclaw-session-menu");
@@ -290,20 +292,9 @@ describe("AppSidebar session catalog pagination", () => {
       const request = vi
         .fn()
         .mockResolvedValue(catalogPage([{ threadId: "thread-1", name: "Newest" }]));
-      const gateway = createGatewayHarness({ request } as unknown as GatewayBrowserClient);
-      gateway.publish({
-        hello: {
-          features: { methods: ["sessions.catalog.list"], events: ["sessions.catalog.changed"] },
-        } as ApplicationGatewaySnapshot["hello"],
-      });
-      const { sidebar } = await mountSidebar(
-        gateway.gateway,
-        createSessions("main", ["agent:main:main"]),
-      );
-      sidebar.connected = true;
-      await sidebar.updateComplete;
-      await vi.advanceTimersByTimeAsync(0);
-      await sidebar.updateComplete;
+      const { sidebar } = await mountSessionCatalogSidebar({
+        request,
+      } as unknown as GatewayBrowserClient);
 
       // One scroll region: catalog groups live inside the sessions scroller.
       // Sibling scroll-less sections flex-squeeze and paint over each other.

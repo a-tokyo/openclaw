@@ -2,11 +2,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { formatCliCommand } from "../../cli/command-format.js";
-import { readDeferredPluginMigrations } from "../../infra/deferred-plugin-migrations.js";
-import {
-  deferredPluginSessionStoreIds,
-  readDeferredPluginSessionImport,
-} from "../../infra/deferred-plugin-session-sources.js";
+import { readDeferredPluginSessionImport } from "../../infra/deferred-plugin-session-sources.js";
 import { formatDoctorStateRepairFailure } from "../../infra/state-repair-message.js";
 import { readAgentDatabaseAdmissionRefusal } from "../../state/agent-database-admission.js";
 import { readAgentDeletionJournal } from "../../state/agent-deletion-journal.js";
@@ -33,9 +29,11 @@ import { SessionStoreMigrationRequiredError } from "./migration-required.js";
 import { resolveSqliteReadScope, toDatabaseOptions } from "./session-accessor.sqlite-scope.js";
 import { isCanonicalSqliteSessionMainKeyCurrent } from "./session-canonical-key-read.js";
 import { setCanonicalSqliteSessionMainKey } from "./session-canonical-key.js";
-import { resolveSqliteTargetFromSessionStorePath } from "./session-sqlite-target.js";
+import {
+  resolveSqliteTargetFromSessionStorePath,
+  type SessionStoreRegistryRead,
+} from "./session-sqlite-target.js";
 import { resolveAllAgentSessionStoreTargetsSync, resolveSessionStoreTargets } from "./targets.js";
-import type { migrateManagedWorktreeCanonicalWorkspaces } from "./worktree-workspace-migration.js";
 
 export type SessionStartupMigrationLogger = Record<"info" | "warn", (message: string) => void>;
 
@@ -43,22 +41,23 @@ export function assertSessionStoreMigrationComplete(params: {
   cfg: OpenClawConfig;
   env?: NodeJS.ProcessEnv;
   targets?: readonly { agentId?: string; storePath: string }[];
+  registeredDatabases?: SessionStoreRegistryRead;
   operation?: "doctor";
 }): void {
   const env = params.env ?? process.env;
+  const readOptions = { env, registeredDatabases: params.registeredDatabases };
   const targets = (
-    params.targets ?? resolveAllAgentSessionStoreTargetsSync(params.cfg, { env })
+    params.targets ?? resolveAllAgentSessionStoreTargetsSync(params.cfg, readOptions)
   ).filter(
     (target) => !target.agentId || !readAgentDatabaseAdmissionRefusal(target.agentId, { env }),
   );
-  let pending: ReturnType<typeof readDeferredPluginMigrations> | undefined;
   const legacyRootStore = path.join(resolveStateDir(env), "sessions", "sessions.json");
   const legacyTargets = fs.existsSync(legacyRootStore)
-    ? resolveSessionStoreTargets(params.cfg, { allAgents: true }, { env }).map((target) => ({
+    ? resolveSessionStoreTargets(params.cfg, { allAgents: true }, readOptions).map((target) => ({
         agentId: target.agentId,
         sqlitePath: resolveSqliteTargetFromSessionStorePath(target.storePath, {
           agentId: target.agentId,
-          env,
+          ...readOptions,
         }).path,
         storePath: legacyRootStore,
       }))
@@ -82,19 +81,15 @@ export function assertSessionStoreMigrationComplete(params: {
     };
     const owners = new Map<string, SourceOwner>();
     for (const target of candidates) {
-      if (
-        !target.agentId ||
-        deferredPluginSessionStoreIds({
-          target: { ...target, agentId: target.agentId },
-          pending: (pending ??= readDeferredPluginMigrations({ env })),
-        }).length === 0
-      ) {
+      if (!target.agentId) {
         return true;
       }
       const destination =
         target.sqlitePath ??
-        resolveSqliteTargetFromSessionStorePath(target.storePath, { agentId: target.agentId, env })
-          .path;
+        resolveSqliteTargetFromSessionStorePath(target.storePath, {
+          agentId: target.agentId,
+          ...readOptions,
+        }).path;
       owners.set(`${target.agentId}\0${destination}`, {
         target: { ...target, agentId: target.agentId },
         destination,
@@ -132,9 +127,9 @@ export function assertSessionStoreMigrationComplete(params: {
         target,
         sqlitePath: destination,
         env,
+        purpose: "readiness",
       });
-      // Owners without a database can never hold a replayable receipt (receipts bind
-      // the database identity, which a later-created database would invalidate).
+      // Owners without a database cannot have completed a core session import.
       // Without a receipt or unindexed history, demanding one deadlocks startup:
       // Doctor refuses to create a database just for the receipt.
       if (!receipt && source.entries.length === 0 && !fs.existsSync(destination)) {
@@ -173,7 +168,6 @@ export async function runSessionStartupMigration(params: {
   handoffDatabase?: (database: OpenClawAgentDatabaseOptions) => Promise<void>;
   deps?: {
     migrateLegacyMainSessionKeys?: typeof migrateLegacyMainSessionKeys;
-    migrateManagedWorktreeCanonicalWorkspaces?: typeof migrateManagedWorktreeCanonicalWorkspaces;
     resolveAllAgentSessionStoreTargetsSync?: typeof resolveAllAgentSessionStoreTargetsSync;
   };
 }): Promise<void> {
@@ -202,11 +196,9 @@ export async function runSessionStartupMigration(params: {
   }
 
   const databases = new Set<string>();
-  let migrateWorktreeSessions = params.deps?.migrateManagedWorktreeCanonicalWorkspaces;
   const registeredDatabases = new Set(
     listOpenClawRegisteredAgentDatabases({ env }).map((entry) => `${entry.agentId}\0${entry.path}`),
   );
-  let pendingWorktreeSessions = 0;
   const tasks = targets.map((target) => async () => {
     params.assertCurrent?.();
     const options = toDatabaseOptions(resolveSqliteReadScope({ ...target, env }));
@@ -245,8 +237,8 @@ export async function runSessionStartupMigration(params: {
           `session: SQLite startup maintenance failed for ${target.agentId}; continuing: ${String(error)}`,
         );
       }
-      // Canonical refusal is readiness failure. Drain before worktree and runtime
-      // visitors can otherwise parse a whole migrated store on the main thread.
+      // Canonical refusal is readiness failure. Drain before runtime visitors can
+      // otherwise parse a whole migrated store on the main thread.
       const { certifySessionCanonicalValidationPending } =
         await import("./session-canonical-validation-readiness.js");
       const { withSqliteCanonicalValidationWorker } =
@@ -256,23 +248,6 @@ export async function runSessionStartupMigration(params: {
         certifySessionCanonicalValidationPending(options, withWorker, params.assertCurrent),
       );
       params.assertCurrent?.();
-      try {
-        migrateWorktreeSessions ??= (await import("./worktree-workspace-migration.js"))
-          .migrateManagedWorktreeCanonicalWorkspaces;
-        params.assertCurrent?.();
-        const worktreeReport = await migrateWorktreeSessions({
-          ...target,
-          cfg: params.cfg,
-          env,
-          mode: "detect",
-        });
-        pendingWorktreeSessions += worktreeReport.found;
-      } catch (error) {
-        params.assertCurrent?.();
-        params.log.warn(
-          `session: SQLite startup maintenance failed for ${target.agentId}; continuing: ${String(error)}`,
-        );
-      }
       if (params.handoffDatabase) {
         // Runtime readiness failures must propagate; only successful handoff
         // transfers the cold connection beyond this maintenance operation.
@@ -289,18 +264,17 @@ export async function runSessionStartupMigration(params: {
   });
   // Share preflight's two-agent disk budget: overlap admission without multiplying
   // SQLite scans and worker heaps across the whole fleet. Drain active work on failure.
-  const { hasError, firstError } = await runTasksWithConcurrency({
-    tasks,
-    limit: AGENT_DATABASE_PREFLIGHT_CONCURRENCY,
-    errorMode: "stop",
+  const { withSqliteCanonicalValidationWorkerPool } =
+    await import("./session-accessor.sqlite-canonical-worker-pool.js");
+  await withSqliteCanonicalValidationWorkerPool(env, async () => {
+    const { hasError, firstError } = await runTasksWithConcurrency({
+      tasks,
+      limit: AGENT_DATABASE_PREFLIGHT_CONCURRENCY,
+      errorMode: "stop",
+    });
+    if (hasError) {
+      throw firstError;
+    }
   });
-  if (hasError) {
-    throw firstError;
-  }
   params.assertCurrent?.();
-  if (pendingWorktreeSessions > 0) {
-    params.log.warn(
-      `session: ${pendingWorktreeSessions} managed-worktree session(s) need canonical workspace repair; run openclaw doctor --fix`,
-    );
-  }
 }

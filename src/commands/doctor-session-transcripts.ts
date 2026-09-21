@@ -39,6 +39,8 @@ import {
   repairReservedIncognitoSessionKeys,
   type ReservedIncognitoKeyRepairReport,
 } from "./doctor-session-incognito-key-repair.js";
+import { listExistingAgentDatabaseTargets } from "./doctor-session-sqlite-readers.js";
+import { isInformationalMissingSessionIndex } from "./doctor-session-sqlite-types.js";
 import { formatSessionSqliteMigrationWarnings } from "./doctor-session-sqlite-warnings.js";
 import {
   repairLegacySessionTitles,
@@ -298,22 +300,27 @@ async function noteSessionSqliteMigrationHealth(params: {
       env: params.env,
     };
     canonicalKeyReport = await repairCanonicalSessionKeys(repairParams);
+    // Import and key repair can create stores; later row repairs share their settled inventory.
+    const rowRepairParams = {
+      ...repairParams,
+      targets: listExistingAgentDatabaseTargets(repairParams.cfg, params.env),
+    };
     // Canonical-key ties compare complete entry JSON, so select their winner before stripping it.
-    resolvedSkillsReport = repairCanonicalSessionResolvedSkills(repairParams);
+    resolvedSkillsReport = repairCanonicalSessionResolvedSkills(rowRepairParams);
     // Import may create the first durable SQLite row for a colliding legacy key.
-    reservedKeyReport = await repairReservedIncognitoSessionKeys(repairParams);
-    deliveryReport = repairCanonicalSessionDeliveryStates(repairParams);
-    repairLegacySessionExecPolicy(repairParams);
+    reservedKeyReport = await repairReservedIncognitoSessionKeys(rowRepairParams);
+    deliveryReport = repairCanonicalSessionDeliveryStates(rowRepairParams);
+    repairLegacySessionExecPolicy(rowRepairParams);
     acpKeyReport = await repairAcpSessionMetaKeysForDoctor({
       ...repairParams,
       authority: maintenanceAuthority,
     });
     titleReport = await repairLegacySessionTitles({
-      ...repairParams,
+      ...rowRepairParams,
       authority: maintenanceAuthority,
     });
     worktreeWorkspaceReport = await repairLegacySessionWorktreeWorkspaces({
-      ...repairParams,
+      ...rowRepairParams,
       // Workspace metadata participates in an unfinished legacy-main source claim.
       apply:
         params.shouldRepair && (!legacyMainSessionResult.armed || legacyMainSessionResult.complete),
@@ -489,10 +496,21 @@ async function noteSessionSqliteMigrationHealth(params: {
   ) {
     return postSessionPluginReceipt;
   }
+  const informationalIndexes = report.targets.filter(isInformationalMissingSessionIndex);
+  const actionableTargets = report.targets.filter(
+    (target) => !isInformationalMissingSessionIndex(target),
+  );
+  const actionableIssues = actionableTargets.reduce(
+    (count, target) => count + target.issues.length,
+    0,
+  );
   const lines = [
     `- Legacy entries: ${report.totals.legacyEntries}; SQLite entries: ${report.totals.sqliteEntries}.`,
     `- Transcript events: imported=${report.totals.importedTranscriptEvents}; validated=${report.totals.validatedTranscriptEvents}.`,
   ];
+  for (const target of informationalIndexes) {
+    lines.push(...target.issues.map((issue) => `- ${issue.message}`));
+  }
   if (report.totals.archivedTranscriptFiles > 0) {
     lines.push(
       `- Archived ${report.totals.archivedTranscriptFiles} legacy transcript artifact(s).`,
@@ -503,15 +521,15 @@ async function noteSessionSqliteMigrationHealth(params: {
       `- Archived ${report.totals.archivedUnreferencedJsonlFiles} unreferenced JSONL artifact(s).`,
     );
   }
-  if (report.totals.issues > 0) {
+  if (actionableIssues > 0) {
     lines.push(
-      ...formatSessionSqliteMigrationWarnings(report.targets).map((warning) => `- ${warning}`),
+      ...formatSessionSqliteMigrationWarnings(actionableTargets).map((warning) => `- ${warning}`),
     );
     lines.push(
-      `- Found ${report.totals.issues} session SQLite issue(s). Inspect with "${formatCliCommand("openclaw doctor --session-sqlite dry-run --session-sqlite-all-agents", params.env)}".`,
+      `- Found ${actionableIssues} session SQLite issue(s). Inspect with "${formatCliCommand("openclaw doctor --session-sqlite dry-run --session-sqlite-all-agents", params.env)}".`,
     );
   }
-  if (!params.shouldRepair) {
+  if (!params.shouldRepair && actionableTargets.length > 0) {
     lines.push(
       '- Run "openclaw doctor --fix" to migrate legacy session metadata/transcripts to SQLite.',
     );

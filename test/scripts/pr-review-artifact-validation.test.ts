@@ -16,7 +16,6 @@ import {
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 const bash = process.platform === "darwin" ? "/bin/bash" : "bash";
 const reviewScript = join(process.cwd(), "scripts/pr-lib/review.sh");
-const reviewArtifactsScript = join(process.cwd(), "scripts/pr-lib/review-artifacts.mjs");
 const mergeScript = join(process.cwd(), "scripts/pr-lib/merge.sh");
 const describePosix = process.platform === "win32" ? describe.skip : describe;
 const testNodeExecPath = resolveTestNodeExecPath();
@@ -161,13 +160,14 @@ function runMergeVerification(
         'fixture_root="$2"',
         'source "$script_parent_dir/pr-lib/common.sh"',
         'source "$script_parent_dir/pr-lib/worktree.sh"',
+        'source "$script_parent_dir/pr-lib/merge-outcome.sh"',
         'repo_root() { printf "%s\\n" "$fixture_root"; }',
         'enter_worktree() { cd "$fixture_root"; }',
         'require_artifact() { [ -s "$1" ]; }',
         "verify_prep_branch_matches_prepared_head() { :; }",
         `refresh_main_snapshot() { PR_MAIN_SHA=${"b".repeat(40)}; }`,
         "mark_pr_operation_side_effects_started() { :; }",
-        "git() {",
+        "pr_git() {",
         '  if [ "${1-}" = -C ]; then shift 2; fi',
         '  case "${1-}" in --git-dir=*) shift;; esac',
         '  case "$1" in',
@@ -181,8 +181,10 @@ function runMergeVerification(
         'node() { case "$1" in */watch-pr-ci.mjs) return 0;; *) command node "$@";; esac; }',
         "MERGE_REPO_NAME=fixture/repo",
         "MERGE_REPO_HOST=github.com",
-        `gh_plain() { case "$*" in *"issues/42/comments?per_page=100"*) printf '%s\\n' ${JSON.stringify(reviewComments)};; *"--json name,bucket,state"*) ${checksResponse};; *"--json state,isDraft,headRefOid"*) printf '%s\\n' '{"isDraft":false,"headRefOid":"${head}"}';; *) return 0;; esac; }`,
-        "gh() {",
+        `pr_gh_plain() { case "$*" in "issue-comments "*) printf '%s\\n' ${JSON.stringify(reviewComments)};; *"--json name,bucket,state"*) ${checksResponse};; *"--json state,isDraft,headRefOid"*) printf '%s\\n' '{"isDraft":false,"headRefOid":"${head}"}';; *) return 0;; esac; }`,
+        'pr_gh_quota_read() { pr_gh_plain "$@"; }',
+        `merge_rest() { echo 'REST policy requires GraphQL' >&2; printf '%s\\n' '{"restUnavailable":true}'; }`,
+        "pr_gh() {",
         '  test "$*" = "pr view 42 --json headRefName,headRefOid,headRepository,headRepositoryOwner" || return 99',
         `  printf '%s\\n' '{"headRefOid":"${head}","headRefName":"review-branch","headRepository":{"nameWithOwner":"fixture/repo"},"headRepositoryOwner":{"login":"fixture"}}'`,
         "}",
@@ -483,7 +485,11 @@ describePosix("scripts/pr review artifact validation", () => {
       const result = runMergeVerification(checks);
 
       expect(result.status).toBe(1);
-      expect(result.stderr).toContain("GitHub returned invalid required-check evidence");
+      expect(result.stderr).toContain(
+        checks === "invalid-json"
+          ? "unable to verify the required GitHub checks"
+          : "GitHub returned invalid required-check evidence",
+      );
       expect(result.stdout).not.toContain("merge-verify passed");
     },
   );
@@ -517,7 +523,7 @@ describePosix("scripts/pr review artifact validation", () => {
 
     expect(result.status).toBe(1);
     expect(result.stdout).toContain(
-      'Invalid behavioral sweep status in .local/review.json: "performed" (allowed: pass|needs_work|not_applicable)',
+      'Invalid behavioral sweep status in .local/review.json: behavioralSweep.status="performed" (allowed: pass|needs_work|not_applicable)',
     );
   });
 
@@ -530,24 +536,22 @@ describePosix("scripts/pr review artifact validation", () => {
 
     expect(result.status).toBe(1);
     expect(result.stdout).toContain(
-      'Invalid behavioral sweep status in .local/review.json: "performed" (allowed: pass|needs_work|not_applicable)',
+      'Invalid behavioral sweep status in .local/review.json: behavioralSweep.status="performed" (allowed: pass|needs_work|not_applicable)',
     );
     expect(result.stdout).toContain(
       "Invalid behavioral sweep in .local/review.json: behavioralSweep.branches must be an array",
     );
     expect(result.stdout).toContain(
-      'Invalid docs status in .local/review.json: "todo" (allowed: up_to_date|missing|not_applicable)',
+      'Invalid docs status in .local/review.json: docs="todo" (allowed: up_to_date|missing|not_applicable)',
     );
     expect(result.stdout).toContain("3 artifact violations");
   });
 
-  it("creates a valid unfinished review without fabricated proof", () => {
-    const result = spawnSync(
-      process.execPath,
-      [reviewArtifactsScript, "template", String(REVIEWED_PR), REVIEWED_HEAD],
-      { encoding: "utf8" },
-    );
-    const template = JSON.parse(result.stdout) as ReturnType<typeof validReview>;
+  it("freshly generated template is structurally valid", () => {
+    const { result, localDir } = runArtifactsInit();
+    const template = JSON.parse(readFileSync(join(localDir, "review.json"), "utf8")) as ReturnType<
+      typeof validReview
+    >;
     expect(result.status).toBe(0);
     expect(template.pr).toEqual({ number: REVIEWED_PR, headSha: REVIEWED_HEAD });
     expect(template.recommendation).toBe("NEEDS WORK");

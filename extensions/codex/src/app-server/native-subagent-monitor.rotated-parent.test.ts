@@ -29,6 +29,7 @@ import {
   notifyChildStarted,
   registerCodexNativeSubagentMonitor,
   successfulSendInputOutput,
+  turnStartedNotification,
   threadRead,
 } from "./native-subagent-monitor.test-support.js";
 import { matchesCodexNativeSubagentSubmissionBinding } from "./session-binding-record.js";
@@ -218,13 +219,7 @@ it.each([
       try {
         initialParent.bindTurn("parent-a");
         await notifyChildStarted(first);
-        await first.notify({
-          method: "turn/started",
-          params: {
-            threadId: "child-thread",
-            turn: { id: "turn-a", status: "inProgress", items: [] },
-          },
-        });
+        await first.notify(turnStartedNotification("turn-a"));
         await first.notify(
           childTurnCompletedNotification({
             turnId: "turn-a",
@@ -249,6 +244,7 @@ it.each([
           database!.prepare("SELECT * FROM task_runs ORDER BY created_at, task_id").all();
         let initialRows = rows();
         expect(initialRows).toHaveLength(1);
+        const initialTaskId = initialRows[0]!.task_id;
         expect(initialRows[0]).toMatchObject({
           run_id: initialRunId,
           status: scenario === "interrupted" ? "running" : "succeeded",
@@ -517,10 +513,12 @@ it.each([
           expect(unsubscribe).toHaveBeenCalledExactlyOnceWith({ threadId: "child-thread" });
           const retired = rows();
           expect(retired).toHaveLength(1);
+          expect(retired[0]!.last_event_at).toBeGreaterThan(Number(initialRows[0]!.last_event_at));
           expect(retired[0]).toEqual({
             ...initialRows[0],
             delivery_status: "failed",
             error: "Subagent parent session ended.",
+            last_event_at: retired[0]!.last_event_at,
           });
           releaseInitialDelivery();
           await initialDelivery;
@@ -543,13 +541,7 @@ it.each([
             "child-thread",
           );
         }
-        await current.notify({
-          method: "turn/started",
-          params: {
-            threadId: "child-thread",
-            turn: { id: "turn-b", status: "inProgress", items: [] },
-          },
-        });
+        await current.notify(turnStartedNotification("turn-b"));
         if (scenario === "active-followup-still-delivering") {
           await finishInitialDelivery();
           claimedAfterInitialDelivery = isCodexAppServerLiveThreadClaimed(
@@ -591,12 +583,8 @@ it.each([
             terminal_summary: "B result",
           });
         } else {
-          expect(afterStart.find((row) => row.task_id === initialRows[0]!.task_id)).toEqual(
-            initialRows[0],
-          );
-          expect(after.find((row) => row.task_id === initialRows[0]!.task_id)).toEqual(
-            initialRows[0],
-          );
+          expect(afterStart.find((row) => row.task_id === initialTaskId)).toEqual(initialRows[0]);
+          expect(after.find((row) => row.task_id === initialTaskId)).toEqual(initialRows[0]);
           if (scenario === "completed" || holdInitialDelivery) {
             expect(after).toHaveLength(2);
             expect(after.find((row) => row.run_id === followupRunId)).toMatchObject({
@@ -719,13 +707,7 @@ it.each([
   try {
     initial.bindTurn("initial-turn");
     await notifyChildStarted(client);
-    await client.notify({
-      method: "turn/started",
-      params: {
-        threadId: "child-thread",
-        turn: { id: "turn-a", status: "inProgress", items: [] },
-      },
-    });
+    await client.notify(turnStartedNotification("turn-a"));
     await client.notify(
       childTurnCompletedNotification({
         turnId: "turn-a",
@@ -763,13 +745,7 @@ it.each([
         submissionId: "turn-b",
       }),
     );
-    await client.notify({
-      method: "turn/started",
-      params: {
-        threadId: "child-thread",
-        turn: { id: "turn-b", status: "inProgress", items: [] },
-      },
-    });
+    await client.notify(turnStartedNotification("turn-b"));
     let secondRecord = structuredClone(records.get(secondRunId)!);
     expect(secondRecord).toMatchObject({ status: "running", runId: secondRunId });
     let receiptParent = "rotated-parent";

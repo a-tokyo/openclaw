@@ -1,3 +1,4 @@
+import { err, ok, type Result } from "@openclaw/normalization-core/result";
 import {
   ErrorCodes,
   errorShape,
@@ -18,12 +19,12 @@ import {
 } from "./operator-role-policy.js";
 import {
   authenticatedProfileUnavailableError,
-  gatewayClientSessionCreator,
   isGatewayClientProfilePending,
 } from "./server-methods/gateway-client-identity.js";
 import type { GatewayClient } from "./server-methods/types.js";
 import { prepareSessionCreatorProfile } from "./session-creator.js";
 import {
+  prepareGatewaySessionStoreTargetsReadOnly,
   resolveGatewaySessionStoreTargetsReadOnly,
   resolveGatewaySessionStoreTargetWithStore,
   type GatewaySessionStoreCache,
@@ -137,6 +138,27 @@ function toSessionSharingTarget(
     : null;
 }
 
+/** Prepare one synchronous batch while retaining each target's failure for ordered consumption. */
+export function prepareSessionSharingTargets(params: {
+  cfg: OpenClawConfig;
+  targets: readonly { sessionKey: string; agentId?: string }[];
+}): Array<Result<SessionSharingTarget | null, unknown>> {
+  return prepareGatewaySessionStoreTargetsReadOnly({
+    cfg: params.cfg,
+    targets: params.targets.map(({ sessionKey, agentId }) => ({ key: sessionKey, agentId })),
+    projection: "list",
+  }).map((result) => {
+    if (!result.ok) {
+      return result;
+    }
+    try {
+      return ok(toSessionSharingTarget(result.value));
+    } catch (error) {
+      return err(error);
+    }
+  });
+}
+
 export type SessionSharingRoleParams = {
   cfg?: OpenClawConfig;
   client: GatewayClient | null;
@@ -150,7 +172,8 @@ export function sharingIdentity(
   actor: ReturnType<typeof resolveGatewayOperatorRoleActor>,
 ) {
   const operator = actor?.kind === "operator" ? { id: actor.profileId } : undefined;
-  const identity = gatewayClientSessionCreator(client) ?? operator;
+  const profile = client?.authenticatedUserProfile;
+  const identity = profile ? { id: profile.profileId } : operator;
   // Owner attribution never narrows sharing; solo deployments stay owner-equivalent.
   return identity?.id === GATEWAY_OWNER_PROFILE_ID ? undefined : identity;
 }
@@ -315,7 +338,9 @@ export function authorizeResolvedSessionMutation(params: {
 export function authorizeSessionAgentRun(params: {
   cfg: OpenClawConfig;
   client: GatewayClient | null;
-  target: SessionSharingTarget;
+  target: Pick<SessionSharingTarget, "agentId" | "canonicalKey"> & {
+    entry?: Pick<SessionEntry, "sandbox">;
+  };
 }): ErrorShape | null {
   const agentError = authorizeGatewaySessionCreation({
     cfg: params.cfg,
@@ -327,7 +352,7 @@ export function authorizeSessionAgentRun(params: {
   }
   if (
     params.cfg.gateway?.roles &&
-    params.target.entry.sandbox !== "required" &&
+    params.target.entry?.sandbox !== "required" &&
     resolveOperatorRolePolicy(params.client, params.cfg)?.sandbox === "required"
   ) {
     return errorShape(

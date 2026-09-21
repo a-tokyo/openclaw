@@ -14,6 +14,7 @@ import {
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../helpers/temp-dir.js";
+import { assertFixtureProcessGroupStopped } from "./exited-descendant-reaper.test-support.js";
 import { createMainRefreshFixture } from "./pr-main-refresh.test-support.js";
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
@@ -23,7 +24,7 @@ const fixture = () => createMainRefreshFixture(tempDirs.make("openclaw-pr-main-r
 function recoverFixtureLock(f: ReturnType<typeof fixture>, oid: string) {
   const pgid = Number(/^pgid=(\d+)$/m.exec(f.git(f.canonical, "cat-file", "blob", oid))?.[1]);
   expect(pgid).toBeGreaterThan(1);
-  expect(() => process.kill(-pgid, 0)).toThrowError(expect.objectContaining({ code: "ESRCH" }));
+  assertFixtureProcessGroupStopped(pgid);
   const result = f.run(["lock-recover", "42", oid, "--confirmed-no-running-tools"]);
   expect(result.status, result.stdout + result.stderr).toBe(0);
   expect(
@@ -110,6 +111,15 @@ describePosix("native PR main refresh boundaries", () => {
       expect(checkouts.length).toBeGreaterThan(0);
       expect(checkouts.every((e) => e.args?.at(-1) === f.head)).toBe(true);
       expect(f.events().filter((e) => e.kind === "main-fetch")).toHaveLength(1);
+      expect(
+        f
+          .events()
+          .some(
+            (event) =>
+              event.kind === "gh" &&
+              event.args?.some((arg) => /\/(?:files|check-runs|status)\?/.test(arg)),
+          ),
+      ).toBe(false);
     },
   );
 
@@ -1044,7 +1054,7 @@ printf 'caller-locale=%s\\n' "$LC_ALL"
   it.each([
     [
       "commit read",
-      'git() { if [ "${DRIFT_FAULT_ACTIVE:-}" = 1 ] && [ "$1" = cat-file ]; then return 1; fi; command git "$@"; }',
+      'pr_git() { if [ "${DRIFT_FAULT_ACTIVE:-}" = 1 ] && [ "$1" = cat-file ]; then return 1; fi; command git "$@"; }',
     ],
     [
       "scratch allocation",
@@ -1052,11 +1062,11 @@ printf 'caller-locale=%s\\n' "$LC_ALL"
     ],
     [
       "mainline diff",
-      'git() { if [ "${DRIFT_FAULT_ACTIVE:-}" = 1 ] && [ "$1" = diff ] && [[ "$3" = *"$PR_MAIN_SHA" ]]; then return 1; fi; command git "$@"; }',
+      'pr_git() { if [ "${DRIFT_FAULT_ACTIVE:-}" = 1 ] && [ "$1" = diff ] && [[ "$3" = *"$PR_MAIN_SHA" ]]; then return 1; fi; command git "$@"; }',
     ],
     [
       "prepared diff",
-      'git() { if [ "${DRIFT_FAULT_ACTIVE:-}" = 1 ] && [ "$1" = diff ] && [[ "$3" = *"$PREP_HEAD_SHA" ]]; then return 1; fi; command git "$@"; }',
+      'pr_git() { if [ "${DRIFT_FAULT_ACTIVE:-}" = 1 ] && [ "$1" = diff ] && [[ "$3" = *"$PREP_HEAD_SHA" ]]; then return 1; fi; command git "$@"; }',
     ],
     [
       "overlap read",
@@ -1168,22 +1178,30 @@ fi`,
     expect(f.events().some((e) => e.kind === "main-fetch")).toBe(false);
   });
 
-  it("stops native merge on viewer quota failure before fetch or dispatch and releases its lock", () => {
+  it("stops native merge when both writer quotas are exhausted before fetch or dispatch and releases its lock", () => {
     const f = fixture();
-    f.configure({ viewerRateLimited: true });
+    f.configure({ writerRateLimited: true });
     const result = f.run("merge-run");
     expect(result.status, result.stdout + result.stderr).toBe(1);
-    expect(result.stderr).toContain("GitHub API preflight rate limited");
+    expect(result.stderr).toContain("GitHub API request failed (resource=graphql)");
+    expect(result.stderr).toContain("original response: HTTP 403");
+    expect(result.stderr).toContain("resource=graphql; remaining=0; limit=unknown; reset=unknown");
+    expect(result.stderr).not.toContain("Supplemental quota probe");
     expect(f.events().some((e) => e.kind === "main-fetch")).toBe(false);
     const ghCalls = f.events().filter((e) => e.kind === "gh");
-    expect(ghCalls.at(-1)?.args).toEqual([
+    const apiCalls = ghCalls.filter((e) => e.args?.[0] === "api").map((e) => e.args);
+    expect(apiCalls.at(-1)).toEqual([
       "api",
       "graphql",
-      "-f",
-      "query=query { viewer { login } }",
       "--include",
+      "-f",
+      "query=query{viewer{login}}",
     ]);
+    expect(apiCalls.filter((args) => args?.includes("rate_limit"))).toHaveLength(0);
+    expect(apiCalls.filter((args) => args?.includes("user"))).toHaveLength(1);
+    expect(apiCalls.filter((args) => args?.includes("graphql"))).toHaveLength(1);
     expect(ghCalls.some((e) => e.args?.includes("merge"))).toBe(false);
+    expect(ghCalls.some((e) => e.args?.[0] === "workflow")).toBe(false);
     expect(f.git(f.origin, "rev-parse", "refs/heads/main")).toBe(f.main);
     expect(f.git(f.canonical, "for-each-ref", "--format=%(refname)", "refs/openclaw")).toBe("");
   });

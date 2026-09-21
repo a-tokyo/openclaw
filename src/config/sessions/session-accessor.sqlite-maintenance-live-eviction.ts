@@ -20,7 +20,7 @@ import {
   openOpenClawAgentDatabase,
   type OpenClawAgentDatabase,
 } from "../../state/openclaw-agent-db.js";
-import { sessionDeliveryOrigin } from "../../utils/delivery-context.shared.js";
+import { sessionDeliveryOrigin } from "../../utils/delivery-context.read.js";
 import { measureSessionPhysicalDiskUsage, type SessionPhysicalDiskUsage } from "./disk-budget.js";
 import type { SessionStateDeletePlan } from "./session-accessor.sqlite-archive-types.js";
 import { readSessionEntryStore } from "./session-accessor.sqlite-entry-inventory.js";
@@ -252,6 +252,7 @@ function planSqliteLiveEntryRemovals(params: {
     }
   }
   return {
+    archivedSessionKeys: [],
     entryRemovals: [...params.removedEntriesByKey].map(([sessionKey, entry]) => ({
       expectedEntry: entry,
       sessionKey,
@@ -337,6 +338,7 @@ export function planOldestCapacityEligibleSqliteLiveEntryRemoval(params: {
 
   if (!victim) {
     return {
+      archivedSessionKeys: [],
       entryRemovals: [],
       stateDeletePlans: [],
       archived: 0,

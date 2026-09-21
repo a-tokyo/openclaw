@@ -28,6 +28,11 @@ import { recordCodexTrajectoryContext } from "./trajectory.js";
 import { buildCodexUserPromptMessage } from "./transcript-mirror.js";
 import { buildCodexParentLocalInstructions } from "./turn-params.js";
 
+export type CodexStartedTurn = {
+  turn: CodexTurnStartResponse;
+  upstreamUserText: string;
+};
+
 export async function prepareCodexAttemptTurnRequest(
   resources: CodexAttemptResources,
   turnRuntime: CodexAttemptTurnState,
@@ -118,7 +123,7 @@ export async function prepareCodexAttemptTurnRequest(
     prompt.refreshWorkspaceReferences(references.include);
     return references;
   };
-  const startCodexTurn = async (): Promise<CodexTurnStartResponse> => {
+  const startCodexTurn = async (): Promise<CodexStartedTurn> => {
     const activeTurnRoute = (await ensureCurrentThreadRoute()) as {
       armTurn(): void;
       cancelTurn(): Promise<void>;
@@ -245,6 +250,9 @@ export async function prepareCodexAttemptTurnRequest(
       },
     });
     let acceptedTurnId: string | undefined;
+    const upstreamUserText = turnStartParams.input
+      .flatMap((item) => (item.type === "text" ? [item.text] : []))
+      .join("\n");
     try {
       const startedTurn = assertCodexTurnStartResponse(
         await resourceState.client.request("turn/start", turnStartParams, {
@@ -254,13 +262,18 @@ export async function prepareCodexAttemptTurnRequest(
         }),
       );
       acceptedTurnId = startedTurn.turn.id;
+      resources.nativeProcessAuthority?.bindTurn(
+        resourceState.client,
+        resourceState.thread.threadId,
+        acceptedTurnId,
+      );
       connection.assertCurrent();
       // Fitting may drop or truncate references; only acknowledge the complete block.
       if (referencesRetained) {
         references.accepted();
       }
       throwIfTurnStartAcceptedAfterAbort();
-      return startedTurn;
+      return { turn: startedTurn, upstreamUserText };
     } catch (error) {
       if (acceptedTurnId || isCodexAppServerIndeterminateRequestCancellationError(error)) {
         // Codex serializes start/interrupt per thread; an empty id interrupts

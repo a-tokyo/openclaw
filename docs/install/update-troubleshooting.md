@@ -17,6 +17,14 @@ start one owned automatic repair; other failures retain diagnostics and handoff
 commands. See [automatic recovery](/cli/triage#automatic-failure-handoff). The original update failure and exit status remain authoritative;
 diagnostics do not turn a failed update into a successful one.
 
+If the update health check emits a complete lint report but does not exit before
+its deadline, the failure identifies that completion separately from process
+termination. An exited child whose output pipes remain open is reported
+separately. Without a complete lint report, a deadline does not establish that
+the checks finished. When automatic repair cannot find a usable inference route
+before starting a repair turn, it is recorded as skipped; the original update
+check remains the reported failure.
+
 In the Control UI, a failed attempt opens **Ask OpenClaw** with its recorded
 details and asks it to investigate before retrying. A lost connection or
 verification timeout is presented as an unknown outcome. The tab remembers the
@@ -84,6 +92,28 @@ The controls require a connected Gateway, support for the corresponding typed
 Gateway method, and administrator scope. When those conditions are not met, use
 the CLI fallback on the Gateway host.
 
+## Doctor cannot enter maintenance during finalization
+
+`finalize:doctor` can report `Doctor could not enter maintenance` when a Gateway
+still owns the selected state directory. A starting Gateway and a healthy serving
+Gateway retain that ownership for their entire process lifetime; waiting for
+readiness does not release the lock.
+
+Finalizers with this recovery wait for startup through the existing readiness
+observer. If the same holder is verified serving the installed version and build,
+the update finishes with a warning and leaves the Gateway running. Update history
+names the holder and records the skipped Doctor pass. Config and plugin maintenance
+remain pending. At the next maintenance window, stop that Gateway through its
+service or deployment owner, run `openclaw update repair`, then start it through
+the same owner. Check `openclaw update status --json` and
+`openclaw gateway status --deep` for the recorded warning and current health.
+
+Do not delete lock files to force entry. A dead process releases the physical lock,
+and lease owners reclaim provably dead identities. Unknown ownership, an unreadable
+database, incompatible schemas, active database writers, or unconfirmed subprocess
+cleanup still require their named recovery action; a maintenance warning does not
+authorize concurrent repair or discard recovery backups.
+
 ## Node and global install permissions
 
 For `node-runtime-preflight`, upgrade the runtime named in the message to a
@@ -145,6 +175,57 @@ Inside a container, the same next action also directs you to pull or build the
 target OpenClaw image and redeploy with the same state/config mounts. Package
 changes inside a running container are not durable.
 
+## Published 2026.9.4 on large agent fleets
+
+The published 2026.9.4 updater shares a five-minute deadline across snapshot
+preparation and candidate checks. Its failure log tail combines output from
+those checks: `Doctor complete.` can belong to the preceding repair pass, even
+when lint is the failed step. The elapsed time in the final log line measures
+the whole rehearsal; the step duration measures the individual check. A complete
+lint JSON report is needed to establish that lint finished before termination.
+
+Published OpenClaw 2026.9.4 can spend many minutes preparing model catalogs and
+chat metadata after its HTTP listener binds. In an instrumented 480-agent
+control with no update, HTTP probes remained unanswered during 944 seconds of
+observation; the Gateway then logged `ready` at 947.5 seconds. Stopping that
+instance eventually required systemd's existing 5-minute-30-second stop limit.
+These are measurements of one synthetic fixture, not expected startup budgets.
+
+A second, uninstrumented 480-agent control first passed signed Gateway
+handshake, serving-build, and health-RPC checks, then lost HTTP responsiveness
+without any update. The 25-minute post-readiness control completed; sampled
+failures spanned 24 minutes before a final three-minute serving check also
+failed. The original PID and installation remained. Shared schema 17, all 481
+physical agent databases at schema 19, and config bytes stayed unchanged;
+captured state-maintenance leases were empty.
+
+The main thread consumed nearly one CPU core. Logs showed existing scheduled
+review attempts, fleet-wide integrity checks, and memory-plugin startup cleanup
+errors. This reproduces a published Gateway fleet preparation/background
+maintenance availability problem independently of updating. Its exact JavaScript
+hot loop remains unprofiled, and the original failed-update run lacked the
+live-state evidence needed to exclude an additional state or recovery defect.
+A retained package, PID, or `serviceRestartSafe: true` does not establish that
+the previous Gateway is serving.
+See [the investigation](https://github.com/openclaw/openclaw/issues/151295).
+
+Before recovery, preserve the update report and a
+[verified backup](/install/updating/rollback-and-recovery#before-updating-create-a-verified-backup).
+Keep the same service account, profile, package manager, and installation prefix.
+Have that installation's owner stop the Gateway and other writers before manual
+replacement. When the installed updater cannot complete, use the
+[manual package-manager procedure](/install/updating/update-methods#alternative-manual-npm-pnpm-or-bun)
+with an exact target compatible with the retained state, then run the target's
+`openclaw doctor --fix` before starting its Gateway. If the retained binary
+cannot read the current state, follow
+[backup recovery](/install/updating/rollback-and-recovery#downgrade); changing
+schema markers or deleting lease rows does not reverse migrations.
+
+Verify the actual serving version/build through an authenticated Gateway RPC
+and check `/readyz` before declaring recovery or removing backups. The
+plain-start control did not verify these recovery steps or establish that
+restarting the same 2026.9.4 fleet resolves the failed-update condition.
+
 ## Plugin repair warnings
 
 Doctor's configured-plugin repair and payload-verification warnings do not block
@@ -181,6 +262,10 @@ catalog omitted that source for Codex; the correction is on main in
 ## Reason codes
 
 - `dirty`, `no-upstream`: repair the source checkout before retrying.
+- `runtime-artifact-publication`: the affected Gateway is running or cannot be
+  verified offline. Inspect `openclaw gateway status --deep`, stop it through its
+  service owner, and retry. On macOS, a loaded LaunchAgent can respawn even when
+  disabled and temporarily has no PID; `openclaw gateway stop` unloads it.
 - `update-ledger-busy`: another process held the state database's write lock
   beyond the update step budget. The command exited successfully without admitting
   a run and left previous history intact. Retry once the Gateway's writes settle.
@@ -232,6 +317,14 @@ changed` when the updater's umask differs from the installed launcher's
   not writable by the invoking user; fix ownership and permissions, then retry.
   Re-run the [installer](/install/installer) if the package install is
   incomplete.
+- `runtime-verification-failed` near 300 seconds at `candidate gateway canary`
+  when updating from 2026.9.4: the installed updater shares that deadline across
+  the snapshot and candidate checks, even with a larger `--timeout`. The elapsed
+  failure duration is not Gateway startup time alone. Use the same
+  [manual package-manager procedure](/install/updating/update-methods#alternative-manual-npm-pnpm-or-bun),
+  then run `openclaw doctor --fix` and restart the Gateway. See
+  [#144858](https://github.com/openclaw/openclaw/issues/144858) and
+  [#154381](https://github.com/openclaw/openclaw/issues/154381).
 - `doctor-failed`: run `openclaw doctor` on the Gateway host, resolve its
   findings, then retry. See [Doctor](/cli/doctor) for the check list and
   `--fix` behavior.

@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from "node:util";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import { normalizeAgentToolResultMiddlewareRuntimeIds } from "./agent-tool-result-middleware.js";
 import { createUnavailableRuntime } from "./api-builder.js";
@@ -36,16 +37,28 @@ import {
   isPluginRegistryActivated,
   withPluginRegistryPreparationScope,
 } from "./registry-lifecycle.js";
-import { getPluginRegistryRuntime } from "./registry-runtime-binding.js";
 import { createPluginRegistry, type PluginRegistry } from "./registry.js";
 import { degradedPluginMatchesRoot, findActiveDegradedPlugin } from "./runtime-degraded-state.js";
-import { getActivePluginRegistry } from "./runtime.js";
+import {
+  bindGatewayContextResolver,
+  getGatewayContextResolver,
+} from "./runtime/gateway-request-scope.js";
 import { setPluginRuntimeLoadContext } from "./runtime/load-context.js";
 import type { PluginRuntime } from "./runtime/types.js";
 import { hasKind } from "./slots.js";
 
 type PluginLoadInput = { source: string; signature: string; config: PreparedPluginConfig };
 const registryInputs = new WeakMap<PluginRegistry, Map<string, PluginLoadInput>>();
+
+/** Captured JSON inputs ignore object key order, but preserve array order and values. */
+function samePluginLoadInput(left: string | undefined, right: string | undefined): boolean {
+  return (
+    left === right ||
+    (left !== undefined &&
+      right !== undefined &&
+      isDeepStrictEqual(JSON.parse(left), JSON.parse(right)))
+  );
+}
 
 type PluginModuleLoaderOverrides = Pick<
   Parameters<typeof createPluginModuleLoader>[0],
@@ -57,13 +70,15 @@ export type InternalPluginLoadOverrides = {
 };
 
 function createDeferredGatewaySubagentRuntime(runtime: PluginRuntime): PluginRuntime["subagent"] {
-  return {
+  const subagent: PluginRuntime["subagent"] = {
     complete: (...args) => runtime.subagent.complete(...args),
     run: (...args) => runtime.subagent.run(...args),
     waitForRun: (...args) => runtime.subagent.waitForRun(...args),
     getSessionMessages: (...args) => runtime.subagent.getSessionMessages(...args),
     deleteSession: (...args) => runtime.subagent.deleteSession(...args),
   };
+  bindGatewayContextResolver(subagent, getGatewayContextResolver(runtime));
+  return subagent;
 }
 
 function createDeferredGatewayNodesRuntime(runtime: PluginRuntime): PluginRuntime["nodes"] {
@@ -144,18 +159,11 @@ export function loadOpenClawPluginsCore(
       expectedSourceDigests: options.expectedSourceDigests,
       ...overrides?.moduleLoader,
     });
-    const activeRuntime =
-      options.runtimeOptions?.allowGatewaySubagentBinding === true
-        ? getActivePluginRegistry()
-        : undefined;
-    const activeGatewayRuntime = activeRuntime
-      ? getPluginRegistryRuntime(activeRuntime)
+    const borrowedSubagent = context.borrowedGatewayRuntime
+      ? createDeferredGatewaySubagentRuntime(context.borrowedGatewayRuntime)
       : undefined;
-    const borrowedSubagent = activeGatewayRuntime
-      ? createDeferredGatewaySubagentRuntime(activeGatewayRuntime)
-      : undefined;
-    const borrowedNodes = activeGatewayRuntime
-      ? createDeferredGatewayNodesRuntime(activeGatewayRuntime)
+    const borrowedNodes = context.borrowedGatewayRuntime
+      ? createDeferredGatewayNodesRuntime(context.borrowedGatewayRuntime)
       : undefined;
     const runtime =
       options.mode === "cli-metadata"
@@ -300,7 +308,12 @@ export function loadOpenClawPluginsCore(
       );
       const previousInput =
         options.previousRegistry && registryInputs.get(options.previousRegistry)?.get(manifest.id);
-      if (previous && !replacedIds.has(manifest.id) && previousInput?.signature === signature) {
+      if (
+        previous &&
+        previousInput &&
+        !replacedIds.has(manifest.id) &&
+        samePluginLoadInput(previousInput.signature, signature)
+      ) {
         // Reserve retained contributions before newcomers register. Reuse validation only after
         // matching policy/admission inputs, leaving excluded candidates on their existing path.
         if (previousInput.config.validation) {
@@ -311,7 +324,7 @@ export function loadOpenClawPluginsCore(
             preparedConfig,
           });
         }
-        if (previousInput.config.input === preparedConfig.input) {
+        if (samePluginLoadInput(previousInput.config.input, preparedConfig.input)) {
           retained.set(manifest.id, previous);
           projectPluginContributions(options.previousRegistry!, previous, registry);
         }

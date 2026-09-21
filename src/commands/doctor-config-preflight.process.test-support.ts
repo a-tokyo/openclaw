@@ -108,10 +108,14 @@ export function createSourceRuntime(root: string): string {
     );
   }
   for (const filename of [
+    "node-host-launcher.mjs",
     "node-version.mjs",
     "node-sqlite.mjs",
     "node-runtime-update.mjs",
     "node-runtime-recovery.mjs",
+    "cli-root-options.mjs",
+    "gateway-run-argv.mjs",
+    "gateway-shutdown-budget.mjs",
     "package.json",
     "tsconfig.json",
   ]) {

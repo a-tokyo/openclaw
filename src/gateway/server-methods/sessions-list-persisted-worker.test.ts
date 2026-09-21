@@ -5,14 +5,17 @@ import {
   persistSubagentRunsToDiskOrThrow,
 } from "../../agents/subagents/registry/subagent-registry-state.js";
 import type { SubagentRunRecord } from "../../agents/subagents/registry/subagent-registry.types.js";
+import { createEmbeddedCallGateway } from "../../agents/tools/embedded-gateway-stub.js";
 import { setRuntimeConfigSnapshot } from "../../config/config.js";
 import { upsertSessionEntryCore } from "../../config/sessions/session-accessor.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import { createSqliteWorkerWriteAdmission } from "../../infra/sqlite-worker-store.js";
 import { createDeferredCore } from "../../shared/deferred.js";
 import { captureOpenClawStateWorkerContext } from "../../state/openclaw-state-worker-context.js";
 import { runOpenClawStateWorkerOperation } from "../../state/openclaw-state-worker-store.js";
 import { ensureProfileForEmail } from "../../state/user-profiles.js";
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
+import { EmbeddedTuiBackend } from "../../tui/embedded-backend.js";
 import { getSessionRowProjection } from "../session-row-projection-access.js";
 import { sessionByKeyReadHandlers } from "./sessions-read-by-key.js";
 import {
@@ -182,6 +185,7 @@ it("lists off-page controller links and deleted-collector totals while a sibling
       const key = { pluginId: "session-list-proof", namespace: "mixed-progress", key: "written" };
       const context = requestContext(cfg);
       await initializeSessionReadContext(context);
+      const workerContext = captureOpenClawStateWorkerContext();
       try {
         const [result, written] = await Promise.all([
           listSessions({
@@ -189,17 +193,24 @@ it("lists off-page controller links and deleted-collector totals while a sibling
             context,
             request: { limit: 1 },
           }),
-          runOpenClawStateWorkerOperation(captureOpenClawStateWorkerContext(), (worker) =>
-            worker.execute({
-              type: "pluginState.register",
-              input: {
-                ...key,
-                valueJson: "true",
-                maxEntries: 4,
-                maxPluginEntries: 4,
-                overflowPolicy: "reject-new",
-              },
-            }),
+          runOpenClawStateWorkerOperation(
+            workerContext,
+            (worker) =>
+              worker.execute({
+                type: "pluginState.register",
+                input: {
+                  ...key,
+                  valueJson: "true",
+                  maxEntries: 4,
+                  overflowPolicy: "reject-new",
+                },
+              }),
+            {
+              createAdmission: createSqliteWorkerWriteAdmission(
+                workerContext.admission.assertCurrent,
+                [workerContext.admission.databasePath],
+              ),
+            },
           ),
         ]);
         expect(written).toEqual({ ok: true, value: undefined });
@@ -216,9 +227,6 @@ it("lists off-page controller links and deleted-collector totals while a sibling
           ],
         });
         expect(JSON.stringify(result)).not.toContain("retained synthetic");
-        const { createEmbeddedCallGateway } =
-          await import("../../agents/tools/embedded-gateway-stub.js");
-        const { EmbeddedTuiBackend } = await import("../../tui/embedded-backend.js");
         const backend = new EmbeddedTuiBackend();
         backend.start();
         try {

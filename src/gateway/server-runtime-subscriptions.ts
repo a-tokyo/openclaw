@@ -34,7 +34,11 @@ import { onSessionLifecycleEvent } from "../sessions/session-lifecycle-events.js
 import { onInternalSessionTranscriptUpdate } from "../sessions/transcript-events.js";
 import { createLazyPromise, createLazyPromiseLoader } from "../shared/lazy-runtime.js";
 import { onUserProfilesChanged } from "../state/user-profile-events.js";
-import { markChatAbortTerminalPersistenceError } from "./chat-abort-lifecycle-internal.js";
+import {
+  bindChatAbortTerminalDispatch,
+  markChatAbortTerminalPersistenceError,
+  type ChatAbortTerminalDispatch,
+} from "./chat-abort-lifecycle-internal.js";
 import {
   type ChatAbortControllerEntry,
   removeChatAbortControllerEntry,
@@ -69,7 +73,7 @@ function dispatchEventHandler<TEvent>(params: {
   log: SubsystemLogger;
   failureMessage: string;
   context: Record<string, unknown>;
-  onFailure?: () => void;
+  onFailure?: (error: unknown) => void;
 }) {
   return runWithRetainedGatewayRootWork(() =>
     params
@@ -78,7 +82,7 @@ function dispatchEventHandler<TEvent>(params: {
       .then(() => undefined)
       .catch((error: unknown) => {
         params.log.warn(params.failureMessage, { ...params.context, error });
-        params.onFailure?.();
+        params.onFailure?.(error);
       }),
   );
 }
@@ -221,8 +225,6 @@ export function startGatewayEventSubscriptions(params: {
         continue;
       }
       entry.projectSessionActive = false;
-      entry.projectSessionTerminalPersisted = false;
-      markChatAbortTerminalPersistenceError(entry, undefined);
       queueMicrotask(() => {
         const current = params.chatAbortControllers.get(candidateRunId);
         if (
@@ -235,35 +237,30 @@ export function startGatewayEventSubscriptions(params: {
       });
     }
   };
-  const settleTrackedTerminal = (run: {
-    runId: string;
-    clientRunId: string;
-    persisted?: boolean;
-  }) => {
-    const persisted = run.persisted ?? true;
+  const settleTrackedTerminal = (run: { runId: string; clientRunId: string }) => {
     for (const candidateRunId of trackedRunIds(run.runId, run.clientRunId)) {
       const entry = params.chatAbortControllers.get(candidateRunId);
-      if (!entry) {
+      if (!entry || entry.projectSessionTerminalPersistence) {
         continue;
       }
-      if (persisted) {
-        params.restartRecoveryCandidates.delete(candidateRunId);
-        markChatAbortTerminalPersistenceError(entry, undefined);
-      }
       entry.projectSessionTerminalPending = false;
-      entry.projectSessionTerminalPersistence = undefined;
-      entry.projectSessionTerminalPersisted = persisted;
+      entry.projectSessionTerminalPersisted = false;
       if (entry.registrationCleanupRequested === true) {
         removeChatAbortControllerEntry(params.chatAbortControllers, candidateRunId, entry);
       }
     }
   };
+  const trackedTerminalWrites = new WeakSet<Promise<void>>();
   const trackTrackedRunTerminalPersistence = (run: {
     runId: string;
     clientRunId: string;
     sessionId?: string;
     persistence: Promise<void>;
   }) => {
+    // Ingress and the lazy chat consumer adopt the same prepared write once.
+    if (trackedTerminalWrites.has(run.persistence)) {
+      return true;
+    }
     let tracked = false;
     for (const candidateRunId of trackedRunIds(run.runId, run.clientRunId)) {
       const entry = params.chatAbortControllers.get(candidateRunId);
@@ -271,17 +268,35 @@ export function startGatewayEventSubscriptions(params: {
         continue;
       }
       tracked = true;
+      entry.projectSessionTerminalPersisted = false;
+      markChatAbortTerminalPersistenceError(entry, undefined);
       entry.projectSessionTerminalPersistence = run.persistence;
-      void run.persistence.catch((error: unknown) => {
-        markChatAbortTerminalPersistenceError(entry, error);
-      });
       const lifecycleGeneration = entry.lifecycleGeneration?.trim();
       const sessionKey = entry.sessionKey.trim();
       const sessionId = run.sessionId?.trim() || entry.sessionId.trim();
       // Lazy chat consumption must retain the terminal time stamped at ingress.
       const observedAt = entry.projectSessionTerminalObservedAt;
-      if (entry.controlUiVisible !== false && lifecycleGeneration && sessionKey && sessionId) {
-        void run.persistence.catch(() => {
+      const settle = (persisted: boolean, error?: unknown) => {
+        if (entry.projectSessionTerminalPersistence !== run.persistence) {
+          return;
+        }
+        // Maintenance can retire the registration before its write settles.
+        // Captured drain targets still need this exact owner's final facts.
+        entry.projectSessionTerminalPending = false;
+        entry.projectSessionTerminalPersistence = undefined;
+        entry.projectSessionTerminalPersisted = persisted;
+        markChatAbortTerminalPersistenceError(entry, error);
+        if (params.chatAbortControllers.get(candidateRunId) !== entry) {
+          return;
+        }
+        if (persisted) {
+          params.restartRecoveryCandidates.delete(candidateRunId);
+        } else if (
+          entry.controlUiVisible !== false &&
+          lifecycleGeneration &&
+          sessionKey &&
+          sessionId
+        ) {
           params.restartRecoveryCandidates.set(candidateRunId, {
             runId: candidateRunId,
             lifecycleGeneration,
@@ -289,8 +304,18 @@ export function startGatewayEventSubscriptions(params: {
             sessionId,
             observedAt,
           });
-        });
-      }
+        }
+        if (entry.registrationCleanupRequested === true) {
+          removeChatAbortControllerEntry(params.chatAbortControllers, candidateRunId, entry);
+        }
+      };
+      void run.persistence.then(
+        () => settle(true),
+        (error: unknown) => settle(false, error),
+      );
+    }
+    if (tracked) {
+      trackedTerminalWrites.add(run.persistence);
     }
     return tracked;
   };
@@ -444,6 +469,7 @@ export function startGatewayEventSubscriptions(params: {
     }
     let failedDispatchCleanup: (() => void) | undefined;
     let terminalPreparation: Promise<void> | undefined;
+    let terminalEntries: ChatAbortControllerEntry[] | undefined;
     sessionObserver.handleEvent(evt);
     sessionActivitySummaries.handleEvent(evt);
     if (auditEnabled) {
@@ -474,6 +500,7 @@ export function startGatewayEventSubscriptions(params: {
         ) {
           entry.projectSessionTerminalPending = true;
           entry.projectSessionTerminalObservedAt = observedAt;
+          (terminalEntries ??= []).push(entry);
         }
       }
       const trackedEntry = candidateRunIds
@@ -545,10 +572,6 @@ export function startGatewayEventSubscriptions(params: {
             params.log.warn("Terminal session persistence failed", { runId: evt.runId, error });
           });
         }
-        void persistence.then(
-          () => settleTrackedTerminal({ runId: evt.runId, clientRunId }),
-          () => settleTrackedTerminal({ runId: evt.runId, clientRunId, persisted: false }),
-        );
         return persistence;
       };
       if (canPersistTerminal) {
@@ -591,6 +614,9 @@ export function startGatewayEventSubscriptions(params: {
       }
     }
     const dispatchPreparation = terminalPreparation;
+    const terminalDispatch: Pick<ChatAbortTerminalDispatch, "failure"> | undefined = terminalEntries
+      ? {}
+      : undefined;
     const dispatch = dispatchEventHandler<AgentEventRuntimePayload>({
       loadHandler: dispatchPreparation
         ? async () => {
@@ -602,8 +628,14 @@ export function startGatewayEventSubscriptions(params: {
       log: params.log,
       failureMessage: "Agent event dispatch failed",
       context: { runId: evt.runId, stream: evt.stream },
-      onFailure: () => failedDispatchCleanup?.(),
+      onFailure: (error) => {
+        if (terminalDispatch) {
+          terminalDispatch.failure = { error };
+        }
+        failedDispatchCleanup?.();
+      },
     });
+    bindChatAbortTerminalDispatch(terminalEntries, dispatch, terminalDispatch);
     agentEventDispatches.add(dispatch);
     void dispatch.then(() => agentEventDispatches.delete(dispatch));
   });

@@ -75,6 +75,14 @@ Hot reload and secrets reload preserve that distinction: catalog compatibility
 metadata does not become a custom request override that switches a native runtime
 back to OpenClaw.
 
+Changing `session.store` does not migrate conversations. Queued notifications
+bound to the previous physical store end with a recorded `store-replaced` outcome.
+Pending child-result delivery is suspended while the result and completed task
+remain available for explicit recovery; selecting the old store again does not
+automatically re-arm that delivery.
+Replacement and in-process restart that keep the same store preserve queued
+notification handoff.
+
 | Category                  | Fields                                                                                                                                                                                                                                                             | Gateway restart needed?                |
 | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------- |
 | Channels                  | `channels.*`, `web` (WhatsApp)                                                                                                                                                                                                                                     | Depends on setting and loaded plugin   |
@@ -93,6 +101,7 @@ back to OpenClaw.
 | Gateway client features   | `gateway.cliAgents`, selected `gateway.controlUi` settings below                                                                                                                                                                                                   | No                                     |
 | Gateway push              | `gateway.push.apns.relay`                                                                                                                                                                                                                                          | No (next push)                         |
 | Gateway terminal          | `gateway.terminal`                                                                                                                                                                                                                                                 | No                                     |
+| Desktop Labs              | `desktop.host.enabled`, `cloudWorkers.desktop`                                                                                                                                                                                                                     | No (updates desktop availability)      |
 | Gateway credentials       | `gateway.auth.token`, `gateway.auth.password`, with the same effective auth mode                                                                                                                                                                                   | No (old shared-auth clients reconnect) |
 | Gateway auth limits       | `gateway.auth.rateLimit`                                                                                                                                                                                                                                           | No (retains limiter state)             |
 | Discovery visibility      | `discovery.mdns.mode`                                                                                                                                                                                                                                              | No (replaces discovery advertisements) |
@@ -141,7 +150,7 @@ their original handlers. Workspace changes reload directory hooks from the
 newly selected workspace. Reload does not replay `gateway:startup`.
 
 Under `gateway.controlUi`, the `enabled`, `environment`, `github`,
-`sessionObserver`, `embedSandbox`, `allowExternalEmbedUrls`, and
+`sessionObserver`, `embedSandbox`, `allowExternalEmbedUrls`, `experimental.customPlugins`, and
 `automaticallyFetchFavicons` settings hot-apply. Reload open Control UI pages to
 pick up the environment label, CLI agent picker, embed preferences, and favicon
 display preference; the Gateway process keeps running. `allowedOrigins` and
@@ -151,6 +160,18 @@ Disabling the Control UI stops serving dashboard pages and assets and cancels
 pending asset preparation. Existing Gateway connections and agent runs continue.
 Re-enabling prepares missing dashboard assets in the background; requests return
 `503` until they are ready. Control UI serving paths still require a Gateway restart.
+
+Custom plugin UI changes refresh plugin views in connected Control UI pages.
+Disabling it removes custom views and prevents new custom native UI loads;
+reload browser tabs to clear plugin JavaScript that already ran. Bundled plugin
+views and backend plugin operations remain available.
+
+Host Desktop and Cloud Worker Desktop switches update connected desktop pickers
+without a Gateway restart. Disabling a source closes its desktop observations.
+Existing system VNC services and cloud workers remain running. Re-enabling
+restores the configured host source or existing desktop-capable workers.
+Cloud worker profile provisioning remains separate: `settings.desktop` affects
+newly provisioned workers.
 
 Node command policy updates connected nodes immediately. Disabling node-published
 tools or skills withdraws them; re-enabling restores the last publication within

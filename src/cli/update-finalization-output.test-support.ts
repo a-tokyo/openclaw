@@ -35,7 +35,11 @@ if (scenario === "human-recovery-plugin-error") {
   Object.defineProperty(process.stdin, "isTTY", { value: true });
   Object.defineProperty(process.stdout, "isTTY", { value: true });
 }
-const sourceUrl = (relative: string) => new URL(relative, import.meta.url).href;
+const sourceUrl = (relative: string) =>
+  new URL(
+    import.meta.url.endsWith(".js") ? relative.replace(/\.ts$/u, ".js") : relative,
+    import.meta.url,
+  ).href;
 const doctorSource = `
 import { intro, note, outro } from ${JSON.stringify(pathToFileURL(require.resolve("@clack/prompts")).href)};
 export async function doctorCommand() {
@@ -139,16 +143,18 @@ export const SQLITE_READONLY_CHILD_ARG = ${JSON.stringify(SQLITE_READONLY_CHILD_
   ],
   [
     sourceUrl("./update-cli/update-command-config-snapshot.ts"),
-    scenario === "phase-hang"
-      ? `import { spawnCommand } from ${JSON.stringify(sourceUrl("../process/exec-spawn.ts"))};
+    // Replace snapshot creation only; keep real readers available to Doctor imports.
+    `export * from ${JSON.stringify(`${sourceUrl("./update-cli/update-command-config-snapshot.ts")}?fixture-original`)};\n` +
+      (scenario === "phase-hang"
+        ? `import { spawnCommand } from ${JSON.stringify(sourceUrl("../process/exec-spawn.ts"))};
 export const createUpdateConfigSnapshot = async () => {
   const child = spawnCommand([process.execPath, '-e', ${JSON.stringify(blockedChildSource)}, '--', 'fixture-private-argument'], {stdin:'pipe', stdout:'ignore', stderr:'ignore'});
   console.error('fixture configSnapshot entered');
   await child;
 };`
-      : scenario === "borrowed-phase"
-        ? "export const createUpdateConfigSnapshot = async () => { await new Promise(resolve => setTimeout(resolve, 1_200)); };"
-        : "export const createUpdateConfigSnapshot = async () => {};",
+        : scenario === "borrowed-phase"
+          ? "export const createUpdateConfigSnapshot = async () => { await new Promise(resolve => setTimeout(resolve, 1_200)); };"
+          : "export const createUpdateConfigSnapshot = async () => {};"),
   ],
   [
     sourceUrl("./update-cli/update-command-config.ts"),
@@ -191,9 +197,27 @@ if (blockedPhase) {
   // Keep real phase ownership; only the deliberately blocked phase gets a short budget.
   stubs.set(
     lifecycleUrl,
-    `import { UpdateFinalizationLifecycle as RealLifecycle } from ${JSON.stringify(`${lifecycleUrl}?fixture-original`)};
+    `import { once } from 'node:events';
+import { UpdateFinalizationLifecycle as RealLifecycle } from ${JSON.stringify(`${lifecycleUrl}?fixture-original`)};
 export class UpdateFinalizationLifecycle extends RealLifecycle {
   budget(phase) { return phase === ${JSON.stringify(blockedPhase)} ? 1_000 : super.budget(phase); }
+  ${
+    scenario === "phase-hang"
+      ? `run(phase, operation, outcome, custody) {
+    if (phase !== 'configSnapshot') return super.run(phase, operation, outcome, custody);
+    return super.run(phase, operation, outcome, {
+      ...custody,
+      enter: async () => {
+        await custody?.enter?.();
+        const released = once(process.stdin, 'end');
+        process.stdin.resume();
+        console.error('fixture configSnapshot recorded');
+        await released;
+      },
+    });
+  }`
+      : ""
+  }
 }`,
   );
 }
@@ -216,7 +240,8 @@ if (repairDeadline) {
 registerHooks({
   resolve(specifier, context, nextResolve) {
     if (specifier.startsWith(".") || specifier.startsWith("file:")) {
-      const url = new URL(specifier, context.parentURL).href.replace(/\.js$/, ".ts");
+      const resolved = new URL(specifier, context.parentURL).href;
+      const url = import.meta.url.endsWith(".js") ? resolved : resolved.replace(/\.js$/u, ".ts");
       const source = stubs.get(url);
       if (source !== undefined) {
         return { url: `data:text/javascript,${encodeURIComponent(source)}`, shortCircuit: true };

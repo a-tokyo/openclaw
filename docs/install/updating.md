@@ -32,6 +32,23 @@ It leaves unverified service definitions unchanged and skips their automatic
 restart. Restart the Gateway you launched manually after the update, or use its
 actual supervisor. Doctor still checks for active state writers before migrations.
 
+After package replacement, compatibility config reads from older updaters run
+in a fresh process using the updated package and its dependencies. This also
+applies to updates driven by 2026.9.4. If an optional read fails, the updater
+prints `candidate-config-read-failed` and leaves the service definition unchanged.
+Reads follow the restored package after a rollback. Inspect the reported problem
+with the updated CLI after the update.
+
+When a writable managed Gateway service points at another global installation,
+the update keeps the active CLI's installation as its target and refreshes the
+service through `gateway install --force` before verifying the restarted Gateway.
+The old service command remains the recovery identity until that handoff succeeds.
+Reconciliation failures are recorded as warnings with a manual repair command.
+Deployment-owned definitions retain their existing installation owner.
+Pending package-publication recovery in either the CLI or selected service
+installation blocks writable preparation. Follow the package recovery command
+reported by the update before retrying; Doctor does not clear those artifacts.
+
 The installed 2026.9.4 updater can refuse with `managed-service-preflight` before
 the target code runs. To reach a release containing this repair, use the
 [manual package-manager procedure](/install/updating/update-methods#alternative-manual-npm-pnpm-or-bun)
@@ -39,6 +56,21 @@ with the same owning package manager, prefix, and state/configuration. Back up
 first, stop the Gateway through its actual supervisor or foreground process owner,
 replace the package, run Doctor, and restart through that same owner.
 `--no-restart` cannot repair the old admission check.
+
+<Note>
+On macOS, the 2026.9.4 Gateway's `update.run` action or `/update` can hand off
+successfully, then fail at activation with `managed-service-preflight` and
+"This command is running inside the gateway process tree." The installed
+updater refuses its own managed helper before swapping packages, so a newer
+candidate cannot repair that first update.
+
+For this ancestry refusal, the owner should run `openclaw update` once from an
+independent Terminal outside the Gateway process tree, using the same owning
+account, installation, and state/configuration. After installing a release
+containing the managed-helper authority fix, subsequent updates started through
+`update.run` or `/update` use the corrected updater. The fix applies to updates
+**from** the fixed version; it does not repair the 2026.9.4 macOS handoff in place.
+</Note>
 
 Registry updates inspect the exact candidate's Node requirement before staging.
 An incompatible runtime produces `node-runtime-preflight`, with the target
@@ -71,7 +103,7 @@ owner around the manual replacement. This recovery does not add CLI-managed
 FreeBSD rc.d service updates.
 </Note>
 
-An already-installed registry package version or Git target SHA still runs plugin maintenance, repairs eligible old OpenClaw release pins, and restarts a running managed Gateway only when plugins change and `--no-restart` is not set; unchanged runs finish as `skipped` / `already-current`.
+An already-installed registry package version or Git target SHA still runs plugin maintenance, repairs eligible old OpenClaw release pins, and restarts a running managed Gateway when plugins change or its service points at another installation, unless `--no-restart` is set. Unchanged runs finish as `skipped` / `already-current`.
 
 Plugin maintenance does not fail an otherwise successful core update. If a plugin
 cannot be updated, OpenClaw continues with the remaining plugins, keeps the previous
@@ -80,6 +112,12 @@ Gateway can also report a plugin that did not load without turning the core upda
 into a failure. Individual plugin outcomes remain available in `--json` output.
 Failures to install core, repair required configuration or state, or start the
 updated Gateway remain update failures.
+Local copies selected through `plugins.load.paths` are operator-managed. Updates
+and `openclaw update repair` retain the selected copy and any npm install it
+shadows, and record a `plugin-operator-managed` warning in the outcome and update
+history. Verify that copy against the updated OpenClaw version, or remove its
+path from `plugins.load.paths` to use the managed installation again. This does
+not grant the local copy trusted plugin privileges.
 An explicit package artifact (for example, a tarball path or URL) is validated
 and installed even when its version matches; matching versions do not prove
 that two artifacts contain the same code.
@@ -216,11 +254,22 @@ identityless update-history row. The Gateway watcher publishes after the deadlin
 a later database open can also publish it. See the precise timing and residual
 old-CLI limitation in [Database schemas](/reference/database-schemas#schema-bumps-and-older-updaters).
 
-If an agent database also needs migration, required state metadata is missing,
-or the state-content migration fails, Doctor instead reports
-`update-schema-bump-unfenced` with database versions and manual update commands.
-Let the failed update finish restoring the previous package. OpenClaw 2026.9.2
-leaves the Gateway service stopped after failed post-install verification. Run
+When agent databases also need migration, the candidate first rehearses Doctor
+on private copies while the published updater can still roll back its package.
+After package commit, the fresh post-core process acquires current executor
+authority and delegates Doctor. Doctor verifies a retained recovery archive
+covering each agent database before migrating live state. The updater then
+restarts the Gateway.
+
+Missing state metadata or unverified backup coverage can still produce
+`update-schema-bump-unfenced` with database versions and recovery instructions.
+Before package commit, let the failed update finish restoring the previous
+package. OpenClaw 2026.9.2 leaves the Gateway service stopped after failed
+post-install verification. After package commit, the old package backup is gone:
+finish `openclaw doctor --fix` with the installed compatible build, then run
+`openclaw gateway start`. Package rollback cannot undo migrated state.
+
+If the compatible package still needs installation, run
 the manual update from a shell outside the Gateway, replacing `<target>` with
 the exact target version from the refusal:
 
@@ -265,9 +314,10 @@ restrictions still apply.
 or access to the `gateway` tool. The tool, slash command, and Control UI all use
 the same Gateway update handler and current authorization checks.
 
-The new version is checked while the old Gateway serves, and an already-current
-update restarts it only when plugins change. Update runs can send these notices
-in that chat as the Gateway observes the recorded milestones:
+The new version is checked while the old Gateway serves. An already-current
+update restarts a running Gateway when plugins change or its service points at a
+different installation. Update runs can send these notices in that chat as the
+Gateway observes the recorded milestones:
 
 1. An acknowledgement when the update is accepted.
 2. `⏳ Restarting the gateway now (v<from> → v<to>)…` when activation is recorded before the Gateway stops.

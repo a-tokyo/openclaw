@@ -3,6 +3,7 @@ import type { SessionEntry } from "../config/sessions.js";
 import type { SessionBindingRecord } from "../infra/outbound/session-binding-service.js";
 import type { ParsedAgentSessionKey } from "../routing/session-key.js";
 import { collectCronHistoryOverflowTaskIds } from "./cron-history-retention.js";
+import type { TaskRegistryMaintenanceRead } from "./task-registry-maintenance-snapshot.js";
 import { setTaskRegistryMaintenanceRuntimeForTests } from "./task-registry.maintenance.js";
 import type { TaskRecord } from "./task-registry.types.js";
 
@@ -10,10 +11,48 @@ type TaskRegistryMaintenanceRuntime = Parameters<
   typeof setTaskRegistryMaintenanceRuntimeForTests
 >[0];
 
+export function createPreparedMaintenanceRead(): TaskRegistryMaintenanceRead {
+  return {
+    assertOwnerCurrent() {},
+    assertCurrent() {},
+    isTaskSettled: () => true,
+  };
+}
+
+export function createAcpSessionStoreEntry(params: {
+  sessionKey: string;
+  parentSessionKey: string;
+  mode: "persistent" | "oneshot";
+}): AcpSessionStoreEntry {
+  const acp = {
+    backend: "acpx",
+    agent: "claude",
+    runtimeSessionName: `${params.sessionKey}:runtime`,
+    mode: params.mode,
+    state: "idle",
+    lastActivityAt: Date.now(),
+  } as const;
+  return {
+    cfg: {},
+    storePath: "/tmp/openclaw-test-sessions.json",
+    sessionKey: params.sessionKey,
+    storeSessionKey: params.sessionKey,
+    entry: {
+      sessionId: `${params.sessionKey}:session`,
+      updatedAt: Date.now(),
+      spawnedBy: params.parentSessionKey,
+      acp,
+    },
+    acp,
+    storeReadFailed: false,
+  };
+}
+
 export function createTaskRegistryMaintenanceHarness(params: {
   tasks: TaskRecord[];
   sessionStore?: Record<string, SessionEntry>;
-  listSessionEntries?: TaskRegistryMaintenanceRuntime["listSessionEntries"];
+  readSessionBackingFacts?: TaskRegistryMaintenanceRuntime["readSessionBackingFacts"];
+  readSessionBackingFactsInWorker?: TaskRegistryMaintenanceRuntime["readSessionBackingFactsInWorker"];
   resolveStorePath?: TaskRegistryMaintenanceRuntime["resolveStorePath"];
   deriveSessionChatTypeFromKey?: TaskRegistryMaintenanceRuntime["deriveSessionChatTypeFromKey"];
   acpEntry?: AcpSessionStoreEntry["entry"];
@@ -53,13 +92,15 @@ export function createTaskRegistryMaintenanceHarness(params: {
             entry: undefined,
             storeReadFailed: false,
           } satisfies AcpSessionStoreEntry),
-    listSessionEntries:
-      params.listSessionEntries ??
-      (() =>
-        Object.entries(sessionStore).map(([sessionKey, entry]) => ({
-          sessionKey,
-          entry,
-        }))),
+    readSessionBackingFacts:
+      params.readSessionBackingFacts ??
+      ((scope) =>
+        scope.sessionKeys.flatMap((sessionKey) =>
+          sessionStore[sessionKey] ? [{ sessionKey, entry: sessionStore[sessionKey] }] : [],
+        )),
+    readSessionBackingFactsInWorker:
+      params.readSessionBackingFactsInWorker ??
+      (async (scopes) => scopes.map((scope) => runtime.readSessionBackingFacts(scope))),
     resolveStorePath: params.resolveStorePath ?? (() => ""),
     ...(params.deriveSessionChatTypeFromKey
       ? { deriveSessionChatTypeFromKey: params.deriveSessionChatTypeFromKey }
@@ -91,6 +132,8 @@ export function createTaskRegistryMaintenanceHarness(params: {
     deleteTaskRecordById: (taskId: string) => currentTasks.delete(taskId),
     ensureTaskRegistryReady: () => {},
     getTaskById: (taskId: string) => currentTasks.get(taskId),
+    getTaskRegistryMaintenanceTask: (_read, taskId: string) => currentTasks.get(taskId),
+    prepareTaskRegistryRead: async () => createPreparedMaintenanceRead(),
     listTaskRecords: () => Array.from(currentTasks.values()),
     getTaskRegistryMaintenanceSnapshot: () => {
       const snapshotTasks = Array.from(currentTasks.values());
@@ -204,7 +247,8 @@ export function configureTaskRegistryMaintenanceRuntimeForTest(params: {
     listSessionBindingsBySession: () => params.sessionBindings ?? [],
     loadCloseAcpSession: params.loadCloseAcpSession ?? (async () => params.closeAcpSession),
     unbindSessionBindings: params.unbindSessionBindings,
-    listSessionEntries: () => [],
+    readSessionBackingFacts: () => [],
+    readSessionBackingFactsInWorker: async (scopes) => scopes.map(() => []),
     resolveStorePath: () => "",
     parseAgentSessionKey: () => null as ParsedAgentSessionKey | null,
     isCronJobActive: () => false,
@@ -223,6 +267,8 @@ export function configureTaskRegistryMaintenanceRuntimeForTest(params: {
     deleteTaskRecordById: (taskId: string) => params.currentTasks.delete(taskId),
     ensureTaskRegistryReady: () => {},
     getTaskById: (taskId: string) => params.currentTasks.get(taskId),
+    getTaskRegistryMaintenanceTask: (_read, taskId: string) => params.currentTasks.get(taskId),
+    prepareTaskRegistryRead: async () => createPreparedMaintenanceRead(),
     listTaskRecords: listSnapshotTasks,
     getTaskRegistryMaintenanceSnapshot: () => {
       const snapshotTasks = listSnapshotTasks();

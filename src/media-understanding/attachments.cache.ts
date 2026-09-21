@@ -18,6 +18,7 @@ import { isAbortError } from "../infra/abort-signal.js";
 import { readFileHandleBounded } from "../infra/fs-safe-advanced.js";
 import { FsSafeError, openLocalFileSafely, type OpenResult } from "../infra/fs-safe.js";
 import type { SsrFPolicy } from "../infra/net/ssrf.js";
+import { buildRandomTempFilePath } from "../infra/temp-download.js";
 import {
   readRemoteMediaBuffer,
   type MediaFetchRetryOptions,
@@ -29,7 +30,6 @@ import {
   normalizeMediaReferenceSource,
   resolveInboundMediaReference,
 } from "../media/media-reference.js";
-import { buildRandomTempFilePath } from "../plugin-sdk/temp-path.js";
 import { normalizeAttachmentPath } from "./attachments.normalize.js";
 import type { MediaAttachment } from "./types.js";
 
@@ -515,7 +515,10 @@ export class MediaAttachmentCache {
     }
     if (!isInboundPathAllowed({ filePath: entry.resolvedPath, roots: this.localPathRoots })) {
       const canonicalRoots = await this.getCanonicalLocalPathRoots();
-      if (!isInboundPathAllowed({ filePath: entry.resolvedPath, roots: canonicalRoots })) {
+      // Roots may already be canonical while macOS attachments still use /tmp or /var aliases.
+      const candidatePath = entry.resolvedPath;
+      const canonicalPath = await fs.realpath(candidatePath).catch(() => candidatePath);
+      if (!isInboundPathAllowed({ filePath: canonicalPath, roots: canonicalRoots })) {
         entry.resolvedPath = undefined;
         if (shouldLogVerbose()) {
           logVerbose(

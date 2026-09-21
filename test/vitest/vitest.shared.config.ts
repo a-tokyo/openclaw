@@ -32,9 +32,11 @@ export type { LocalVitestScheduling };
 
 export const jsdomOptimizedDeps = {
   optimizer: {
-    web: {
+    client: {
       enabled: true,
-      include: ["lit", "lit-html", "@lit/reactive-element"] as string[],
+      // Root and directives must share browser/development internals; native
+      // Node deep imports otherwise mix incompatible private Lit fields.
+      include: ["lit/**"] as string[],
     },
   },
 };
@@ -132,6 +134,14 @@ export const sharedVitestConfig = {
   root: repoRoot,
   envDir: false as const,
   plugins: [
+    {
+      name: "openclaw:node-worker-policy",
+      config: () => ({
+        test: {
+          globalSetup: [resolveRepoRootPath("test/vitest/vitest.node-policy.global-setup.ts")],
+        },
+      }),
+    },
     createStateSchemaInlinePlugin(repoRoot),
     compiledSubprocessesPlugin(),
     createRedactingReporterPlugin(),
@@ -452,6 +462,7 @@ export const sharedVitestConfig = {
       sourcePackageAlias("media-core"),
       sourcePackageAlias("retry"),
       sourcePackageAlias("session-url-contract", "parse"),
+      sourcePackageAlias("session-url-contract", "session-key-normalization"),
       sourcePackageAlias("session-url-contract", "share-build"),
       sourcePackageAlias("session-url-contract", "public-share"),
       sourcePackageAlias("session-url-contract"),
@@ -490,6 +501,9 @@ export const sharedVitestConfig = {
     },
     server: {
       deps: {
+        // Vite versions unoptimized imports; native transitive imports do not.
+        // Keep editor classes and parser properties in one module graph.
+        inline: [/@(?:codemirror|lezer)\//u],
         external: dependencyExternalPatterns,
       },
     },

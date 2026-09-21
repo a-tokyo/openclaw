@@ -15,7 +15,6 @@ import { requireNodeSqlite } from "../infra/node-sqlite.js";
 import * as nodeSqlite from "../infra/node-sqlite.js";
 import { listOpenFileDescriptorsForPath } from "../infra/open-file-descriptors.test-support.js";
 import { readSqliteNumberPragma } from "../infra/sqlite-pragma.test-support.js";
-import { runSqliteImmediateTransactionSync } from "../infra/sqlite-transaction.js";
 import { VERSION } from "../version.js";
 import {
   beginAgentDeletionJournal,
@@ -32,7 +31,6 @@ import {
   claimOpenClawAgentDatabaseLease,
   releaseOpenClawAgentDatabaseLease,
 } from "./openclaw-agent-db-lease.js";
-import { withFreshOpenClawAgentDatabaseReadOnly } from "./openclaw-agent-db-readonly-open.js";
 import { withOpenClawAgentDatabaseReadOnly } from "./openclaw-agent-db-readonly.js";
 import {
   createOpenClawAgentDatabasePathMatcher,
@@ -855,19 +853,7 @@ describe("openclaw agent database", () => {
   it("uses the canonical state schema for deletion journal reads and updates", () => {
     const stateDir = createTempStateDir();
     const env = { OPENCLAW_STATE_DIR: stateDir };
-    const stateDatabasePath = resolveOpenClawStateSqlitePath(env);
-    fs.mkdirSync(path.dirname(stateDatabasePath), { recursive: true });
-    const { DatabaseSync } = requireNodeSqlite();
-    const schemaSql = fs.readFileSync(
-      new URL("./openclaw-state-schema.sql", import.meta.url),
-      "utf8",
-    );
-    const stateDatabase = new DatabaseSync(stateDatabasePath);
-    try {
-      runSqliteImmediateTransactionSync(stateDatabase, () => stateDatabase.exec(schemaSql));
-    } finally {
-      stateDatabase.close();
-    }
+    materializeSharedStateDatabase(env);
 
     const entry = {
       agentId: "deleted",
@@ -1241,41 +1227,6 @@ describe("openclaw agent database", () => {
       expect(admitted).toBe(false);
     },
   );
-
-  it.each([false, true])("preserves missing-table adaptation (fresh-only: %s)", (freshOnly) => {
-    const stateDir = createTempStateDir();
-    const options = {
-      agentId: "worker-1",
-      env: { OPENCLAW_STATE_DIR: stateDir },
-    };
-    const databasePath = materializeCurrentWorkerAgentDatabase(stateDir);
-    const owner = openOpenClawAgentDatabase(options);
-    owner.db.exec("DROP TABLE session_nodes;");
-    let readDb: DatabaseSync | undefined;
-    const readOnly = freshOnly
-      ? withFreshOpenClawAgentDatabaseReadOnly
-      : withOpenClawAgentDatabaseReadOnly;
-    const read = (throwOnMissingTable = false) =>
-      readOnly(
-        ({ db }) => {
-          readDb = db;
-          return db.prepare("SELECT * FROM session_nodes").all();
-        },
-        options,
-        { throwOnMissingTable },
-      );
-
-    expect(read()).toEqual({ found: false, reason: "table-missing" });
-    expect(() => read(true)).toThrow(/no such table: session_nodes/);
-    expect(readDb === owner.db).toBe(!freshOnly);
-    expect(readDb?.isOpen).toBe(!freshOnly);
-    expect(owner.db.isOpen).toBe(true);
-    expect(closeOpenClawAgentDatabaseByPath(databasePath)).toBe(true);
-    expect(read()).toEqual({ found: false, reason: "table-missing" });
-    expect(readDb?.isOpen).toBe(false);
-    expect(() => read(true)).toThrow(/no such table: session_nodes/);
-    expect(readDb?.isOpen).toBe(false);
-  });
 
   it("reads committed rows without joining or closing the owner's transaction", () => {
     const stateDir = createTempStateDir();
@@ -4017,6 +3968,7 @@ describe("openclaw agent database", () => {
         DROP TRIGGER session_nodes_entry_valid_after_identity_update;
         DROP TRIGGER session_conversations_route_context_invalidate_after_update;
         DROP INDEX idx_agent_session_nodes_entry_valid_pending;
+        DROP INDEX idx_agent_session_nodes_entry_not_valid;
         DROP TABLE session_key_contract;
         ALTER TABLE session_nodes DROP COLUMN entry_valid;
         ALTER TABLE session_conversations DROP COLUMN route_context_json;
@@ -4077,6 +4029,7 @@ describe("openclaw agent database", () => {
         DROP TRIGGER session_nodes_entry_valid_after_entry_update;
         DROP TRIGGER session_nodes_entry_valid_after_identity_update;
         DROP INDEX idx_agent_session_nodes_entry_valid_pending;
+        DROP INDEX idx_agent_session_nodes_entry_not_valid;
         DROP TABLE session_key_contract;
         ALTER TABLE session_nodes DROP COLUMN entry_valid;
       `);
@@ -5045,21 +4998,6 @@ describe("openclaw agent database", () => {
     const databasePath = materializeCurrentWorkerAgentDatabase(stateDir);
     createUnsafeIndexDrift(databasePath);
 
-    expect(() => openOpenClawAgentDatabase({ agentId: "worker-1", env })).toThrow(
-      /integrity_check failed.*missing from index unsafe_index_records_value/iu,
-    );
-  });
-
-  it("retains integrity verification until the runtime lifecycle resets", () => {
-    const stateDir = createTempStateDir();
-    const env = { OPENCLAW_STATE_DIR: stateDir };
-    const databasePath = openOpenClawAgentDatabase({ agentId: "worker-1", env }).path;
-    expect(closeOpenClawAgentDatabaseByPath(databasePath)).toBe(true);
-    closeOpenClawStateDatabaseForTest();
-    createUnsafeIndexDrift(databasePath);
-
-    expect(openOpenClawAgentDatabase({ agentId: "worker-1", env }).db.isOpen).toBe(true);
-    closeOpenClawAgentDatabasesForTest();
     expect(() => openOpenClawAgentDatabase({ agentId: "worker-1", env })).toThrow(
       /integrity_check failed.*missing from index unsafe_index_records_value/iu,
     );

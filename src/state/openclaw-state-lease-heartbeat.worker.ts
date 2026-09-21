@@ -1,7 +1,12 @@
 import { parentPort, workerData } from "node:worker_threads";
+import { coerceErrorMessage } from "@openclaw/normalization-core/error-coercion";
 import { runWithSqliteBusyTimeout } from "../infra/sqlite-busy-timeout.js";
 import { runWithSqliteCoordinator } from "../infra/sqlite-coordinator.js";
-import { isSqliteLockError } from "../infra/sqlite-error-diagnostics.js";
+import {
+  isSqliteLockError,
+  sqliteErrorCode,
+  sqliteExtendedResultCode,
+} from "../infra/sqlite-error-diagnostics.js";
 import { runSqliteImmediateTransactionSync } from "../infra/sqlite-transaction.js";
 import {
   acquireStateDatabaseCoordinator,
@@ -12,6 +17,7 @@ import { openTrackedStateDatabase, closeTrackedStateDatabase } from "./openclaw-
 import {
   leaseHeartbeatState as state,
   LEASE_HEARTBEAT_START_TIMEOUT_MS,
+  type LeaseHeartbeatRenewalFailure,
   type LeaseHeartbeatWorkerData,
 } from "./openclaw-state-lease-heartbeat-shared.js";
 import {
@@ -37,8 +43,10 @@ function withLifecycleCoordinator<T>(label: string, operation: () => T): T {
 function openHeartbeatDatabase() {
   // The parent's bound is a retry deadline, not ownership. Renewal below still
   // checks the exact current persisted owner/expiry before changing the row.
-  const deadline = Math.min(params.expiresAt, Date.now() + LEASE_HEARTBEAT_START_TIMEOUT_MS);
-  while (Date.now() < deadline && Atomics.load(shared, state.status) === state.starting) {
+  const deadline = Date.now() + LEASE_HEARTBEAT_START_TIMEOUT_MS;
+  const remaining = () =>
+    Math.min(deadline, Number(Atomics.load(shared, state.expiresAt))) - Date.now();
+  while (remaining() > 0 && Atomics.load(shared, state.status) === state.starting) {
     try {
       return withLifecycleCoordinator("maintenance heartbeat open", () =>
         openTrackedStateDatabase(params.path, { existingOnly: params.existingOnly }),
@@ -48,18 +56,14 @@ function openHeartbeatDatabase() {
         throw error;
       }
     }
-    Atomics.wait(
-      shared,
-      state.status,
-      state.starting,
-      Math.max(1, Math.min(25, deadline - Date.now())),
-    );
+    Atomics.wait(shared, state.status, state.starting, Math.max(1, Math.min(25, remaining())));
   }
   throw new Error("state lease heartbeat startup deadline expired or owner stopped");
 }
 const db = openHeartbeatDatabase();
 let processOwner = params.processOwner;
 let heartbeat: ReturnType<typeof setTimeout> | undefined;
+let attempt = 0;
 const lose = () => {
   Atomics.compareExchange(shared, state.status, state.starting, state.lost);
   Atomics.compareExchange(shared, state.status, state.ready, state.lost);
@@ -73,6 +77,7 @@ const renew = () => {
     return;
   }
   let expiresAt: number | undefined;
+  attempt += 1;
   try {
     // Native lookup can be slow; keep it outside write admission and startup readiness.
     if (
@@ -107,11 +112,25 @@ const renew = () => {
         { lockFailureReporting: "suppress" },
       ),
     );
+    if (expiresAt !== undefined) {
+      Atomics.store(shared, state.lastRenewedAt, BigInt(expiresAt - params.leaseMs));
+    }
     if (expiresAt !== undefined && processOwner?.identity.startedAt != null) {
       processOwner = undefined;
     }
   } catch (error) {
     if (!(error instanceof StateDatabaseCoordinatorContentionError) && !isSqliteLockError(error)) {
+      parentPort?.postMessage(
+        {
+          name: error instanceof Error ? error.name : "Error",
+          message: coerceErrorMessage(error),
+          code: sqliteErrorCode(error),
+          errcode: sqliteExtendedResultCode(error),
+          attempt,
+          elapsedMs: Date.now() - params.acquiredAt,
+        } satisfies LeaseHeartbeatRenewalFailure,
+        [],
+      );
       lose();
       return;
     }

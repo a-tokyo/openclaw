@@ -148,6 +148,7 @@ export async function deliverSubagentAnnouncement(params: {
   sourceSessionKey?: string;
   sourceRunId?: string;
   sourceTool?: string;
+  settleWakeSourceSessionKeys?: readonly string[];
   isSourceSessionEffectsAllowed?: () => boolean;
   /** Additional source guard released by the accepting Gateway or injection owner. */
   isSourceSessionAdmissionAllowed?: () => boolean;
@@ -295,7 +296,7 @@ export async function deliverSubagentAnnouncement(params: {
     ? createCompletionUserTurnTranscriptRecorderFactory(params)
     : undefined;
 
-  return await runSubagentAnnounceDispatch({
+  const delivery = await runSubagentAnnounceDispatch({
     expectsCompletionMessage: params.expectsCompletionMessage,
     requireDirectDelivery: params.requireDirectDelivery || params.completionTarget === "parent",
     signal: params.signal,
@@ -311,9 +312,7 @@ export async function deliverSubagentAnnouncement(params: {
         createUserTurnTranscriptRecorder: createCompletionUserTurnTranscriptRecorder,
         signal: params.signal,
         isSourceSessionEffectsAllowed: params.isSourceSessionEffectsAllowed,
-        ...(params.isSourceSessionAdmissionAllowed
-          ? { isSourceSessionAdmissionAllowed: params.isSourceSessionAdmissionAllowed }
-          : {}),
+        isSourceSessionAdmissionAllowed: params.isSourceSessionAdmissionAllowed,
       });
     },
     direct: async () => {
@@ -333,10 +332,9 @@ export async function deliverSubagentAnnouncement(params: {
         requesterSessionOrigin: params.requesterSessionOrigin,
         sourceSessionKey: params.sourceSessionKey,
         sourceTool: params.sourceTool,
+        settleWakeSourceSessionKeys: params.settleWakeSourceSessionKeys,
         isSourceSessionEffectsAllowed: params.isSourceSessionEffectsAllowed,
-        ...(params.isSourceSessionAdmissionAllowed
-          ? { isSourceSessionAdmissionAllowed: params.isSourceSessionAdmissionAllowed }
-          : {}),
+        isSourceSessionAdmissionAllowed: params.isSourceSessionAdmissionAllowed,
         isCompletionOwnedByRequesterYield: params.isCompletionOwnedByRequesterYield,
         requesterIsSubagent: params.requesterIsSubagent,
         completionTarget: params.completionTarget,
@@ -351,6 +349,22 @@ export async function deliverSubagentAnnouncement(params: {
       });
     },
   });
+  const failedDirect =
+    params.expectsCompletionMessage || params.sourceTool === "subagent_announce"
+      ? delivery.phases?.find(
+          (phase) =>
+            phase.phase === "direct-primary" && !phase.delivered && phase.path === "direct",
+        )
+      : undefined;
+  if (failedDirect?.error) {
+    const source = params.sourceRunId
+      ? `run ${params.sourceRunId}`
+      : `session ${params.sourceSessionKey ?? params.requesterSessionKey}`;
+    defaultRuntime.log(
+      `[warn] Subagent completion direct announce failed for ${source}: ${failedDirect.error}${delivery.delivered ? "; recovered via steered" : ""}`,
+    );
+  }
+  return delivery;
 }
 
 const testing = {

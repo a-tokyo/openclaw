@@ -14,6 +14,7 @@ import {
 } from "./server-chat-state.js";
 import { GatewayConnectionWork } from "./server-connection-work.js";
 import { WEBSOCKET_OPEN_READY_STATE } from "./server-constants.js";
+import { resolveVisibleActiveSessionRunState } from "./server-methods/session-active-runs.js";
 import { GatewayClientRegistry } from "./server/client-registry.js";
 import { buildGatewaySessionSnapshot } from "./session-event-payload.js";
 import { resolveSessionEventAgentScope } from "./session-request-agent.js";
@@ -125,19 +126,40 @@ export function createGatewayConnectionState(params: {
         return () => undefined;
       }
       const now = Date.now();
+      const ancestors = projection.ancestorRows(record);
       return (client) => {
         if (!projection.isCurrent(record)) {
           return undefined;
         }
-        const { row } = prepareProjectedSessionPresentation(projection, client, now, {
-          chatAbortControllers,
-        }).snapshot(query, { includeDerivedTitles: true, includeLastMessage: true });
+        const { projectedAgentRuns } = projection.state.rowContext;
+        const presentation = prepareProjectedSessionPresentation(
+          projection,
+          client,
+          now,
+          (selection) =>
+            resolveVisibleActiveSessionRunState({
+              ...selection,
+              context: { chatAbortControllers },
+              projectedAgentRunIndex: projectedAgentRuns,
+            }),
+        );
+        const enrichment = { includeDerivedTitles: true, includeLastMessage: true };
+        const { row } = presentation.snapshot(query, enrichment);
         if (!row) {
           return undefined;
         }
         return {
           ...base,
           session: row,
+          ancestorSessions: ancestors?.every((ancestor) => projection.isCurrent(ancestor))
+            ? ancestors.flatMap((ancestor) => {
+                if (presentation.sharing.entryFilter?.(ancestor.key, ancestor.entry) === false) {
+                  return [];
+                }
+                const presented = presentation.present(ancestor, enrichment);
+                return presented ? [presented] : [];
+              })
+            : undefined,
           visibility: row.visibility,
           sharingRole: row.sharingRole,
           ...(isRecord(base.activitySummary) && row.activitySummary

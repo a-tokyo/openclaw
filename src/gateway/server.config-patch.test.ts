@@ -1,4 +1,5 @@
 // Config RPCs cover control-UI edits, secrets, auth persistence, and rate limiting.
+import { randomUUID } from "node:crypto";
 import fsNode from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -24,6 +25,7 @@ import { createOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import { getFreePort } from "../test-utils/ports.js";
 import { GatewayClient, GatewayClientRequestError } from "./client.js";
 import { invalidateConfigGetResponseCache } from "./config-get-response.js";
+import { pruneStaleControlPlaneBuckets } from "./control-plane-rate-limit.js";
 import { startGatewayServer } from "./server.js";
 
 const reloadBarrier = vi.hoisted(() => ({ wait: undefined as Promise<void> | undefined }));
@@ -51,7 +53,6 @@ const GATEWAY_TOKEN = "config-rpc-synthetic-token";
 let state: Awaited<ReturnType<typeof createOpenClawTestState>>;
 let server: Awaited<ReturnType<typeof startGatewayServer>> | undefined;
 let client: GatewayClient | undefined;
-let rateLimitEpochMs = Date.now();
 const hotReloadRecovery = vi.fn(() => ({ status: "emitted" as const }));
 const unarmedConfigWatchers: ReturnType<typeof chokidar.watch>[] = [];
 
@@ -114,6 +115,8 @@ async function startConfigRpcGateway({
       OPENCLAW_SKIP_CRON: "1",
       OPENCLAW_SKIP_GMAIL_WATCHER: "1",
       OPENCLAW_SKIP_PROVIDERS: "1",
+      // Config RPCs use real model discovery, without an unrelated native marketplace sync.
+      OPENCLAW_CODEX_APP_SERVER_ARGS: "app-server --listen stdio:// -c features.plugins=false",
       OPENCLAW_DISABLE_BUNDLED_PLUGINS: undefined,
       OPENCLAW_BUNDLED_PLUGINS_DIR: path.resolve(import.meta.dirname, "../../dist/extensions"),
     },
@@ -306,8 +309,7 @@ async function writeUnresolvedAuthProfileTokenRef(missingEnvVar: string) {
 function installConfigWriteGatewayHooks(options: ConfigRpcGatewayOptions = {}) {
   beforeEach(() => startConfigRpcGateway(options));
   beforeEach(() => {
-    rateLimitEpochMs += 60_000;
-    vi.spyOn(Date, "now").mockReturnValue(rateLimitEpochMs);
+    pruneStaleControlPlaneBuckets(Number.MAX_SAFE_INTEGER);
   });
   afterEach(stopConfigRpcGateway);
 }
@@ -462,12 +464,8 @@ describe("gateway config methods", () => {
       await writeJsonFile(original.path, root);
       // Finish fixture seeding before warming the draft whose rejection must invalidate reads.
       invalidateConfigGetResponseCache();
-      await expect
-        .poll(async () => (await getCurrentConfigObject()).config.logging)
-        .toEqual({
-          level: "info",
-        });
       const draft = await getCurrentConfigObject();
+      expect(draft.config.logging).toEqual({ level: "info" });
       const raw = JSON.stringify(
         method === "config.patch"
           ? { logging: { level: "debug" } }
@@ -480,15 +478,16 @@ describe("gateway config methods", () => {
       expect(stale.ok).toBe(false);
       expect(stale.error?.message).toContain("config changed since last load");
       expect(JSON.parse(await fs.readFile(includePath, "utf8"))).toEqual({ level: "warn" });
-      await expect.poll(getConfigHash).not.toBe(draft.hash);
+      const refreshedHash = await getConfigHash();
+      expect(refreshedHash).not.toBe(draft.hash);
       const fresh = await rpcReq<{ hash: string }>(requireClient(), method, {
         raw,
-        baseHash: await getConfigHash(),
+        baseHash: refreshedHash,
       });
       expect(fresh.ok, fresh.error?.message).toBe(true);
       expect(JSON.parse(await fs.readFile(includePath, "utf8"))).toEqual({ level: "debug" });
       expect(JSON.parse(await fs.readFile(original.path, "utf8"))).toEqual(root);
-      await expect.poll(getConfigHash).toBe(fresh.payload?.hash);
+      expect(await getConfigHash()).toBe(fresh.payload?.hash);
     },
   );
 });
@@ -950,7 +949,6 @@ describe("gateway config methods", () => {
   });
 
   it("uses fresh revisions after agent create, update, and delete before reload applies", async () => {
-    vi.mocked(Date.now).mockRestore();
     const operations = [
       {
         method: "agents.create",
@@ -1662,7 +1660,7 @@ describe("gateway config methods", () => {
 
   it("acknowledges sandbox config only after the runtime snapshot applies it", async () => {
     const original = await getCurrentConfigObject();
-    const image = `openclaw-settlement-${rateLimitEpochMs}:test`;
+    const image = `openclaw-settlement-${randomUUID()}:test`;
 
     try {
       const res = await rpcReq<{ ok?: boolean }>(requireClient(), "config.patch", {

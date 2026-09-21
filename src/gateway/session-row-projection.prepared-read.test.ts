@@ -1,17 +1,69 @@
 import { DatabaseSync, StatementSync } from "node:sqlite";
 import { afterEach, expect, it, vi } from "vitest";
-import { replaceSessionEntrySync } from "../config/sessions/session-accessor.js";
+import {
+  loadSessionEntryReadOnly,
+  replaceSessionEntrySync,
+} from "../config/sessions/session-accessor.js";
+import { createDeferredCore } from "../shared/deferred.js";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import { sessionByKeyReadHandlers } from "./server-methods/sessions-read-by-key.js";
 import { requestContext } from "./server-methods/sessions-read-cache.test-support.js";
 import type { SessionRowReadView } from "./session-row-prepared-read.js";
 import { bindSessionRowProjection } from "./session-row-projection-access.js";
 import { createSessionRowProjection } from "./session-row-projection.js";
+import { createWorkerSessionPlacementStore } from "./worker-environments/placement-store.js";
 
 afterEach(() => vi.restoreAllMocks());
 
 const cfg = { agents: { entries: { main: {} } } };
 const query = { agentId: "main", key: "agent:main:dashboard:incognito-prepared" };
+
+it.each([false, true])(
+  "preserves stored session ID spelling in placement facts (archived: %s)",
+  async (archived) => {
+    await withOpenClawTestState({ scenario: "minimal" }, async () => {
+      const target = { agentId: "main", sessionKey: "agent:main:placement-spelling" };
+      const sessionId = " placement-spelling ";
+      replaceSessionEntrySync(target, {
+        sessionId,
+        updatedAt: 1,
+        ...(archived ? { archivedAt: 1 } : {}),
+      });
+      expect(loadSessionEntryReadOnly(target)?.sessionId).toBe(sessionId);
+      const placements = createWorkerSessionPlacementStore();
+      placements.startDispatch({ ...target, sessionId });
+      const projection = await createSessionRowProjection({
+        cfg,
+        modelCatalog: [],
+        placementFactsReader: placements,
+      });
+      const context = bindSessionRowProjection(requestContext(cfg), () => projection);
+      const respond = vi.fn();
+      try {
+        await projection.ensureMaterialized();
+        expect(projection.materializedCount).toBe(archived ? 0 : 1);
+        await sessionByKeyReadHandlers["sessions.describe"]!({
+          req: { type: "req", id: "placement-spelling", method: "sessions.describe" },
+          params: { key: target.sessionKey },
+          client: null,
+          context,
+          isWebchatConnect: () => false,
+          respond,
+        });
+        expect(respond).toHaveBeenCalledExactlyOnceWith(true, {
+          session: expect.objectContaining({
+            key: target.sessionKey,
+            sessionId,
+            placement: expect.objectContaining({ state: "requested" }),
+          }),
+        });
+        expect(loadSessionEntryReadOnly(target)?.sessionId).toBe(sessionId);
+      } finally {
+        projection.dispose();
+      }
+    });
+  },
+);
 
 it("consumes an incognito describe response without SQLite or resident private rows", async () => {
   await withOpenClawTestState({ scenario: "minimal" }, async () => {
@@ -24,7 +76,13 @@ it("consumes an incognito describe response without SQLite or resident private r
         incognito: true,
       },
     );
-    const projection = await createSessionRowProjection({ cfg });
+    const placements = createWorkerSessionPlacementStore();
+    placements.startDispatch({
+      agentId: query.agentId,
+      sessionKey: query.key,
+      sessionId: "private-description",
+    });
+    const projection = await createSessionRowProjection({ cfg, placementFactsReader: placements });
     const prepare = projection.withPreparedExactRows.bind(projection);
     let retained: SessionRowReadView | undefined;
     const prepared = vi
@@ -55,7 +113,16 @@ it("consumes an incognito describe response without SQLite or resident private r
           }
         });
       });
-    const respond = vi.fn();
+    const escapedPlacement = createDeferredCore<unknown>();
+    const respond = vi.fn(() => {
+      queueMicrotask(() => {
+        try {
+          escapedPlacement.resolve(projection.snapshot(query).row?.placement);
+        } catch (error) {
+          escapedPlacement.reject(error);
+        }
+      });
+    });
     const context = bindSessionRowProjection(requestContext(cfg), () => projection);
     try {
       await sessionByKeyReadHandlers["sessions.describe"]!({
@@ -68,9 +135,14 @@ it("consumes an incognito describe response without SQLite or resident private r
       });
       expect(prepared).toHaveBeenCalledOnce();
       expect(respond).toHaveBeenCalledExactlyOnceWith(true, {
-        session: expect.objectContaining({ key: query.key, sessionId: "private-description" }),
+        session: expect.objectContaining({
+          key: query.key,
+          sessionId: "private-description",
+          placement: expect.objectContaining({ state: "requested" }),
+        }),
       });
-      expect(projection.select()).toEqual([]);
+      expect(await escapedPlacement.promise).toBeUndefined();
+      expect(projection.selectEntries()).toEqual([]);
       expect(() => retained?.describe(query)).toThrow("no longer active");
     } finally {
       projection.dispose();
@@ -101,9 +173,9 @@ it("keeps missing private reads absent and refuses unprepared keys and asynchron
           },
         ),
       ).rejects.toThrow("must remain synchronous");
-      expect(() => retained?.select({ key: query.key })).toThrow("no longer active");
+      expect(() => retained?.selectEntries({ key: query.key })).toThrow("no longer active");
       expect(projection.capture(query)).toBeUndefined();
-      expect(projection.select()).toEqual([]);
+      expect(projection.selectEntries()).toEqual([]);
     } finally {
       projection.dispose();
     }
@@ -138,7 +210,7 @@ it("prepares only the private response's child selections before consumption", a
         ],
       };
       vi.spyOn(projection, "describe").mockReturnValue(row);
-      const select = vi.spyOn(projection, "select").mockReturnValue([]);
+      const select = vi.spyOn(projection, "selectEntries").mockReturnValue([]);
       await projection.withPreparedExactRows(
         () => [query],
         (read) => {
@@ -147,8 +219,10 @@ it("prepares only the private response's child selections before consumption", a
           select.mockImplementation(() => {
             throw new Error("child metadata must be read before consumption");
           });
-          expect(read.select({ key: childKey })).toEqual([]);
-          expect(() => read.select({ key: "agent:main:unprepared-child" })).toThrow("not prepared");
+          expect(read.selectEntries({ key: childKey })).toEqual([]);
+          expect(() => read.selectEntries({ key: "agent:main:unprepared-child" })).toThrow(
+            "not prepared",
+          );
           expect(select).not.toHaveBeenCalled();
         },
       );

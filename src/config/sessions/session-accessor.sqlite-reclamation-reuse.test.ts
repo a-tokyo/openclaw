@@ -5,8 +5,9 @@ import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { setImmediate as yieldToEventLoop } from "node:timers/promises";
 import type { Worker, WorkerOptions } from "node:worker_threads";
+import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
-import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
+import { createTempDirTracker } from "../../../test/helpers/temp-dir.js";
 import {
   conversation,
   queueConversationDeliveryForTest,
@@ -15,11 +16,14 @@ import { runGatewayConversationList } from "../../gateway/conversation-list.js";
 import { runGatewayConversationSend } from "../../gateway/conversation-send.js";
 import { completeDurableDelivery } from "../../infra/outbound/delivery-completion.js";
 import type { MessageActionResult } from "../../infra/outbound/message-action-contracts.js";
+import { SQLITE_IDLE_HANDLE_TTL_MS } from "../../infra/sqlite-handle-lifecycle.js";
+import { createSqliteWorkerOperationAdmission } from "../../infra/sqlite-worker-operation-admission.js";
 import { createDeferredCore } from "../../shared/deferred.js";
 import type { OpenClawAgentDatabaseClaim } from "../../state/openclaw-agent-db-identity.js";
 import type { OpenClawAgentDatabaseWorkerLeaseReceipt } from "../../state/openclaw-agent-db-lease.js";
 import {
   getOpenClawAgentDatabaseValidation,
+  getOpenClawAgentDatabaseValidationForTransfer,
   invalidateOpenClawAgentDatabaseValidation,
   setOpenClawAgentDatabaseValidation,
   type OpenClawAgentDatabaseValidation,
@@ -33,11 +37,16 @@ import {
   getOpenClawAgentDatabaseIfOpen,
   openOpenClawAgentDatabase,
 } from "../../state/openclaw-agent-db.js";
+import type { AgentDatabaseRequestExecutionSource } from "../../state/openclaw-agent-execution-contract.js";
+import { createAgentDatabaseNativeGeneration } from "../../state/openclaw-agent-execution-native.js";
 import { runOpenClawAgentWriteAdmission } from "../../state/openclaw-agent-write-admission.js";
+import { clearOpenClawAgentIntegrityVerification } from "../../state/openclaw-quarantine-store.js";
 import {
+  closeOpenClawStateDatabaseAsync,
   closeOpenClawStateDatabaseForTest,
   openOpenClawStateDatabase,
 } from "../../state/openclaw-state-db.js";
+import { captureOpenClawStateWorkerContext } from "../../state/openclaw-state-worker-context.js";
 import { createChannelTestPluginBase } from "../../test-utils/channel-plugins.js";
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import {
@@ -92,13 +101,15 @@ function fullChecks() {
   return Atomics.load(new Int32Array(validation.checks), 0);
 }
 
-const tempDirs = useAutoCleanupTempDirTracker(afterEach);
+const tempDirs = createTempDirTracker();
 afterEach(async () => {
   vi.useRealTimers();
   vi.restoreAllMocks();
   await closeOpenClawAgentDatabasesAsync();
+  await closeOpenClawStateDatabaseAsync();
   closeOpenClawAgentDatabasesForTest();
   closeOpenClawStateDatabaseForTest();
+  tempDirs.cleanup();
   vi.unstubAllEnvs();
 });
 
@@ -143,6 +154,69 @@ function leasesFor(fixture: ReturnType<typeof createFixture>) {
     .db.prepare("SELECT lease_id FROM agent_database_leases WHERE path = ?")
     .all(fixture.database.path);
 }
+
+test.each(["current", "revoked-after-open", "revoked-during-open"] as const)(
+  "reclamation borrows native-only verification unless revoked (%s)",
+  async (proof) => {
+    const { database, options, plans, scopes } = createFixture(["victim"]);
+    closeOpenClawAgentDatabasesForTest(options.env.OPENCLAW_STATE_DIR);
+    const context = captureOpenClawStateWorkerContext(options);
+    const assertCurrent = () => context.admission.assertCurrent();
+    let revokedDuringOpen = false;
+    const source: AgentDatabaseRequestExecutionSource = {
+      assertCurrent,
+      createAdmission(binding) {
+        return () => ({
+          nativeLocations: binding.nativeLocations,
+          admission: createSqliteWorkerOperationAdmission((request, grant) => {
+            if (
+              proof === "revoked-during-open" &&
+              !revokedDuringOpen &&
+              request.stage === "prepare" &&
+              isRecord(request.facts) &&
+              isRecord(request.facts.identity) &&
+              request.facts.identity.kind === "file"
+            ) {
+              invalidateOpenClawAgentDatabaseValidation(database.path);
+              revokedDuringOpen = true;
+            }
+            binding.authorize(request);
+            assertCurrent();
+            if (!grant()) {
+              throw new Error("Native reclamation fixture lost admission");
+            }
+          }),
+        });
+      },
+    };
+    const generation = createAgentDatabaseNativeGeneration(
+      database.agentId,
+      database.path,
+      context,
+      assertCurrent,
+      assertCurrent,
+      undefined,
+      () => {},
+    );
+    try {
+      await generation.runExisting(source, async () => "opened");
+      expect(getOpenClawAgentDatabaseIfOpen(options)).toBeUndefined();
+      const transferred = getOpenClawAgentDatabaseValidationForTransfer(database);
+      expect(Boolean(transferred)).toBe(proof !== "revoked-during-open");
+      if (proof === "revoked-after-open") {
+        invalidateOpenClawAgentDatabaseValidation(database.path);
+      }
+      await expect(
+        runSqliteSessionReclamation({ forceInProcess: false, plan: plans[0]! }),
+      ).resolves.toMatchObject({ kind: "lifecycle-artifacts", value: { removedEntries: 1 } });
+      expect(fullChecks()).toBe(proof === "current" ? 0 : 1);
+      expect(revokedDuringOpen).toBe(proof === "revoked-during-open");
+      expect(loadSessionEntryReadOnly(scopes[0]!)).toBeUndefined();
+    } finally {
+      await generation.close();
+    }
+  },
+);
 
 test.each(["directory discovery", "Gateway send", "durable completion"] as const)(
   "admits %s behind a native reclamation commit request",
@@ -332,11 +406,13 @@ test("retained reclamation operations share the first full scan until the Gatewa
     });
   }
   closeOpenClawAgentDatabasesForTest(databaseOptions.env.OPENCLAW_STATE_DIR);
+  clearOpenClawAgentIntegrityVerification(database.path, databaseOptions.env);
   const workerIds = new Set<number>();
   for (let pass = 0; pass < 3; pass += 1) {
     if (pass === 2) {
       await closeOpenClawAgentDatabasesAsync(databaseOptions.env.OPENCLAW_STATE_DIR);
       closeOpenClawAgentDatabasesForTest(databaseOptions.env.OPENCLAW_STATE_DIR);
+      clearOpenClawAgentIntegrityVerification(database.path, databaseOptions.env);
     }
     const diagnostics: SqliteSessionReclamationDiagnostics = {};
     await expect(
@@ -680,7 +756,7 @@ test("retires the previous database before opening a different agent store", asy
   expect(loadSessionEntryReadOnly(second.scopes[1]!)).toMatchObject({ sessionId: "second" });
 });
 
-test("retires after sixty idle seconds and opens a new Worker for the next request", async () => {
+test("retires after thirty idle minutes and opens a new Worker for the next request", async () => {
   const fixture = createFixture(["first", "second", "third"]);
   invalidateOpenClawAgentDatabaseValidation(fixture.database.path);
   const spawned = observeReclamationWorkers();
@@ -691,7 +767,7 @@ test("retires after sixty idle seconds and opens a new Worker for the next reque
     expect(spawned).toHaveLength(1);
     expect(fullChecks()).toBe(1);
     const exited = once(spawned[0]!, "exit");
-    await vi.advanceTimersByTimeAsync(59_999);
+    await vi.advanceTimersByTimeAsync(SQLITE_IDLE_HANDLE_TTL_MS - 1);
     expect(spawned[0]?.threadId).toBeGreaterThan(0);
     await vi.advanceTimersByTimeAsync(1);
     await exited;
@@ -803,6 +879,7 @@ test.each([false, true])(
             },
           );
         }
+        await closeOpenClawAgentDatabasesAsync(state.root);
         await reclaimSqliteFreePages(databaseOptions);
         const workers: Worker[] = [];
         const spawn = archiveWorker.createSqliteTranscriptArchiveWorker;
@@ -814,9 +891,12 @@ test.each([false, true])(
           },
         );
         const run = reclamation.runSqliteSessionReclamation;
-        let requests = 0;
         vi.spyOn(reclamation, "runSqliteSessionReclamation").mockImplementation(async (params) => {
-          if (++requests === 2 && failure) {
+          if (
+            failure &&
+            params.plan.kind === "history-eviction" &&
+            params.plan.sessionId === "second"
+          ) {
             throw new Error("next victim preparation failed");
           }
           return run(params);

@@ -27,11 +27,15 @@ import type {
 } from "./server-methods/types.js";
 import { isSessionCreatorProfile, prepareSessionCreatorProfile } from "./session-creator.js";
 import {
+  isAgentRunStartMethod,
   isRequiredSessionTargetMethod,
   isSessionProfileDependentMethod,
 } from "./session-method-policy.js";
 import { SessionMutationAuthorizationChangedError } from "./session-mutation-authorization-error.js";
-import { resolveRequestedSessionAgentId } from "./session-request-agent.js";
+import {
+  resolveRequestedSessionAgentId,
+  resolveRequestedSessionAgentInput,
+} from "./session-request-agent.js";
 import type { SessionRowReadView } from "./session-row-prepared-read.js";
 import { getSessionRowProjection } from "./session-row-projection-access.js";
 import {
@@ -99,21 +103,6 @@ function expectedSessionMutationTargetError(
     : null;
 }
 
-const AGENT_RUN_START_METHODS = new Set([
-  "agent",
-  "chat.send",
-  "message.action",
-  "send",
-  "sessions.dispatch",
-  "sessions.send",
-  "sessions.steer",
-  "talk.client.create",
-  "talk.client.toolCall",
-  "talk.session.create",
-  "tools.invoke",
-  "wake",
-]);
-
 // Documented contract (docs/gateway/protocol.md): these methods authorize by session
 // visibility inside their handler, not by mutation participation. The pipeline still
 // applies incognito checks and the operator role cap: a view/suggest-capped caller
@@ -134,6 +123,7 @@ export {
   isGatewayAdmin,
   isResolvedIncognitoSession,
   isSessionVisibilityAllowed,
+  prepareSessionSharingTargets,
   resolveSessionSharingRole,
   resolveSessionSharingTarget,
   resolveSessionSharingTargets,
@@ -149,16 +139,11 @@ export function resolveSessionMutationAuthorization(params: {
   expectedTarget?: ExpectedSessionMutationTarget;
   sessionRowRead?: SessionRowReadView;
 }): { authorization?: SessionMutationAuthorization; error: ErrorShape | null } {
-  const authorizesAgentRun =
-    AGENT_RUN_START_METHODS.has(params.method) ||
-    (params.method === "sessions.goal.update" &&
-      typeof params.requestParams === "object" &&
-      params.requestParams !== null &&
-      "action" in params.requestParams &&
-      params.requestParams.action === "resume");
+  const authorizesAgentRun = isAgentRunStartMethod(params.method, params.requestParams);
   // Progress belongs to the current conversation, not merely its stable session ID.
   // Capture this boundary for admins too so delayed writes cannot revive a reset card.
-  const bindsProgressLifecycle = params.method === "progressCard.put";
+  const bindsProgressLifecycle =
+    params.method === "progressCard.put" || params.method === "progressCard.refresh";
   const adminBypass = isGatewayAdmin(params.client) && !authorizesAgentRun;
   if (adminBypass && !bindsProgressLifecycle && !params.expectedTarget) {
     return { error: null };
@@ -218,12 +203,16 @@ export function resolveSessionMutationAuthorization(params: {
     targetRef: SessionMutationTarget,
     targetCount: number,
   ): { target: SessionSharingTarget | null } | { error: ErrorShape } => {
+    const input = resolveRequestedSessionAgentInput(targetRef.sessionKey, targetRef.agentId);
+    if (!input.ok) {
+      return { error: input.error };
+    }
     try {
       return {
         target: resolveSessionSharingTarget({
           cfg: getCfg(),
           sessionKey: targetRef.sessionKey,
-          agentId: targetRef.agentId,
+          agentId: input.value,
           ...(lookupCaches ??= createLookupCaches()),
           exactRead: targetCount === 1,
         }),
