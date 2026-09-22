@@ -45,7 +45,10 @@ import { parseSessionEntryJson as parseSessionEntryRow } from "./session-accesso
 import { normalizeStoreSessionKey } from "./store-entry.js";
 import { collectSessionMaintenancePreserveKeysForStore } from "./store-maintenance-preserve.js";
 import { resolveMaintenanceConfig } from "./store-maintenance-runtime.js";
-import { isRecentSessionMaintenanceEntry } from "./store-maintenance.js";
+import {
+  getSessionMaintenanceActivityAt,
+  isRecentSessionMaintenanceEntry,
+} from "./store-maintenance.js";
 import type { SessionEntry } from "./types.js";
 
 /**
@@ -203,14 +206,14 @@ function collectCapacityEligibleLivePreserveKeys(params: {
   for (const key of params.skipSessionKeys ?? []) {
     preserveKeys.add(key);
   }
+  for (const key of params.unprotectSessionKeys ?? []) {
+    preserveKeys.delete(key);
+  }
   for (const key of collectAdmissionProtectedStoreKeys({
     database: params.database,
     storePath: params.storePath,
   })) {
     preserveKeys.add(key);
-  }
-  for (const key of params.unprotectSessionKeys ?? []) {
-    preserveKeys.delete(key);
   }
   return preserveKeys;
 }
@@ -318,6 +321,9 @@ export function planOldestCapacityEligibleSqliteLiveEntryRemoval(params: {
     if (preserveKeys.has(key)) {
       continue;
     }
+    if (entry.status === "running") {
+      continue;
+    }
     const parsed = parseAgentSessionKey(key);
     if (parsed?.rest === "main" || key === "global") {
       continue;
@@ -331,7 +337,10 @@ export function planOldestCapacityEligibleSqliteLiveEntryRemoval(params: {
     if (!isDurableConversationSessionKey(key, entry)) {
       continue;
     }
-    if (!victim || (entry.updatedAt ?? 0) < (victim.entry.updatedAt ?? 0)) {
+    if (
+      !victim ||
+      getSessionMaintenanceActivityAt(entry) < getSessionMaintenanceActivityAt(victim.entry)
+    ) {
       victim = { key, entry };
     }
   }
@@ -391,8 +400,9 @@ export async function reclaimSqliteLiveSessionEntriesToHighWater(params: {
   pruneArchivesToHighWater: () => Promise<{
     removedFiles: number;
     usage: SessionPhysicalDiskUsage;
+    checkpointIncomplete?: number;
   }>;
-  reclaimFreePages: () => void | Promise<void>;
+  reclaimFreePages: () => boolean | void | Promise<boolean | void>;
   resolved: Pick<ResolvedSqliteReadScope, "agentId" | "env" | "path">;
   storePath: string;
   usage: SessionPhysicalDiskUsage;
@@ -435,6 +445,7 @@ export async function reclaimSqliteLiveSessionEntriesToHighWater(params: {
       scope: params.storePath,
       identities,
       run: async () => {
+        livePlanParams.database = openOpenClawAgentDatabase(databaseOptions);
         const fencedPlan = planOldestCapacityEligibleSqliteLiveEntryRemoval({
           ...livePlanParams,
           unprotectSessionKeys: new Set([
@@ -460,16 +471,18 @@ export async function reclaimSqliteLiveSessionEntriesToHighWater(params: {
     }
     removedEntries += 1;
     emitArchivedTranscriptUpdates(published.archivedTranscripts);
-    try {
-      await params.reclaimFreePages();
-    } catch {
-      // Best-effort reclamation only.
+    const reclaimed = await params.reclaimFreePages();
+    if (reclaimed === false) {
+      break;
     }
     usage = await measureSessionPhysicalDiskUsage(params.storePath);
     if (usage.totalBytes > params.highWaterBytes) {
       const repruned = await params.pruneArchivesToHighWater();
       removedFiles += repruned.removedFiles;
       usage = repruned.usage;
+      if (repruned.checkpointIncomplete) {
+        break;
+      }
     }
     livePlanParams.database = openOpenClawAgentDatabase(databaseOptions);
   }

@@ -99,7 +99,7 @@ export async function inspectSqliteSessionHistoryDiskBudget(
       diskBudget: {
         ...diskBudget,
         deferredReason: "checkpoint-incomplete",
-        checkpoint: blocked.checkpoint,
+        checkpoint: blocked.checkpoint?.health,
         walBytesBefore: usage.databaseWalBytes,
         walBytesAfter: usage.databaseWalBytes,
       },
@@ -324,7 +324,7 @@ async function enforceSessionHistoryMaintenanceSerialized(
       maxBytes: maxDiskBytes,
       highWaterBytes,
       deferred: {
-        checkpoint: blocked.checkpoint,
+        checkpoint: blocked.checkpoint?.health,
         walBytesBefore: initialUsage.databaseWalBytes,
         walBytesAfter: initialUsage.databaseWalBytes,
       },
@@ -386,28 +386,39 @@ async function enforceSessionHistoryMaintenanceForDatabase(
       ),
     );
   };
-  const reclaimLiveFreePages = async () => {
-    await withSqliteSessionPageReclamation(databaseOptions, (reclaimPages) =>
-      runExclusiveSqliteSessionWrite(
-        resolved,
-        async () => {
-          try {
-            await reclaimSqliteFreePages(
-              databaseOptions,
-              { trigger: "after-eviction" },
-              {
+  const reclaimLiveFreePages = async (): Promise<boolean> => {
+    const pageDiagnostics: SqliteSessionArchivePruningDiagnostics = {
+      trigger: "after-eviction",
+    };
+    const checkpointCompleted = await withSqliteSessionPageReclamation(
+      databaseOptions,
+      (reclaimPages) =>
+        runExclusiveSqliteSessionWrite(
+          resolved,
+          async () => {
+            try {
+              return await reclaimSqliteFreePages(databaseOptions, pageDiagnostics, {
                 reclaimPages,
                 onCheckpointIncomplete: (checkpoint) =>
                   deferPhysicalBudgetForCheckpoint(params, databasePath, checkpoint),
-              },
-            );
-          } catch {
-            // Best-effort reclamation only.
-          }
-        },
-        "session.history.free-pages",
-      ),
+              });
+            } catch {
+              return true;
+            }
+          },
+          "session.history.free-pages",
+        ),
     );
+    if (!checkpointCompleted) {
+      pruning = {
+        usage: await measureSessionPhysicalDiskUsage(params.storePath),
+        removedFiles: 0,
+        completed: false,
+        checkpointIncomplete: pageDiagnostics.checkpointIncomplete ?? 1,
+        checkpoint: pageDiagnostics.checkpoint,
+      };
+    }
+    return checkpointCompleted;
   };
   let pruning = await pruneArchives("initial");
   let { usage, removedFiles } = pruning;
@@ -563,34 +574,6 @@ async function enforceSessionHistoryMaintenanceForDatabase(
       if (repruned.checkpointIncomplete) {
         return finish();
       }
-    }
-  }
-
-  // Historical generations first. Idle durable live nodes are last-resort
-  // capacity victims so maxDiskBytes still bounds the store. Skip when the
-  // high-water mark is not a usable stop condition (#119422 / #119909).
-  if (highWaterBytes > 0 && maxDiskBytes > 0) {
-    const database = openOpenClawAgentDatabase(databaseOptions);
-    const live = await reclaimSqliteLiveSessionEntriesToHighWater({
-      archiveDirectory,
-      database,
-      finalizePlans: finalizeSessionEntryMaintenancePlansAfterWriterReleaseBestEffort,
-      highWaterBytes,
-      pruneArchivesToHighWater: async () => {
-        pruning = await pruneArchives("after-eviction");
-        return pruning;
-      },
-      reclaimFreePages: reclaimLiveFreePages,
-      resolved,
-      storePath: params.storePath,
-      usage,
-      preserveRecentMs: params.maintenance.preserveRecentMs,
-    });
-    removedEntries += live.removedEntries;
-    removedFiles += live.removedFiles;
-    usage = live.usage;
-    if (pruning.checkpointIncomplete) {
-      return finish();
     }
   }
 

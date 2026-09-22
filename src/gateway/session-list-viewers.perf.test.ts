@@ -170,6 +170,7 @@ test.skipIf(process.env.OPENCLAW_BENCH_SESSION_VIEWERS !== "1")(
         for (const client of clients) {
           await rpc(client);
         }
+        const rpcCpuStarted = process.threadCpuUsage();
         for (let round = 0; round < 5; round++) {
           for (const client of clients) {
             const start = performance.now();
@@ -177,6 +178,7 @@ test.skipIf(process.env.OPENCLAW_BENCH_SESSION_VIEWERS !== "1")(
             rpcSamples.push(performance.now() - start);
           }
         }
+        const rpcCpu = process.threadCpuUsage(rpcCpuStarted);
         const samples: number[] = [];
         const phases = new Map<SessionListPhase | "serialize" | "total", number>();
         for (let round = 0; round < 5; round++) {
@@ -250,6 +252,7 @@ test.skipIf(process.env.OPENCLAW_BENCH_SESSION_VIEWERS !== "1")(
               medianMs: samples.toSorted((a, b) => a - b)[Math.floor(samples.length / 2)],
               rpcMeanMs: rpcSamples.reduce((sum, value) => sum + value, 0) / rpcSamples.length,
               rpcMedianMs: rpcSamples.toSorted((a, b) => a - b)[Math.floor(rpcSamples.length / 2)],
+              rpcThreadCpuMsPerCall: (rpcCpu.user + rpcCpu.system) / 1_000 / rpcSamples.length,
               phaseMs: Object.fromEntries(
                 [...phases].map(([key, ms]) => [key, ms / samples.length]),
               ),
@@ -293,6 +296,7 @@ test("preserves viewer pages across publications while bounding shared predicate
     const entry = (sessionId: string, owner: number, updatedAt: number): SessionEntry => ({
       sessionId,
       updatedAt,
+      lastInteractionAt: 20 - updatedAt,
       createdActor: {
         type: "human",
         source: "profile",
@@ -314,14 +318,24 @@ test("preserves viewer pages across publications while bounding shared predicate
     const opts = { limit: 2, ownerFirst: true, excludeSystem: true };
     const golden = [
       [
-        { ids: ["b", "a", "c"], order: ["b", "c", "f", "a"], total: 4 },
-        { ids: ["c", "f"], order: ["c", "f", "a"], total: 3 },
-        { ids: ["f", "b", "c"], order: ["b", "c", "f", "a"], total: 4 },
+        {
+          ids: ["b", "a", "c"],
+          order: ["b", "c", "f", "a"],
+          activityOrder: ["a", "f", "c", "b"],
+          total: 4,
+        },
+        { ids: ["c", "f"], order: ["c", "f", "a"], activityOrder: ["a", "f", "c"], total: 3 },
+        {
+          ids: ["f", "b", "c"],
+          order: ["b", "c", "f", "a"],
+          activityOrder: ["a", "f", "c", "b"],
+          total: 4,
+        },
       ],
       [
-        { ids: ["b", "d"], order: ["d", "b"], total: 2 },
-        { ids: ["d", "b"], order: ["d", "b"], total: 2 },
-        { ids: ["f", "d"], order: ["f", "d", "b"], total: 3 },
+        { ids: ["b", "d"], order: ["d", "b"], activityOrder: ["b", "d"], total: 2 },
+        { ids: ["d", "b"], order: ["d", "b"], activityOrder: ["b", "d"], total: 2 },
+        { ids: ["f", "d"], order: ["f", "d", "b"], activityOrder: ["b", "d", "f"], total: 3 },
       ],
     ];
     try {
@@ -364,6 +378,27 @@ test("preserves viewer pages across publications while bounding shared predicate
             );
             expect(next.totalCount).toBe(expected.total);
           }
+          const activity = await listProjectedSessions({
+            projection,
+            client,
+            opts: { ...opts, ownerFirst: false, sortBy: "activity", includeActivitySummary: false },
+          });
+          expect(activity.sessions.map((row) => row.sessionId)).toEqual(
+            expected.activityOrder.slice(0, opts.limit),
+          );
+          expect(activity.totalCount).toBe(expected.total);
+          const people = await listProjectedSessions({
+            projection,
+            client,
+            opts: { ...opts, ownerFirst: false, sortBy: "updatedAt", includePeople: true },
+          });
+          expect(people.sessions.map((row) => row.sessionId)).toEqual(
+            expected.order.slice(0, opts.limit),
+          );
+          expect(people.peopleSessionCount).toBe(expected.total);
+          expect(people.people?.reduce((count, person) => count + person.sessionCount, 0)).toBe(
+            expected.total,
+          );
         }
         expect.soft(predicate.mock.calls.length).toBe(0);
         expect.soft(selectEntries.mock.calls.length).toBe(0);
@@ -388,6 +423,19 @@ test("preserves viewer pages across publications while bounding shared predicate
           clock.mockRestore();
         }
         expect(selectEntries.mock.calls.length).toBe(0);
+        expect(predicate).not.toHaveBeenCalled();
+        const archived = await listProjectedSessions({
+          projection,
+          client: clients[0],
+          opts: { ...opts, ownerFirst: false, archived: true },
+        });
+        expect(archived.sessions.map((row) => row.sessionId)).toEqual([revision === 0 ? "d" : "a"]);
+        expect(archived.totalCount).toBe(1);
+        expect(predicate).toHaveBeenCalled();
+        predicate.mockClear();
+        const unarchived = await listProjectedSessions({ projection, client: clients[0], opts });
+        expect(unarchived.sessions.map((row) => row.sessionId)).toEqual(golden[revision]![0]!.ids);
+        expect(predicate).toHaveBeenCalled();
         if (revision === 0) {
           replaceSessionEntrySync(
             { agentId: "main", sessionKey: "agent:main:a" },
