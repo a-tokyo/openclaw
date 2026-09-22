@@ -955,7 +955,6 @@ describe("SQLite historical session disk budget", () => {
     }
   });
 
-
   function sessionNodeExists(sessionKey: string): boolean {
     const owner = database();
     const db = getSessionKysely(owner.db);
@@ -981,7 +980,6 @@ describe("SQLite historical session disk budget", () => {
       db.selectFrom("session_windows").select("session_id"),
     ).rows.filter((row) => !liveIds.has(row.session_id)).length;
   }
-
 });
 
 function createTrajectoryEvent(sessionId: string, sessionKey: string): TrajectoryEvent {

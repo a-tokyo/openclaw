@@ -129,7 +129,11 @@ export function collectAdmissionProtectedSessionIds(params: {
             db
               .selectFrom("session_nodes")
               .select("session_key")
-              .where(db.fn<string>("hex", ["session_key"]), "in", sqliteStringSet(admittedKeyBytes)),
+              .where(
+                db.fn<string>("hex", ["session_key"]),
+                "in",
+                sqliteStringSet(admittedKeyBytes),
+              ),
           ),
       )
     : [];
