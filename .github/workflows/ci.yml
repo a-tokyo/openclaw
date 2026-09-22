@@ -5621,6 +5621,14 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             build
 
+      # Full pairing/share UI proof stays in full-manual validation; fast regressions join smoke below.
+      - name: Prove native managed document download and export
+        id: ios_attachment_tests
+        if: matrix.phase == 'tests' && needs.preflight.outputs.compatibility_target != 'true'
+        env:
+          BASELINE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: /bin/bash scripts/test-ios-chat-attachments.sh "$BASELINE_SHA"
+
       - name: Run focused iOS voice cleanup simulator tests
         id: ios_voice_cleanup_tests
         if: (matrix.phase == 'smoke' || matrix.phase == 'tests') && needs.preflight.outputs.compatibility_target != 'true'
@@ -5651,6 +5659,9 @@ jobs:
             -only-testing:OpenClawTests/TalkRealtimeConsultCancellationTests \
             -only-testing:OpenClawTests/TalkRealtimeTranscriptWriteQueueTests \
             -only-testing:OpenClawTests/TalkModeManagerTests \
+            -only-testing:OpenClawTests/ManagedDocumentEnvelopeTests \
+            -only-testing:OpenClawTests/IOSMediaArtifactLoaderTests \
+            -only-testing:OpenClawTests/OpenClawTypographyTests \
             test
 
       # App compilation and screenshots do not execute approval or notification
@@ -5772,13 +5783,15 @@ jobs:
             test-without-building
 
       - name: Upload iOS lifecycle simulator evidence
-        if: ${{ always() && ((steps.ios_lifecycle_tests.outcome != '' && steps.ios_lifecycle_tests.outcome != 'skipped') || (steps.ios_voice_cleanup_tests.outcome != '' && steps.ios_voice_cleanup_tests.outcome != 'skipped')) }}
+        if: ${{ always() && ((steps.ios_lifecycle_tests.outcome != '' && steps.ios_lifecycle_tests.outcome != 'skipped') || (steps.ios_voice_cleanup_tests.outcome != '' && steps.ios_voice_cleanup_tests.outcome != 'skipped') || (steps.ios_attachment_tests.outcome != '' && steps.ios_attachment_tests.outcome != 'skipped')) }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: ios-lifecycle-tests-${{ needs.preflight.outputs.checkout_revision }}
           path: |
             apps/ios/build/LifecycleTestResults/*.xcresult
             apps/ios/build/LifecycleTestResults/*.log
+            apps/ios/build/LifecycleTestResults/Attachment-*
+            apps/ios/build/LifecycleTestResults/attachments-*
           if-no-files-found: warn
           retention-days: 14
 
