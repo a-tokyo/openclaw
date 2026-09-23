@@ -9,6 +9,7 @@
  */
 
 import { bufferToBlobPart } from "openclaw/plugin-sdk/blob-runtime";
+import { pruneMapToMaxSize } from "openclaw/plugin-sdk/collection-runtime";
 import { responseWithRelease } from "openclaw/plugin-sdk/fetch-runtime";
 import { readProviderJsonResponse } from "openclaw/plugin-sdk/provider-http";
 import { fetchWithSsrFGuard } from "openclaw/plugin-sdk/ssrf-runtime";
@@ -20,6 +21,7 @@ import {
   withMSTeamsRequestDeadline,
 } from "./request-timeout.js";
 import { assertMSTeamsSendHandoff, type MSTeamsSendHandoff } from "./send-handoff.js";
+import { resolveTeamGroupId } from "./team-identity.js";
 import { buildUserAgent } from "./user-agent.js";
 
 const GRAPH_ROOT = "https://graph.microsoft.com/v1.0";
@@ -46,14 +48,79 @@ async function requestSharePoint(
   return responseWithRelease(response, release);
 }
 
-export function requireMSTeamsSharePointSiteId(siteId?: string): string {
+function requireMSTeamsSharePointSiteId(siteId?: string): string {
   const normalized = siteId?.trim();
   if (!normalized) {
     throw new Error(
-      "channels.msteams.sharePointSiteId is required to send files to group chats or channels",
+      "No SharePoint site ID available for file upload. " +
+        "Set channels.msteams.sharePointSiteId, or verify that the team's AAD group ID " +
+        "is resolvable and the bot has Sites.Read.All to resolve the team site automatically.",
     );
   }
   return normalized;
+}
+
+/**
+ * Resolve a SharePoint site ID for a file upload. Uses the explicit config value when set;
+ * otherwise resolves a standard channel's team site dynamically. Called lazily at the
+ * upload boundary so text-only messages never wait on Graph. Group chats and
+ * private/shared channels still require sharePointSiteId.
+ */
+export async function resolveUploadSiteId(params: {
+  configuredSiteId?: string;
+  teamId?: string;
+  channelId?: string;
+  tokenProvider: MSTeamsAccessTokenProvider;
+  getTeamDetails?: (teamId: string) => Promise<{ aadGroupId?: string }>;
+  fetchFn?: typeof fetch;
+}): Promise<string> {
+  if (params.configuredSiteId !== undefined) {
+    const explicit = params.configuredSiteId.trim();
+    if (!explicit) {
+      throw new Error(
+        "channels.msteams.sharePointSiteId is blank. Omit it to discover a standard channel's team site, or set a site ID.",
+      );
+    }
+    return explicit;
+  }
+  if (!params.teamId) {
+    return requireMSTeamsSharePointSiteId(undefined);
+  }
+  const groupId = await resolveTeamGroupId({
+    conversationTeamId: params.teamId,
+    getTeamDetails: params.getTeamDetails,
+  });
+  if (!groupId) {
+    throw new Error(
+      `Could not resolve AAD group ID for team ${params.teamId}. ` +
+        "Set channels.msteams.sharePointSiteId as a fallback.",
+    );
+  }
+  if (params.channelId) {
+    await assertStandardChannelForAutoUpload({
+      groupId,
+      channelId: params.channelId,
+      tokenProvider: params.tokenProvider,
+      fetchFn: params.fetchFn,
+    });
+  }
+  return await resolveTeamSiteId({
+    groupId,
+    tokenProvider: params.tokenProvider,
+    fetchFn: params.fetchFn,
+  });
+}
+
+const DEFAULT_SHAREPOINT_FOLDER = "OpenClawShared";
+
+function resolveMSTeamsSharePointFolder(folder?: string): string {
+  const trimmed = folder?.trim() || DEFAULT_SHAREPOINT_FOLDER;
+  if (trimmed === "." || trimmed === ".." || /[\\/]/.test(trimmed)) {
+    throw new Error(
+      "channels.msteams.sharePointFolder must be a single folder name without path separators",
+    );
+  }
+  return trimmed;
 }
 
 interface DriveUploadResult {
@@ -69,6 +136,96 @@ interface SharingLinkResult {
 const SHAREPOINT_REQUEST_TIMEOUT_LABEL = "MS Teams SharePoint request";
 const SHAREPOINT_UPLOAD_TIMEOUT_LABEL = "MS Teams SharePoint upload";
 const GRAPH_TOKEN_TIMEOUT_LABEL = "MS Teams Graph token acquisition";
+
+// Team site IDs are stable; cache avoids a Graph lookup on every file send.
+const teamSiteIdCache = new Map<string, string>();
+const TEAM_SITE_ID_CACHE_MAX_ENTRIES = 200;
+
+/**
+ * Resolve the SharePoint site ID for a team's backing site via Graph.
+ * Results are cached — a team's site ID never changes.
+ *
+ * Requires Sites.Read.All or Sites.ReadWrite.All on the bot's app registration.
+ */
+async function resolveTeamSiteId(params: {
+  groupId: string;
+  tokenProvider: MSTeamsAccessTokenProvider;
+  fetchFn?: typeof fetch;
+}): Promise<string> {
+  const cached = teamSiteIdCache.get(params.groupId);
+  if (cached) {
+    return cached;
+  }
+
+  const fetchFn = params.fetchFn ?? fetch;
+  const data = await withMSTeamsAbortableRequestTimeout({
+    label: SHAREPOINT_REQUEST_TIMEOUT_LABEL,
+    work: async (signal) => {
+      const token = await getGraphAccessToken(params.tokenProvider);
+      const res = await fetchFn(`${GRAPH_ROOT}/groups/${params.groupId}/sites/root?$select=id`, {
+        headers: { "User-Agent": buildUserAgent(), Authorization: `Bearer ${token}` },
+        signal,
+      });
+
+      if (!res.ok) {
+        throw await createMSTeamsHttpError(
+          res,
+          `Resolve team SharePoint site failed for group ${params.groupId}`,
+        );
+      }
+
+      return await readProviderJsonResponse<{ id?: string }>(
+        res,
+        "msteams.graph-upload.resolveTeamSiteId",
+      );
+    },
+  });
+
+  const siteId = data.id?.trim();
+  if (!siteId) {
+    throw new Error(`Graph returned no site ID for group ${params.groupId}`);
+  }
+
+  teamSiteIdCache.set(params.groupId, siteId);
+  pruneMapToMaxSize(teamSiteIdCache, TEAM_SITE_ID_CACHE_MAX_ENTRIES);
+  return siteId;
+}
+
+async function assertStandardChannelForAutoUpload(params: {
+  groupId: string;
+  channelId: string;
+  tokenProvider: MSTeamsAccessTokenProvider;
+  fetchFn?: typeof fetch;
+}): Promise<void> {
+  const fetchFn = params.fetchFn ?? fetch;
+  const data = await withMSTeamsAbortableRequestTimeout({
+    label: SHAREPOINT_REQUEST_TIMEOUT_LABEL,
+    work: async (signal) => {
+      const token = await getGraphAccessToken(params.tokenProvider);
+      const res = await fetchFn(
+        `${GRAPH_ROOT}/teams/${encodeURIComponent(params.groupId)}/channels/${encodeURIComponent(params.channelId)}?$select=membershipType`,
+        {
+          headers: { "User-Agent": buildUserAgent(), Authorization: `Bearer ${token}` },
+          signal,
+        },
+      );
+      if (!res.ok) {
+        throw await createMSTeamsHttpError(res, "Resolve channel membership type failed");
+      }
+      return await readProviderJsonResponse<{ membershipType?: string }>(
+        res,
+        "msteams.graph-upload.resolveChannelMembershipType",
+      );
+    },
+  });
+  const membershipType = data.membershipType?.trim().toLowerCase();
+  if (membershipType !== "standard") {
+    throw new Error(
+      "Automatic SharePoint site discovery supports standard channels only. " +
+        "Set channels.msteams.sharePointSiteId to upload to a specific site.",
+    );
+  }
+}
 
 async function getGraphAccessToken(tokenProvider: MSTeamsAccessTokenProvider): Promise<string> {
   return await withMSTeamsRequestDeadline({
@@ -94,11 +251,12 @@ async function uploadToSharePoint(
     contentType?: string;
     tokenProvider: MSTeamsAccessTokenProvider;
     siteId: string;
+    folderName?: string;
     fetchFn?: typeof fetch;
   } & MSTeamsSendHandoff,
 ): Promise<DriveUploadResult> {
-  // Use "OpenClawShared" folder to organize bot-uploaded files
-  const uploadPath = `/OpenClawShared/${encodeURIComponent(params.filename)}`;
+  const folder = encodeURIComponent(resolveMSTeamsSharePointFolder(params.folderName));
+  const uploadPath = `/${folder}/${encodeURIComponent(params.filename)}`;
   // Graph's default conflictBehavior=replace overwrites a same-named file in place. Bot assets
   // reuse names (image-1.png each generation) and Teams caches file cards by driveItem URL, so
   // replace clobbers history and shows stale images; "rename" mints a unique driveItem instead.
@@ -358,6 +516,7 @@ export async function uploadAndShareSharePoint(
     siteId: string;
     chatId?: string;
     usePerUserSharing?: boolean;
+    folderName?: string;
     fetchFn?: typeof fetch;
   } & MSTeamsSendHandoff,
 ): Promise<{
@@ -373,6 +532,7 @@ export async function uploadAndShareSharePoint(
     contentType: params.contentType,
     tokenProvider: params.tokenProvider,
     siteId: params.siteId,
+    folderName: params.folderName,
     fetchFn: params.fetchFn,
     assertDirectAdapterHandoff: params.assertDirectAdapterHandoff,
   });
