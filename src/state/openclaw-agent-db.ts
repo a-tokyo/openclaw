@@ -76,6 +76,7 @@ import {
   closeOpenClawAgentDatabases,
   refreshAgentDatabaseIdleTimer,
   retainAgentDatabase,
+  retainIncognitoSharedState,
   retainFailedAgentDatabaseClose,
   revokePendingAgentDatabaseOpen,
   type PendingAgentDatabaseOpen,
@@ -261,6 +262,7 @@ function* openOpenClawAgentDatabaseSteps(
     cache.unregisterExitClose ??= registerSqliteCacheExitClose(closeOpenClawAgentDatabases);
     cache.databases.set(pathname, database);
     cache.generation += 1;
+    retainIncognitoSharedState(db, options.env);
     getOpenClawDatabaseMaintenanceScope()?.own(database.db, "agent-handles", () =>
       closeMaintenanceAgentDatabase(database),
     );
@@ -298,9 +300,18 @@ function* openOpenClawAgentDatabaseSteps(
   }
   let verification: OpenClawAgentIntegrityVerification | undefined;
   let hasLiveLease = false;
-  const captureVerification: OpenClawAgentIntegrityVerificationReceiver = (record, liveLease) => {
+  const validation = pending?.validation ?? preparedLease?.validation;
+  const captureVerification: OpenClawAgentIntegrityVerificationReceiver = (
+    record,
+    liveLease,
+    invalidated,
+  ) => {
     verification = record;
     hasLiveLease = liveLease;
+    if (invalidated && validation) {
+      // Stale-peer cleanup precedes adoption of proof already transferred by the host.
+      Atomics.store(new Int32Array(validation.valid), 0, 0);
+    }
   };
   const leaseId = preparedLease
     ? preparedLease.claim(captureVerification)
@@ -345,7 +356,6 @@ function* openOpenClawAgentDatabaseSteps(
     // Eviction churn must avoid migration/convergence and registry busy waits.
     // Version and owner can change while evicted, so their read-only gates run on every open.
     const validationDatabase = { db, path: pathname, agentId };
-    const validation = pending?.validation ?? preparedLease?.validation;
     if (validation) {
       adoptOpenClawAgentDatabaseValidation(validationDatabase, validation);
     }
@@ -358,7 +368,7 @@ function* openOpenClawAgentDatabaseSteps(
         const existingSchema = readExistingAgentSchemaMeta(db);
         assertExistingAgentSchemaOwner(existingSchema, agentId, pathname);
         // Live owners may lend runtime proof; cold opens require clean-close proof.
-        // Both remain subject to durable invalidation and schema convergence.
+        // Runtime proof carries owner revocation; every open still checks schema convergence.
         const requiresCurrentVersionConvergence = yield* agentDatabaseIntegrityBeforeMutationSteps(
           db,
           agentId,

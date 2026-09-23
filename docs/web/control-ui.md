@@ -33,7 +33,16 @@ Hidden retained chats defer command and model metadata refreshes until you retur
 
 Provider authentication status is shared across views and refreshes after account changes and near credential warning or expiry deadlines. Credentials without an expiry do not need periodic refreshes. Hidden tabs defer deadline refreshes until visible again.
 
+The sidebar loads automation status once per connection and refreshes after automation or configuration changes. Failed reads retry once per minute while the tab is visible and stop retrying after success. Overdue warnings advance on a local deadline without polling the Gateway. Hidden tabs catch up when visible; returning to an unchanged tab does not poll automations. Command palette searches reuse their automation inventory on the same connection until one of those changes or a reconnect.
+
 Thinking, speed, and context-window changes stay synchronized across panes showing the same session. While a change is pending, the latest selection remains visible. A rejected change restores the latest confirmed value. Delayed events from a replaced session leave the current transcript and unsent draft intact.
+
+While an agent works, the working indicator shows its latest completed commentary
+or preamble when the model and runtime provide one. New updates replace that
+status, and the status disappears when the run ends. Approval and startup messages
+take priority. Earlier updates remain in the transcript; **Keep commentary** in
+the chat view menu controls whether commentary stays visible after the run.
+Runtimes without commentary keep the usual working indicator.
 
 Subagent runs appear in inline transcript activity rows, the chat **Tasks** tab,
 and the [Tasks page](/automation/tasks#control-ui), outside sidebar navigation.
