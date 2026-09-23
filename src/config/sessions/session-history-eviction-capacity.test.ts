@@ -12,6 +12,7 @@ import {
   createOpenClawTestState,
   type OpenClawTestState,
 } from "../../test-utils/openclaw-test-state.js";
+import * as diskBudget from "./disk-budget.js";
 import { measureSessionPhysicalDiskUsage } from "./disk-budget.js";
 import {
   appendTranscriptMessage,
@@ -19,11 +20,13 @@ import {
   resetSessionEntryLifecycle,
 } from "./session-accessor.js";
 import { getSessionKysely } from "./session-accessor.sqlite-scope.js";
+import * as archivePruning from "./session-history-archive-pruning.js";
 import {
   enforceSqliteSessionHistoryDiskBudget,
   inspectSqliteSessionHistoryDiskBudget,
 } from "./session-history-eviction.js";
 import { resolveSqliteTargetFromSessionStorePath } from "./session-sqlite-target.js";
+import { registerSessionMaintenancePreserveKeysProvider } from "./store-maintenance-preserve.js";
 
 describe("SQLite live-node disk budget eviction", () => {
   let testState: OpenClawTestState;
@@ -190,7 +193,7 @@ describe("SQLite live-node disk budget eviction", () => {
     const now = Date.now();
     const dayMs = 24 * 60 * 60 * 1000;
     const mainKey = "agent:main:main";
-    const recentKey = "agent:main:dashboard:recent";
+    const recentKey = "agent:main:slack:channel:c6:thread:6";
     const idleThreadKey = "agent:main:slack:channel:c5:thread:5";
     await replaceSessionEntry(
       { sessionKey: mainKey, storePath },
@@ -242,6 +245,105 @@ describe("SQLite live-node disk budget eviction", () => {
     expect(sessionExists("recent-live")).toBe(true);
     expect(sessionNodeExists(recentKey)).toBe(true);
     expect(sessionExists("live-main")).toBe(true);
+  });
+
+  it("keeps a provider-protected thread that appears while live eviction waits", async () => {
+    const oldestKey = "agent:main:slack:channel:c10:thread:10";
+    const newerKey = "agent:main:slack:channel:c11:thread:11";
+    await replaceSessionEntry(
+      { sessionKey: oldestKey, storePath },
+      { sessionId: "provider-oldest", updatedAt: 5 },
+    );
+    await appendTranscriptMessage(
+      { sessionId: "provider-oldest", sessionKey: oldestKey, storePath },
+      { message: { role: "user", content: "oldest " + "x".repeat(64 * 1024) } },
+    );
+    await replaceSessionEntry(
+      { sessionKey: newerKey, storePath },
+      { sessionId: "provider-newer", updatedAt: 15 },
+    );
+    await appendTranscriptMessage(
+      { sessionId: "provider-newer", sessionKey: newerKey, storePath },
+      { message: { role: "user", content: "newer " + "y".repeat(64 * 1024) } },
+    );
+    settlePhysicalUsage();
+    const before = await measureSessionPhysicalDiskUsage(storePath);
+    let preserveCalls = 0;
+    let underBudget = false;
+    const realMeasure = diskBudget.measureSessionPhysicalDiskUsage;
+    vi.spyOn(diskBudget, "measureSessionPhysicalDiskUsage").mockImplementation(
+      async (targetPath) => {
+        const usage = await realMeasure(targetPath);
+        return underBudget ? { ...usage, totalBytes: 1 } : usage;
+      },
+    );
+    const unregister = registerSessionMaintenancePreserveKeysProvider(() => {
+      preserveCalls += 1;
+      if (preserveCalls < 2) {
+        return [];
+      }
+      underBudget = true;
+      return [oldestKey];
+    });
+    try {
+      const result = await enforceSqliteSessionHistoryDiskBudget({
+        storePath,
+        mode: "enforce",
+        maintenance: {
+          maxDiskBytes: before.totalBytes - 1,
+          highWaterBytes: Math.max(1, before.totalBytes - 1),
+        },
+      });
+      expect(preserveCalls).toBeGreaterThanOrEqual(2);
+      expect(result?.removedEntries ?? 0).toBe(0);
+      expect(sessionNodeExists(oldestKey)).toBe(true);
+      expect(sessionNodeExists(newerKey)).toBe(true);
+    } finally {
+      unregister();
+    }
+  });
+
+  it("stops live eviction when the post-delete checkpoint is blocked", async () => {
+    const oldestKey = "agent:main:slack:channel:c12:thread:12";
+    const newerKey = "agent:main:slack:channel:c13:thread:13";
+    await replaceSessionEntry(
+      { sessionKey: oldestKey, storePath },
+      { sessionId: "checkpoint-oldest", updatedAt: 5 },
+    );
+    await appendTranscriptMessage(
+      { sessionId: "checkpoint-oldest", sessionKey: oldestKey, storePath },
+      { message: { role: "user", content: "oldest " + "x".repeat(64 * 1024) } },
+    );
+    await replaceSessionEntry(
+      { sessionKey: newerKey, storePath },
+      { sessionId: "checkpoint-newer", updatedAt: 15 },
+    );
+    await appendTranscriptMessage(
+      { sessionId: "checkpoint-newer", sessionKey: newerKey, storePath },
+      { message: { role: "user", content: "newer " + "y".repeat(64 * 1024) } },
+    );
+    settlePhysicalUsage();
+    const before = await measureSessionPhysicalDiskUsage(storePath);
+    const realReclaim = archivePruning.reclaimSqliteFreePages;
+    vi.spyOn(archivePruning, "reclaimSqliteFreePages").mockImplementation(
+      async (databaseOptions, diagnostics, limits) => {
+        if (diagnostics?.trigger === "after-eviction") {
+          return false;
+        }
+        return await realReclaim(databaseOptions, diagnostics, limits);
+      },
+    );
+    const result = await enforceSqliteSessionHistoryDiskBudget({
+      storePath,
+      mode: "enforce",
+      maintenance: {
+        maxDiskBytes: before.totalBytes - 1,
+        highWaterBytes: Math.max(1, before.totalBytes - 1),
+      },
+    });
+    expect(result?.removedEntries).toBe(1);
+    expect(sessionNodeExists(oldestKey)).toBe(false);
+    expect(sessionNodeExists(newerKey)).toBe(true);
   });
 
   it("does not wipe live durables when highWaterBytes is 0", async () => {

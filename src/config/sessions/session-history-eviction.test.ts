@@ -867,7 +867,7 @@ describe("SQLite historical session disk budget", () => {
   });
 
   it("does not live-evict a node when the admission identity is a prior generation", async () => {
-    const sessionKey = "agent:main:history-protection";
+    const sessionKey = "agent:main:slack:channel:c8:thread:8";
     await replaceSessionEntry(
       { sessionKey, storePath },
       { sessionId: "admitted-history", updatedAt: 1 },
