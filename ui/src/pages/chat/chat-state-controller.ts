@@ -7,8 +7,8 @@ import type { ChatQueueItem } from "../../lib/chat/chat-types.ts";
 import type { StoredChatOutboxScope } from "../../lib/chat/outbox-store.ts";
 import { showToast } from "../../lib/toast.ts";
 import { disposeSelectedSessionMessageSubscription } from "./chat-history-subscription.ts";
+import { chatOutboxOwner } from "./chat-outbox-owner.ts";
 import { getChatPendingInputs } from "./chat-pending-inputs.ts";
-import { subscribeChatOutboxProjection } from "./chat-queue.ts";
 import { stopChatRealtimeTalk } from "./chat-realtime.ts";
 import type { ChatPageHost } from "./chat-state-host.ts";
 import { invalidateImageLightbox } from "./chat-state-page.ts";
@@ -28,7 +28,7 @@ type ChatRenderLifecycleScope = {
 };
 
 export class ChatStateController<TState extends ChatPageHost> implements ReactiveController {
-  readonly attachmentReads: ChatAttachmentReadLifecycle;
+  private attachmentReadsValue: ChatAttachmentReadLifecycle;
   private readonly composerPersistence: ChatComposerPersistence;
   private stateValue: TState | undefined;
   private previousChatLoading = false;
@@ -53,7 +53,7 @@ export class ChatStateController<TState extends ChatPageHost> implements Reactiv
     private readonly onStateChange?: () => void,
     private readonly onQueuedMessageDiscarded?: (item: ChatQueueItem) => void,
   ) {
-    this.attachmentReads = new ChatAttachmentReadLifecycle(() =>
+    this.attachmentReadsValue = new ChatAttachmentReadLifecycle(() =>
       this.stateValue?.requestUpdate?.(),
     );
     this.composerPersistence = new ChatComposerPersistence(() => this.stateValue);
@@ -62,6 +62,24 @@ export class ChatStateController<TState extends ChatPageHost> implements Reactiv
 
   get state(): TState | undefined {
     return this.stateValue;
+  }
+
+  get attachmentReads(): ChatAttachmentReadLifecycle {
+    return this.attachmentReadsValue;
+  }
+
+  takeAttachmentReads(): ChatAttachmentReadLifecycle {
+    const reads = this.attachmentReadsValue;
+    this.attachmentReadsValue = new ChatAttachmentReadLifecycle(() =>
+      this.stateValue?.requestUpdate?.(),
+    );
+    return reads;
+  }
+
+  adoptAttachmentReads(reads: ChatAttachmentReadLifecycle, state: TState): void {
+    this.attachmentReadsValue.abortReads();
+    this.attachmentReadsValue = reads;
+    reads.retarget(this.attachmentInputProps(state), () => state.requestUpdate?.());
   }
 
   attachmentInputProps(state: TState) {
@@ -131,7 +149,7 @@ export class ChatStateController<TState extends ChatPageHost> implements Reactiv
     const renderLifecycle = state.renderLifecycle;
     state.requestUpdate = () => renderLifecycle.invalidate();
     this.cleanups.push(
-      subscribeChatOutboxProjection(state, (item) => {
+      chatOutboxOwner(state).subscribe(state, (item) => {
         if (this.stateValue === state) {
           this.onQueuedMessageDiscarded?.(item);
         }

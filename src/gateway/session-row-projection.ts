@@ -35,6 +35,7 @@ import {
 } from "./session-row-projection-archive.js";
 import { createSessionRowProjectionBackfill } from "./session-row-projection-backfill.js";
 import { createSessionRowProjectionCatalog } from "./session-row-projection-catalog.js";
+import { isIdentityScopesOnlyConfigChange } from "./session-row-projection-config.js";
 import { createSessionRowProjectionContext } from "./session-row-projection-context.js";
 import { createSessionRowCreatorIndex } from "./session-row-projection-identities.js";
 import {
@@ -111,7 +112,6 @@ export async function createSessionRowProjection(params: records.ProjectionOptio
       if (changed) {
         // Rows served during renewal need new materializations only when their model facts changed.
         epoch++;
-        databaseRevision++;
         revisionToken = undefined;
         metadata.invalidate({ all: true, scope: "catalog" });
         archive.invalidateRows({ all: true, scope: "catalog" }, rows.values());
@@ -144,14 +144,6 @@ export async function createSessionRowProjection(params: records.ProjectionOptio
       transcriptUpdates.remove(id);
       backfill.remove(id);
       dirty.delete(id);
-    },
-    prepare(row) {
-      metadata.prepare(epoch, cfg, matching, put, referenced);
-      const current = acquireEntry(row, readSessionRowEntry(row));
-      if (current && materialize(current)) {
-        backfill.enqueue(records.identity(current));
-      }
-      return current;
     },
   });
   const markRelated = (row: records.Row, includeChildren = true) =>
@@ -244,9 +236,11 @@ export async function createSessionRowProjection(params: records.ProjectionOptio
     // Every stored identity must be visible before an earlier store selects a later parent.
     for (const { row, entry } of acquisitions) {
       const current = acquireEntry(row, entry);
-      if (current && !isCold(current)) {
+      if (current) {
         dirty.add(records.identity(current));
-        backfill.enqueue(records.identity(current));
+        if (!isCold(current)) {
+          backfill.enqueue(records.identity(current));
+        }
       }
     }
     membership.updateTargets(
@@ -268,13 +262,22 @@ export async function createSessionRowProjection(params: records.ProjectionOptio
     topologyDirty = epoch !== revision;
   }
   function mark(change: SessionRowChange) {
+    if ("all" in change && change.scope === "config" && !change.factsInvalidated) {
+      const next = inOwnerContext(() => params.getConfig?.() ?? cfg);
+      if (isIdentityScopesOnlyConfigChange(cfg, next)) {
+        cfg = next;
+        void ensureMaterialized().catch(() => {});
+        return;
+      }
+    }
     epoch++;
     const presentationOnly = metadata.invalidate(change) && !change.factsInvalidated;
     if (!presentationOnly) {
       revisionToken = undefined;
     }
     if ("all" in change) {
-      if (!presentationOnly) {
+      const catalogOnly = change.scope === "catalog" && !change.factsInvalidated;
+      if (!presentationOnly && !catalogOnly) {
         databaseRevision++;
       }
       placementFacts.invalidateChange(change);
@@ -283,15 +286,11 @@ export async function createSessionRowProjection(params: records.ProjectionOptio
         catalog.invalidate();
       }
       // Renewal serves the old catalog until its replacement is adopted.
-      if (!presentationOnly && (change.scope !== "catalog" || !params.getModelCatalog)) {
+      if (!presentationOnly && (!catalogOnly || !params.getModelCatalog)) {
         archive.invalidateRows(
           change,
           typeof change.scope === "string" ? rows.values() : matching(change.scope),
         );
-      } else if (!presentationOnly) {
-        for (const row of rows.values()) {
-          row.pendingDatabaseFacts = undefined;
-        }
       }
     } else if (change.scope === "automation") {
       records.markAutomation(
@@ -314,15 +313,17 @@ export async function createSessionRowProjection(params: records.ProjectionOptio
           previous.sharingEntry = entry;
           if (entry?.archivedAt !== undefined && !registryFactsReady) {
             // Committed row changes must survive an unrelated compact-facts refill.
-            return archive.deferAcquisition({ ...previous, hasBoard: undefined });
+            return archive.deferAcquisition(previous);
           }
           return isCold(previous) || records.changesRowStructure(previous, entry)
-            ? acquireEntry({ ...previous, hasBoard: undefined }, entry)
+            ? acquireEntry(previous, entry)
             : previous;
         });
-        if (row && !isCold(row)) {
+        if (row) {
           dirty.add(records.identity(row));
-          backfill.enqueue(records.identity(row));
+          if (!isCold(row)) {
+            backfill.enqueue(records.identity(row));
+          }
         }
       }
       if (
@@ -349,11 +350,13 @@ export async function createSessionRowProjection(params: records.ProjectionOptio
             }
             return acquireEntry(row, entry);
           });
-          if (!admitted || isCold(admitted)) {
+          if (!admitted) {
             continue;
           }
           dirty.add(records.identity(admitted));
-          backfill.enqueue(records.identity(admitted));
+          if (!isCold(admitted)) {
+            backfill.enqueue(records.identity(admitted));
+          }
         }
       }
     }
@@ -600,6 +603,7 @@ export async function createSessionRowProjection(params: records.ProjectionOptio
       topologyDirty: () => topologyDirty,
       topology,
       lookup,
+      stores: () => stores,
       owner: (): SessionRowReadView & { isCurrent: typeof isCurrent } => projection,
     });
   const projection = {
@@ -621,6 +625,17 @@ export async function createSessionRowProjection(params: records.ProjectionOptio
       return findSessionRowById(query, { disposed, lookup, matching });
     },
     describe,
+    readMembership(query: records.Lookup) {
+      if (disposed) {
+        return undefined;
+      }
+      const row = lookup(query);
+      if (row && isIncognitoSessionKey(row.key)) {
+        return describe(query)?.membership;
+      }
+      const members = row && membership.membership(row.storeTarget.storePath, row.key);
+      return members ? new Set(members) : undefined;
+    },
     ...createSessionRowAncestorReads({
       state: () => ({ cfg, context: metadata.current }),
       referenced,
@@ -643,10 +658,6 @@ export async function createSessionRowProjection(params: records.ProjectionOptio
       return readSessionRowModelFacts({
         cfg,
         ...row,
-        preparedAcpMeta:
-          row.materialized && !dirty.has(records.identity(row))
-            ? (row.materialized.source.thinkingProjection.acpMeta ?? null)
-            : undefined,
         source: { entry: row.storedEntry, readSourceEntry: (key) => readSourceEntry(row, key) },
         modelCatalog: catalog.current,
         rowContext: metadata.current,

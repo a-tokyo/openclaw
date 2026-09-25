@@ -1,6 +1,8 @@
-import { executeSqliteQuerySync } from "../../infra/kysely-sync.js";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
-import { runExclusiveSessionLifecycleMutation } from "../../sessions/session-lifecycle-admission.js";
+import {
+  collectActiveSessionWorkAdmissions,
+  runExclusiveSessionLifecycleMutation,
+} from "../../sessions/session-lifecycle-admission.js";
 import { runQueuedStoreWrite, type StoreWriterQueue } from "../../shared/store-writer-queue.js";
 import {
   isIncognitoOpenClawAgentSqlitePath,
@@ -23,12 +25,8 @@ import type {
   SqliteSessionReclamationDiagnostics,
 } from "./session-accessor.sqlite-contract.js";
 import { emitArchivedTranscriptUpdates } from "./session-accessor.sqlite-events.js";
+import { planSessionStateDeleteIfUnreferenced } from "./session-accessor.sqlite-lifecycle-state.js";
 import {
-  planSessionStateDeleteIfUnreferenced,
-  readReferencedSessionIds,
-} from "./session-accessor.sqlite-lifecycle-state.js";
-import {
-  collectAdmissionProtectedSessionIds,
   finalizeSessionEntryMaintenancePlansAfterWriterReleaseBestEffort,
   planOldestCapacityEligibleSqliteLiveEntryRemoval,
   reclaimSqliteLiveSessionEntriesToHighWater,
@@ -40,12 +38,8 @@ import {
   runExclusiveSqliteSessionReclamation,
   runSqliteSessionReclamation,
 } from "./session-accessor.sqlite-reclamation.js";
+import { isRecentHistoricalSessionId } from "./session-accessor.sqlite-references.js";
 import {
-  collectRecentSessionHistoryIds,
-  isRecentHistoricalSessionId,
-} from "./session-accessor.sqlite-references.js";
-import {
-  getSessionKysely,
   resolveSqliteScope,
   resolveSqliteTranscriptArchiveDirectory,
   runExclusiveSqliteSessionWrite,
@@ -69,10 +63,12 @@ import {
   type SessionHistoryDiskBudgetParams,
 } from "./session-history-budget-state.js";
 import { deleteDiskBudgetArchivedSessionEntry } from "./session-history-entry-eviction.runtime.js";
-import { readDiskEvictableArchivedSessionBatch } from "./session-history-eviction-candidates.js";
+import {
+  collectSessionAdmissionReferences,
+  readDiskEvictableArchivedSessionBatch,
+  readHistoricalSessionIdsInDatabase,
+} from "./session-history-eviction-candidates.js";
 import { resolveMaintenanceConfig } from "./store-maintenance-runtime.js";
-
-export { collectAdmissionProtectedSessionIds } from "./session-accessor.sqlite-maintenance.js";
 
 /** Reports the same physical total enforce mode compares, without projecting logical row bytes. */
 export async function inspectSqliteSessionHistoryDiskBudget(
@@ -122,9 +118,10 @@ export async function inspectSqliteSessionHistoryDiskBudget(
   ) {
     return { diskBudget, wouldMutate: true };
   }
-  const candidates = readHistoricalSessionIds({
+  const candidates = await readHistoricalSessionIds({
     databaseOptions,
     preserveRecentMs: params.maintenance.preserveRecentMs,
+    reclamationMode: params.reclamationMode,
     storePath: params.storePath,
   });
   const archivedCandidates = readDiskEvictableArchivedSessionBatch({
@@ -151,23 +148,6 @@ export async function inspectSqliteSessionHistoryDiskBudget(
   return { diskBudget, wouldMutate: livePlan.entryRemovals.length > 0 };
 }
 
-function collectProtectedHistoricalSessionIds(params: {
-  database: OpenClawAgentDatabase;
-  preserveRecentMs?: number | null;
-  storePath: string;
-}): Set<string> {
-  const protectedSessionIds = readReferencedSessionIds(
-    params.database,
-    undefined,
-    undefined,
-    params,
-  );
-  for (const sessionId of collectAdmissionProtectedSessionIds(params)) {
-    protectedSessionIds.add(sessionId);
-  }
-  return protectedSessionIds;
-}
-
 function collectCandidateAdditionalProtection(params: {
   database: OpenClawAgentDatabase;
   preserveRecentMs?: number | null;
@@ -181,27 +161,52 @@ function collectCandidateAdditionalProtection(params: {
   return protectedSessionIds;
 }
 
-function readHistoricalSessionIds(params: {
+/** Session ids owned by in-flight work admissions, without live-reference protection. */
+export function collectAdmissionProtectedSessionIds(params: {
+  database: Pick<OpenClawAgentDatabase, "db">;
+  storePath: string;
+}): Set<string> {
+  return collectSessionAdmissionReferences({
+    database: params.database,
+    admissionIdentities: [...(collectActiveSessionWorkAdmissions().get(params.storePath) ?? [])],
+  });
+}
+
+async function readHistoricalSessionIds(params: {
   databaseOptions: OpenClawAgentDatabaseOptions;
   preserveRecentMs?: number | null;
+  reclamationMode?: SessionHistoryDiskBudgetParams["reclamationMode"];
   storePath: string;
-}): string[] {
-  // openclaw-agent-db.ts cache rule: LRU eviction closes idle handles across awaits.
-  const database = openOpenClawAgentDatabase(params.databaseOptions);
-  const scope = { ...params, database };
-  const protectedSessionIds = collectProtectedHistoricalSessionIds(scope);
-  for (const sessionId of collectRecentSessionHistoryIds(scope)) {
-    protectedSessionIds.add(sessionId);
+}): Promise<string[]> {
+  const input = {
+    admissionIdentities: [...(collectActiveSessionWorkAdmissions().get(params.storePath) ?? [])],
+    preserveRecentMs: params.preserveRecentMs,
+  };
+  if (
+    params.reclamationMode === "in-process" ||
+    isIncognitoOpenClawAgentSqlitePath(
+      resolveOpenClawAgentSqlitePath(params.databaseOptions),
+      params.databaseOptions,
+    )
+  ) {
+    return readHistoricalSessionIdsInDatabase({
+      ...input,
+      database: openOpenClawAgentDatabase(params.databaseOptions),
+    });
   }
-  const db = getSessionKysely(database.db);
-  return executeSqliteQuerySync(
-    database.db,
-    db
-      .selectFrom("session_windows")
-      .select("session_id")
-      .orderBy("updated_at", "asc")
-      .orderBy("session_id", "asc"),
-  ).rows.flatMap((row) => (protectedSessionIds.has(row.session_id) ? [] : [row.session_id]));
+  const [{ withSessionHistoryWorkerDatabase }, { maintenanceLane }] = await Promise.all([
+    import("./session-transcript-worker-runtime.js"),
+    import("./session-transcript-worker-resources.js"),
+  ]);
+  return withSessionHistoryWorkerDatabase(
+    params.databaseOptions,
+    (owner) =>
+      owner.readHistoricalEvictionCandidates({
+        ...input,
+        env: params.databaseOptions.env ?? process.env,
+      }),
+    maintenanceLane,
+  );
 }
 
 const log = createSubsystemLogger("sessions/history-eviction");
@@ -437,9 +442,10 @@ async function enforceSessionHistoryMaintenanceForDatabase(
   }
   const candidates =
     usage.totalBytes > highWaterBytes
-      ? readHistoricalSessionIds({
+      ? await readHistoricalSessionIds({
           databaseOptions,
           preserveRecentMs: params.maintenance.preserveRecentMs,
+          reclamationMode: params.reclamationMode,
           storePath: params.storePath,
         })
       : [];
@@ -462,14 +468,8 @@ async function enforceSessionHistoryMaintenanceForDatabase(
                 sessionId,
                 storePath: params.storePath,
               });
-              for (const referenced of readReferencedSessionIds(
-                database,
-                undefined,
-                [sessionId],
-                params.maintenance,
-              )) {
-                protectedBeforeArchive.add(referenced);
-              }
+              // Worker discovery checked node references; the reclamation transaction
+              // checks them again before persisting the archive or deleting history.
               return planSessionStateDeleteIfUnreferenced({
                 archiveDirectory,
                 archiveTranscript: true,

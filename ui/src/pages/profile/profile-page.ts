@@ -36,7 +36,7 @@ import {
 import { renderSettingsWorkspace } from "../../components/settings-workspace.ts";
 import { t } from "../../i18n/index.ts";
 import { registerModelAccountsEnglish } from "../../i18n/locales/en-model-accounts.ts";
-import { registerProfileAccessEnglish } from "../../i18n/locales/en-profile-access.ts";
+import { registerProfileEnglish } from "../../i18n/locales/en-profile.ts";
 import { formatUiError } from "../../lib/format-error.ts";
 import { IdentityAvatarController } from "../../lib/identity-avatar-loader.ts";
 import { OpenClawLightDomElement } from "../../lit/openclaw-element.ts";
@@ -51,7 +51,7 @@ import { userProfileAvatarUrl } from "./profile-avatar-url.ts";
 import { renderProfileHero } from "./profile-hero.ts";
 
 registerModelAccountsEnglish();
-registerProfileAccessEnglish();
+registerProfileEnglish();
 
 const PROFILE_DOCS_URL = "https://docs.openclaw.ai/concepts/user-model";
 
@@ -309,31 +309,22 @@ export class ProfilePage extends OpenClawLightDomElement {
   }
 
   private renderIdentity() {
-    if (!this.selfUser) {
+    if (!this.selfUser || !this.canWrite || !this.ownProfile) {
       return html`<div id=${PROFILE_SETTINGS_TARGET_IDS.identity}>
         ${renderSettingsSection(
           { title: t("profilePage.identity.title") },
-          renderSettingsEmpty(t("profilePage.identity.unidentified")),
-        )}
-      </div>`;
-    }
-    if (!this.canWrite) {
-      return html`<div id=${PROFILE_SETTINGS_TARGET_IDS.identity}>
-        ${renderSettingsSection(
-          { title: t("profilePage.identity.title") },
-          renderSettingsEmpty(t("profilePage.identity.writeRequired")),
-        )}
-      </div>`;
-    }
-    if (!this.ownProfile) {
-      return html`<div id=${PROFILE_SETTINGS_TARGET_IDS.identity}>
-        ${renderSettingsSection(
-          { title: t("profilePage.identity.title") },
-          this.identityLoading
-            ? renderSettingsLoadingSkeleton({ label: t("profilePage.identity.loading"), rows: 2 })
-            : renderSettingsEmpty(
-                this.identityError ?? t("profilePage.identity.profileUnavailable"),
-              ),
+          !this.selfUser
+            ? renderSettingsEmpty(t("profilePage.identity.unidentified"))
+            : !this.canWrite
+              ? renderSettingsEmpty(t("profilePage.identity.writeRequired"))
+              : this.identityLoading
+                ? renderSettingsLoadingSkeleton({
+                    label: t("profilePage.identity.loading"),
+                    rows: 2,
+                  })
+                : renderSettingsEmpty(
+                    this.identityError ?? t("profilePage.identity.profileUnavailable"),
+                  ),
         )}
       </div>`;
     }
