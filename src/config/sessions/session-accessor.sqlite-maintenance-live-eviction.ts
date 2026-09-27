@@ -4,11 +4,7 @@
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
 import { uniqueStrings } from "@openclaw/normalization-core/string-normalization";
 import { sql } from "kysely";
-import {
-  executeSqliteQuerySync,
-  iterateSqliteQuerySync,
-  sqliteStringSet,
-} from "../../infra/kysely-sync.js";
+import { executeSqliteQuerySync } from "../../infra/kysely-sync.js";
 import {
   parseAgentSessionKey,
   parseThreadSessionSuffix,
@@ -47,6 +43,7 @@ import {
   parseSessionEntryJson as parseSessionEntryRow,
   sessionEntryMetadataJson,
 } from "./session-accessor.sqlite-status.js";
+import { collectSessionAdmissionReferences } from "./session-history-eviction-candidates.js";
 import { normalizeStoreSessionKey } from "./store-entry.js";
 import { resolveSessionMaintenancePreserveKeys } from "./store-maintenance-preserve-snapshot.js";
 import { captureSessionMaintenancePreservation } from "./store-maintenance-preserve.js";
@@ -97,7 +94,7 @@ function emptyLiveEntryPlan(): SessionEntryMaintenancePlan {
 
 /** Activity order matches `getSessionMaintenanceActivityAt` without loading prompt payloads. */
 function liveNodeActivityAtSql() {
-  return sql<number>`CASE WHEN json_valid(entry_json) THEN MAX(
+  return /* kysely-allow-raw: activity timestamp is not a stored column. */ sql<number>`CASE WHEN json_valid(entry_json) THEN MAX(
     COALESCE(json_extract(entry_json, '$.lastInteractionAt'), 0),
     COALESCE(json_extract(entry_json, '$.lastActivityAt'), 0),
     COALESCE(json_extract(entry_json, '$.sessionStartedAt'), 0),
@@ -113,82 +110,14 @@ function isLocalEvictionFenceIdentity(identity: string, unprotect: ReadonlySet<s
   );
 }
 
-/** Session ids owned by in-flight work admissions, without live-reference protection. */
-export function collectAdmissionProtectedSessionIds(params: {
+function collectAdmissionProtectedSessionIds(params: {
   database: Pick<OpenClawAgentDatabase, "db">;
   storePath: string;
 }): Set<string> {
-  const protectedSessionIds = new Set<string>();
-  const admissionIdentities =
-    collectActiveSessionWorkAdmissions().get(params.storePath) ?? new Set<string>();
-  if (admissionIdentities.size === 0) {
-    return protectedSessionIds;
-  }
-
-  // Admissions may carry either the backing session id or its live session key. Protect both,
-  // then resolve admitted keys through their entries so cleanup cannot reclaim active work.
-  for (const identity of admissionIdentities) {
-    protectedSessionIds.add(identity);
-  }
-  const normalizedAdmissionKeys = new Set(
-    [...admissionIdentities].map((identity) => normalizeStoreSessionKey(identity)),
-  );
-  const db = getSessionKysely(params.database.db);
-  const admittedKeyBytes: string[] = [];
-  // Normalize lightweight keys before reading payloads; unrelated saved prompts can be large.
-  for (const row of iterateSqliteQuerySync(
-    params.database.db,
-    db
-      .selectFrom("session_nodes")
-      .select(["session_key", db.fn<string>("hex", ["session_key"]).as("key_bytes")]),
-  )) {
-    if (normalizedAdmissionKeys.has(normalizeStoreSessionKey(row.session_key))) {
-      admittedKeyBytes.push(row.key_bytes);
-    }
-  }
-  const rows = admittedKeyBytes.length
-    ? iterateSqliteQuerySync(
-        params.database.db,
-        db
-          .selectFrom("session_nodes")
-          .select(["entry_json", "current_session_id"])
-          // Keep stored keys inside SQLite: Node TEXT rebinding can change raw UTF-16 keys.
-          .where(
-            "session_key",
-            "in",
-            db
-              .selectFrom("session_nodes")
-              .select("session_key")
-              .where(
-                db.fn<string>("hex", ["session_key"]),
-                "in",
-                sqliteStringSet(admittedKeyBytes),
-              ),
-          ),
-      )
-    : [];
-  for (const row of rows) {
-    protectedSessionIds.add(row.current_session_id);
-    const entry = parseSessionEntryRow(row);
-    if (entry) {
-      for (const sessionId of collectSessionStateIdsForEntry(entry)) {
-        protectedSessionIds.add(sessionId);
-      }
-    }
-  }
-  // Key-scoped admissions must survive rollover: an in-flight run admitted by
-  // key may still write to a generation the entry no longer references, so
-  // every generation of an admitted key stays off-limits.
-  const generationRows = iterateSqliteQuerySync(
-    params.database.db,
-    db.selectFrom("session_windows").select(["session_id", "session_key"]),
-  );
-  for (const row of generationRows) {
-    if (normalizedAdmissionKeys.has(normalizeStoreSessionKey(row.session_key))) {
-      protectedSessionIds.add(row.session_id);
-    }
-  }
-  return protectedSessionIds;
+  return collectSessionAdmissionReferences({
+    database: params.database,
+    admissionIdentities: [...(collectActiveSessionWorkAdmissions().get(params.storePath) ?? [])],
+  });
 }
 
 function collectAdmissionProtectedStoreKeys(params: {
@@ -383,7 +312,7 @@ function readOldestCapacityEligibleLiveNode(params: {
     }
     const rows = executeSqliteQuerySync(params.database.db, query).rows;
     for (const row of rows) {
-      const activity = Number(row.activity_at);
+      const activity = row.activity_at;
       cursor = {
         activityAt: Number.isFinite(activity) ? activity : 0,
         sessionKey: row.session_key,

@@ -49,10 +49,7 @@ import {
   planSessionStateAfterEntryRemoval,
   readReferencedSessionIdsAfterTargetMutation,
 } from "./session-accessor.sqlite-lifecycle-state.js";
-import {
-  collectAdmissionProtectedSessionIds,
-  refreshSqliteSessionPlannerStatisticsBestEffort,
-} from "./session-accessor.sqlite-maintenance.js";
+import { refreshSqliteSessionPlannerStatisticsBestEffort } from "./session-accessor.sqlite-maintenance.js";
 import {
   createHistoricalGenerationReclamationPlan,
   createLifecycleArtifactReclamationPlan,
@@ -76,7 +73,10 @@ import {
   withSqliteSessionDatabase,
   type ResolvedSqliteScope,
 } from "./session-accessor.sqlite-scope.js";
-import { kickSessionHistoryDiskBudgetMaintenance } from "./session-history-eviction.js";
+import {
+  collectAdmissionProtectedSessionIds,
+  kickSessionHistoryDiskBudgetMaintenance,
+} from "./session-history-eviction.js";
 import type { InternalSessionEntry as SessionEntry } from "./types.js";
 
 // Single-target lifecycle owner: cleanup, reset, guarded delete, and trusted rollback.

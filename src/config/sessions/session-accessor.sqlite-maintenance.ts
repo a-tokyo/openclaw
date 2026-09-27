@@ -497,7 +497,6 @@ export async function finalizeSessionEntryMaintenancePlansAfterWriterReleaseBest
 
 // Live-node capacity eviction is in session-accessor.sqlite-maintenance-live-eviction.ts.
 export {
-  collectAdmissionProtectedSessionIds,
   planOldestCapacityEligibleSqliteLiveEntryRemoval,
   reclaimSqliteLiveSessionEntriesToHighWater,
 } from "./session-accessor.sqlite-maintenance-live-eviction.js";
