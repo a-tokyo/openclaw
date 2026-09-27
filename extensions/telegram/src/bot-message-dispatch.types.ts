@@ -27,6 +27,7 @@ import type {
   LaneName,
   LaneTextDeliverer,
 } from "./lane-delivery-text-deliverer.js";
+import type { createTelegramReasoningStepState } from "./reasoning-lane-coordinator.js";
 
 export type DispatchTelegramMessageParams = {
   context: TelegramMessageContext;
@@ -73,7 +74,7 @@ export type FreshTelegramSessionEntryLoader = ((
   clear: () => void;
 };
 
-export type TelegramAnswerBlockDelivery = {
+type TelegramAnswerBlockDelivery = {
   payload: ReplyPayload;
   text: string;
   buttons: import("./button-types.js").TelegramInlineButtons | undefined;
@@ -119,7 +120,7 @@ export type TelegramQueuedAnswerBlockRotation = {
   text?: string;
   shouldRotateBeforeDelivery: boolean;
 };
-export type TelegramBufferedFinalSettlement = {
+type TelegramBufferedFinalSettlement = {
   visibleReplySent: boolean;
   onPlatformSendDispatch?: () => Promise<void>;
   assertPlatformSendAuthorized?: () => void;
@@ -130,14 +131,7 @@ export type TelegramBufferedFinalSettlement = {
 
 type TelegramProgressCompositor = ReturnType<typeof createChannelProgressDraftCompositor>;
 
-export type TelegramReasoningStepState = {
-  noteReasoningHint: () => void;
-  noteReasoningDelivered: () => void;
-  shouldBufferFinalAnswer: () => boolean;
-  bufferFinalAnswer: (value: ReplyPayload) => void;
-  takeBufferedFinalAnswer: () => ReplyPayload | undefined;
-  resetForNextStep: () => void;
-};
+type TelegramReasoningStepState = ReturnType<typeof createTelegramReasoningStepState>;
 
 export type TelegramDraftStateSlice = {
   answerLane: DraftLaneState;

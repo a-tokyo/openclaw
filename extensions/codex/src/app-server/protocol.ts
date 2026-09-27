@@ -30,7 +30,6 @@ import type {
   CodexPluginReadParams,
   CodexPluginReadResponse,
   CodexPluginSummary,
-  CodexSkillsListParams,
   CodexSkillsListResponse,
 } from "./protocol-control-plane.js";
 import type { JsonObject, JsonValue } from "./protocol-json.js";
@@ -583,6 +582,7 @@ export type CodexModel = {
   hidden: boolean;
   isDefault: boolean;
   inputModalities: string[];
+  serviceTiers?: { id: string; name: string; description: string }[];
   supportedReasoningEfforts: CodexReasoningEffortOption[];
   defaultReasoningEffort?: string | null;
   multiAgentVersion?: "disabled" | "v1" | "v2" | null;
@@ -648,8 +648,6 @@ export declare namespace v2 {
   export type PluginReadParams = CodexPluginReadParams;
   export type PluginReadResponse = CodexPluginReadResponse;
   export type PluginSummary = CodexPluginSummary;
-  export type SkillsListParams = CodexSkillsListParams;
-  export type SkillsListResponse = CodexSkillsListResponse;
 }
 
 type CodexAppServerRequestParamsOverride = {
@@ -692,7 +690,9 @@ type CodexAppServerRequestParamsOverride = {
 };
 
 type CodexAppServerRequestResultMap = {
-  "thread/backgroundTerminals/list": { data: { itemId: string; processId: string }[] };
+  "thread/backgroundTerminals/list": {
+    data: { itemId: string; processId: string; command: string; cwd: string }[];
+  };
   "thread/backgroundTerminals/terminate": { terminated: boolean };
   initialize: CodexInitializeResponse;
   "account/rateLimits/read": JsonValue;

@@ -278,9 +278,6 @@ function inspectLoadedRuntime(args) {
     fail("Fixture unit is not already loaded.");
   }
   const unit = parseUnit(fs.readFileSync(loadedPath, "utf8"));
-  if (!unit) {
-    fail();
-  }
   if (matches(["call", paths.owner, root, `${manager}.Manager`, "GetUnit", "s", unitName])) {
     writeProperties([["o", [object]]]);
     return true;
@@ -326,22 +323,22 @@ function inspectLoadedRuntime(args) {
     ]);
     return true;
   }
-  if (
-    matches([
-      "get-property",
-      paths.owner,
-      object,
-      `${manager}.Service`,
-      "Result",
-      "NRestarts",
-      "MainPID",
-      "ExecMainStatus",
-      "ExecMainCode",
-      "KillMode",
-      "TasksCurrent",
-      "MemoryCurrent",
-    ])
-  ) {
+  const runtimeQuery = [
+    "get-property",
+    paths.owner,
+    object,
+    `${manager}.Service`,
+    "Result",
+    "NRestarts",
+    "MainPID",
+    "ExecMainStatus",
+    "ExecMainCode",
+    "KillMode",
+    "TasksCurrent",
+    "MemoryCurrent",
+  ];
+  const includeControlGroup = matches([...runtimeQuery, "ControlGroup"]);
+  if (matches(runtimeQuery) || includeControlGroup) {
     // systemd's unavailable uint64 sentinel stays unknown to the native reader.
     const unknown = Number(0xffff_ffff_ffff_ffffn);
     writeProperties([
@@ -353,6 +350,8 @@ function inspectLoadedRuntime(args) {
       ["s", unit.killMode],
       ["t", runtime.settled ? 0 : unknown],
       ["t", unknown],
+      // This process-group emulator does not create a native systemd cgroup.
+      ...(includeControlGroup ? [["s", ""]] : []),
     ]);
     return true;
   }
@@ -560,23 +559,17 @@ function run() {
     "s",
     unitName,
   ]);
-  const unitQuery = matches([
-    ...prefix,
-    "get-property",
-    manager,
-    object,
-    `${manager}.Unit`,
-    ...commandPropertyNames("Unit"),
-  ]);
-  const serviceQuery = matches([
-    ...prefix,
-    "get-property",
-    manager,
-    object,
-    `${manager}.Service`,
-    ...commandPropertyNames("Service"),
-  ]);
-  if (!load && !unitQuery && !serviceQuery) {
+  const commandScope = ["Unit", "Service"].find((scope) =>
+    matches([
+      ...prefix,
+      "get-property",
+      manager,
+      object,
+      `${manager}.${scope}`,
+      ...commandPropertyNames(scope),
+    ]),
+  );
+  if (!load && !commandScope) {
     fail();
   }
   const unit = readUnit(false, requireLoaded);
@@ -589,7 +582,7 @@ function run() {
   if (load) {
     writeProperties([["o", [object]]]);
   } else {
-    writeCommandProperties(unit, unitQuery ? "Unit" : "Service");
+    writeCommandProperties(unit, commandScope);
   }
 }
 

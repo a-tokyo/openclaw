@@ -11,6 +11,10 @@ import { isPathInside } from "../infra/path-guards.js";
 import { setSqliteBusyTimeout } from "../infra/sqlite-busy-timeout.js";
 import { SQLITE_IDLE_HANDLE_TTL_MS } from "../infra/sqlite-handle-lifecycle.js";
 import type { SqliteIntegrityDiagnostics } from "../infra/sqlite-integrity.js";
+import {
+  deferSqlitePostCommitPublication,
+  hasSqlitePostCommitScope,
+} from "../infra/sqlite-post-commit.js";
 import { createSqliteTerminalOpenLatch } from "../infra/sqlite-terminal-open-latch.js";
 import {
   registerSqliteCacheExitClose,
@@ -22,6 +26,7 @@ import { resolveGlobalSingleton } from "../shared/global-singleton.js";
 import { releaseAgentDeletionDatabaseCleanup } from "./agent-deletion-cleanup.js";
 import type {
   OpenClawAgentDatabase,
+  OpenClawAgentDatabaseOptions,
   OpenClawAgentDatabaseOwnerInspection,
 } from "./openclaw-agent-db-contract.js";
 import {
@@ -38,6 +43,7 @@ import {
   drainAgentDatabaseResources,
   matchesAgentDatabaseClose,
   revokeAgentDatabaseResources,
+  type AgentDatabaseCloseSelection,
 } from "./openclaw-agent-db-resources.js";
 import {
   assertSupportedAgentSchemaVersion,
@@ -108,6 +114,30 @@ const cache = resolveGlobalSingleton<AgentDatabaseLifecycle>(
     retainedCloses: new Set(),
   }),
 );
+
+/** Queue a non-throwing runtime publication on the outer database commit edge. */
+export function deferOpenClawAgentPostCommitPublication(
+  database: OpenClawAgentDatabase,
+  publish: (options: OpenClawAgentDatabaseOptions) => void,
+): boolean {
+  // Maintenance can mark projections dirty without scheduling runtime publication.
+  if (!hasSqlitePostCommitScope(database.db)) {
+    return false;
+  }
+  const lease = cache.leases.get(database.path);
+  if (
+    cache.databases.get(database.path) !== database ||
+    (!lease && !cache.incognito.has(database))
+  ) {
+    throw new Error("Agent post-commit publication requires its admitted database owner");
+  }
+  const options = {
+    agentId: database.agentId,
+    path: database.path,
+    ...(lease ? { env: { ...lease.env } } : {}),
+  };
+  return deferSqlitePostCommitPublication(database.db, () => publish(options));
+}
 
 /** Runtime reads and opens share the generation-aware process-local damage latch. */
 export function assertAgentDatabaseTerminalOpenAllowed(pathname: string): void {
@@ -481,6 +511,23 @@ export function closeOpenClawAgentDatabases(rootPath?: string): void {
   }
 }
 
+async function drainPendingAgentDatabaseOpens(
+  selection: AgentDatabaseCloseSelection,
+): Promise<void> {
+  while (true) {
+    const pending = [...cache.activePending].filter((owner) =>
+      matchesAgentDatabaseClose(selection, owner),
+    );
+    if (pending.length === 0) {
+      return;
+    }
+    for (const owner of pending) {
+      revokePendingAgentDatabaseOpen(owner.path, selection.agentId);
+    }
+    await Promise.allSettled(pending.map((owner) => owner.promise));
+  }
+}
+
 /** Drain native opens before a lifecycle owner releases shared state or removes its root. */
 export async function closeOpenClawAgentDatabasesAsync(rootPath?: string): Promise<void> {
   // Retained resources may drain slowly; revoke native admission before yielding to them.
@@ -490,18 +537,7 @@ export async function closeOpenClawAgentDatabasesAsync(rootPath?: string): Promi
     }
   }
   await drainAgentDatabaseResources({ rootPath }, async () => {
-    while (true) {
-      const pending = [...cache.activePending].filter(
-        (owner) => rootPath === undefined || isPathInside(rootPath, owner.path),
-      );
-      if (pending.length === 0) {
-        break;
-      }
-      for (const owner of pending) {
-        revokePendingAgentDatabaseOpen(owner.path);
-      }
-      await Promise.allSettled(pending.map((owner) => owner.promise));
-    }
+    await drainPendingAgentDatabaseOpens({ rootPath });
     closeOpenClawAgentDatabases(rootPath);
   });
 }
@@ -514,18 +550,7 @@ export async function closeOpenClawAgentDatabaseByPathAsync(
   const selection = { path: path.resolve(pathname), agentId: expectedAgentId };
   revokePendingAgentDatabaseOpen(selection.path, expectedAgentId);
   return drainAgentDatabaseResources(selection, async () => {
-    while (true) {
-      const pending = [...cache.activePending].filter((owner) =>
-        matchesAgentDatabaseClose(selection, owner),
-      );
-      if (pending.length === 0) {
-        break;
-      }
-      for (const owner of pending) {
-        revokePendingAgentDatabaseOpen(owner.path, expectedAgentId);
-      }
-      await Promise.allSettled(pending.map((owner) => owner.promise));
-    }
+    await drainPendingAgentDatabaseOpens(selection);
     return closeOpenClawAgentDatabaseByPath(selection.path, expectedAgentId);
   });
 }

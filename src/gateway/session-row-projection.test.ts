@@ -8,9 +8,9 @@ import {
   deleteSessionEntryLifecycle,
   replaceSessionEntrySync,
 } from "../config/sessions/session-accessor.js";
+import { historyLane } from "../config/sessions/session-transcript-worker-resources.js";
 import { setCurrentPluginMetadataSnapshot } from "../plugins/current-plugin-metadata.test-support.js";
 import { createPluginMetadataSnapshotFixture } from "../plugins/plugin-metadata.test-support.js";
-import { emitSessionIdentityMutation } from "../sessions/session-lifecycle-events.js";
 import { sessionChanges } from "../sessions/session-row-changes.js";
 import { registerOpenClawAgentDatabase } from "../state/openclaw-agent-db-registry.js";
 import {
@@ -26,7 +26,7 @@ import * as rowInputs from "./session-utils-row.js";
 
 afterEach(() => vi.restoreAllMocks());
 
-it("prepares dirty persistent row facts without Gateway-thread data reads", async () => {
+it("prepares dirty persistent row facts independently of history reads and the Gateway thread", async () => {
   await withOpenClawTestState({ scenario: "minimal" }, async () => {
     const key = "agent:main:worker-row";
     const cfg = {
@@ -61,10 +61,22 @@ it("prepares dirty persistent row facts without Gateway-thread data reads", asyn
       await projection.ensureMaterialized();
       try {
         const before = projection.materializedCount;
-        sessionChanges.emit({ agentId: "main", sessionKey: key });
+        const historyReads = vi
+          .spyOn(historyLane.pool, "run")
+          .mockRejectedValue(new Error("History reader is unavailable"));
+        replaceSessionEntrySync(
+          { agentId: "main", sessionKey: key },
+          {
+            ...projection.capture({ agentId: "main", key })!.entry,
+            sessionId: "worker-row",
+            updatedAt: 2,
+            label: "Fresh worker row",
+          },
+        );
         const reads = observeSqliteReadSql(StatementSync.prototype);
         try {
-          await listProjectedSessions({ projection, opts: {} });
+          const listed = await listProjectedSessions({ projection, opts: {} });
+          expect(listed.sessions).toMatchObject([{ key, label: "Fresh worker row", updatedAt: 2 }]);
           expect(projection.materializedCount).toBeGreaterThan(before);
           expect(
             reads.queries.flatMap((sql) =>
@@ -84,6 +96,7 @@ it("prepares dirty persistent row facts without Gateway-thread data reads", asyn
           );
         } finally {
           reads.restore();
+          historyReads.mockRestore();
         }
       } finally {
         projection.dispose();
@@ -200,6 +213,7 @@ it("retains current rows across agent scopes without SQLite and refreshes only t
           {
             sessionId: `${agentId}-${name}`,
             updatedAt: Date.now(),
+            lastInteractionAt: name === "parent" ? 2 : 1,
             label: name,
             ...(name === "child" ? { parentSessionKey: `agent:${agentId}:parent` } : {}),
           },
@@ -213,8 +227,22 @@ it("retains current rows across agent scopes without SQLite and refreshes only t
       const untouched = projection.describe({ agentId: "work", key: "agent:work:child" });
       const prepares = vi.spyOn(DatabaseSync.prototype, "prepare");
       const exec = vi.spyOn(DatabaseSync.prototype, "exec");
+      const insertionOrder = projection.selectEntries({ agentId: "main", sortBy: null });
+      const insertionKeys = insertionOrder.map((record) => record.key);
       const first = projection.selectEntries({ agentId: "main" });
+      const interactionOrder = projection.selectEntries({
+        agentId: "main",
+        sortBy: "lastInteractionAt",
+      });
+      expect(interactionOrder.map((record) => record.key)).toEqual([
+        "agent:main:parent",
+        "agent:main:child",
+      ]);
       expect(first.map((record) => record.key)).toEqual(["agent:main:child", "agent:main:parent"]);
+      expect(insertionOrder.map((record) => record.key)).toEqual(insertionKeys);
+      expect(
+        projection.selectEntries({ agentId: "main", sortBy: null }).map((record) => record.key),
+      ).toEqual(insertionKeys);
       expect(
         projection.snapshot({ agentId: "main", key: "agent:main:parent" }).row?.childSessions,
       ).toEqual(["agent:main:child"]);
@@ -307,28 +335,23 @@ it.each(["reset", "replace"] as const)(
       const cfg = { agents: { list: [{ id: "main", default: true }] } };
       replaceSessionEntrySync(
         { agentId: "main", sessionKey: key },
-        { sessionId: "old", updatedAt: 1 },
+        { sessionId: "old", lifecycleRevision: "original", updatedAt: 1 },
       );
       const projection = await createSessionRowProjection({ cfg });
       await projection.ensureMaterialized();
       try {
         const old = projection.describe({ agentId: "main", key });
+        const sessionId = kind === "reset" ? "old" : "new";
         replaceSessionEntrySync(
           { agentId: "main", sessionKey: key },
-          { sessionId: "new", updatedAt: 2 },
+          { sessionId, lifecycleRevision: "replacement", updatedAt: 2 },
         );
-        emitSessionIdentityMutation({
-          kind,
-          agentId: "main",
-          previous: { sessionId: "old", sessionKeys: [key] },
-          current: { sessionId: "new", sessionKeys: [key] },
-        });
         const current = projection.capture({ agentId: "main", key });
         expect(current).toBeDefined();
         await projection.ensureMaterialized();
         expect(projection.isCurrent(current!)).toBe(true);
         expect(projection.isCurrent(old!)).toBe(false);
-        expect(projection.snapshot({ agentId: "main", key }).row?.sessionId).toBe("new");
+        expect(projection.snapshot({ agentId: "main", key }).row?.sessionId).toBe(sessionId);
         expect(old?.entry.sessionId).toBe("old");
       } finally {
         projection.dispose();
@@ -698,6 +721,9 @@ it("keeps cross-agent inheritance bound to a stored qualified parent", async () 
         model: "work-model",
         modelOverrideSource: "inherited",
       });
+      expect(
+        projection.selectEntries({ agentId: "work", parentSessionKey: "agent:work:main" }),
+      ).toEqual([]);
       expect(
         projection
           .selectEntries({ agentId: "main", parentSessionKey: "agent:work:main" })

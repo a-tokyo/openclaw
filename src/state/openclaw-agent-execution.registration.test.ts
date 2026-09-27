@@ -18,7 +18,10 @@ import type { acquireSqliteWorkerLifecycle } from "../infra/sqlite-worker-lifecy
 import type { SqliteWorkerAdmissionRequest } from "../infra/sqlite-worker-operation-admission.js";
 import { createSqliteWorkerTransferOwner } from "../infra/sqlite-worker-transfer.js";
 import { createDeferredCore, type Deferred } from "../shared/deferred.js";
-import type { OpenClawAgentDatabaseRegistrationCommit } from "./openclaw-agent-db-contract.js";
+import type {
+  OpenClawAgentDatabaseRegistrationCommit,
+  OpenClawAgentDatabaseRegistrationObserver,
+} from "./openclaw-agent-db-contract.js";
 import type { AgentDatabaseExecutionOpen } from "./openclaw-agent-execution-contract.js";
 import { OpenClawQuarantineReadCleanupError } from "./openclaw-quarantine-error.js";
 import { hydrateOpenClawStateWorkerError } from "./openclaw-state-worker-error.js";
@@ -37,10 +40,11 @@ const edge = vi.hoisted(() => {
       (
         options: unknown,
         lease: unknown,
-        committed?: (receipt: OpenClawAgentDatabaseRegistrationCommit) => void,
+        registration?: OpenClawAgentDatabaseRegistrationObserver,
       ) => typeof database
     >(),
     request: vi.fn<(request: SqliteWorkerAdmissionRequest) => void>(),
+    attachment: vi.fn(() => ({ kind: "agent-execution", startupJournal: false })),
     nativeClose: vi.fn(() => {
       database.db.isOpen = false;
       return true;
@@ -62,6 +66,7 @@ vi.mock("node:worker_threads", async (importOriginal) => {
   return {
     parentPort: { on: edge.on, postMessage: edge.publishReply },
     isMainThread: false,
+    workerData: null,
     threadId: 1,
     isMarkedAsUntransferable: actual.isMarkedAsUntransferable,
     Worker: edge.forbidden,
@@ -89,6 +94,7 @@ vi.mock("../infra/sqlite-worker-operation-admission.js", async (importOriginal) 
   return {
     ...actual,
     requestSqliteWorkerOperationAdmission: edge.request,
+    takeSqliteWorkerOperationAdmissionAttachment: edge.attachment,
   };
 });
 vi.mock("../infra/sqlite-worker-broker-admission.js", () => ({
@@ -258,8 +264,9 @@ afterEach(async () => {
 
 it("settles eager native factory creation synchronously", async () => {
   const { createSqliteWorkerBackend } = await import("./openclaw-agent-execution.worker.js");
-  edge.open.mockImplementation((_options, _lease, committed) => {
-    committed?.(receipt);
+  edge.open.mockImplementation((_options, _lease, registration) => {
+    registration?.starting?.();
+    registration?.committed?.(receipt);
     nativeOpened = true;
     return edge.database;
   });
@@ -313,11 +320,12 @@ it.each([
       return "ok";
     });
     edge.request.mockImplementation(actual.requestSqliteWorkerOperationAdmission);
-    edge.open.mockImplementation((_options, _lease, committed) => {
+    edge.open.mockImplementation((_options, _lease, registration) => {
       if (outcome === "ordinary closed") {
         throw nativeError;
       }
-      committed?.(receipt);
+      registration?.starting?.();
+      registration?.committed?.(receipt);
       if (outcome === "native and report failure") {
         throw nativeError;
       }
@@ -472,8 +480,9 @@ describe("committed agent registration across failed native opening", () => {
   it.each(["inline", "framed"] as const)(
     "retains the shared-state lifecycle location through %s command delivery",
     async (delivery) => {
-      edge.open.mockImplementation((_options, _lease, committed) => {
-        committed?.(receipt);
+      edge.open.mockImplementation((_options, _lease, registration) => {
+        registration?.starting?.();
+        registration?.committed?.(receipt);
         nativeOpened = true;
         return edge.database;
       });
@@ -640,8 +649,9 @@ describe("committed agent registration across failed native opening", () => {
     async ({ openingSucceeds, reportRefused }) => {
       const openingError = new Error("Validation publication failed after registration COMMIT");
       const reportingError = new Error("Original caller retired before receipt acknowledgement");
-      edge.open.mockImplementation((_options, _lease, committed) => {
-        committed?.(receipt);
+      edge.open.mockImplementation((_options, _lease, registration) => {
+        registration?.starting?.();
+        registration?.committed?.(receipt);
         if (openingSucceeds) {
           nativeOpened = true;
           return edge.database;
@@ -702,8 +712,9 @@ describe("committed agent registration across failed native opening", () => {
   );
 
   it("keeps a fully initialized actor available without reporting registration again", async () => {
-    edge.open.mockImplementation((_options, _lease, committed) => {
-      committed?.(receipt);
+    edge.open.mockImplementation((_options, _lease, registration) => {
+      registration?.starting?.();
+      registration?.committed?.(receipt);
       nativeOpened = true;
       return edge.database;
     });
@@ -756,6 +767,7 @@ describe("committed agent registration across failed native opening", () => {
     vi.doMock("../infra/sqlite-worker-operation-admission.js", () => ({
       ...duplicateAdmission,
       requestSqliteWorkerOperationAdmission: edge.request,
+      takeSqliteWorkerOperationAdmissionAttachment: edge.attachment,
       withSqliteWorkerOperationAdmission: edge.forbidden,
     }));
     const refused = new Error("Authority revoked after preflight and before native agent open");

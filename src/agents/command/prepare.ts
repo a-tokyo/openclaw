@@ -63,19 +63,6 @@ import type { AgentCommandOpts } from "./types.js";
 
 const OVERRIDE_VALUE_MAX_LENGTH = 256;
 
-function containsControlCharacters(value: string): boolean {
-  for (const char of value) {
-    const code = char.codePointAt(0);
-    if (code === undefined) {
-      continue;
-    }
-    if (code <= 0x1f || (code >= 0x7f && code <= 0x9f)) {
-      return true;
-    }
-  }
-  return false;
-}
-
 export function normalizeExplicitOverrideInput(raw: string, kind: "provider" | "model"): string {
   const trimmed = raw.trim();
   const label = kind === "provider" ? "Provider" : "Model";
@@ -85,7 +72,7 @@ export function normalizeExplicitOverrideInput(raw: string, kind: "provider" | "
   if (trimmed.length > OVERRIDE_VALUE_MAX_LENGTH) {
     throw new Error(`${label} override exceeds ${String(OVERRIDE_VALUE_MAX_LENGTH)} characters.`);
   }
-  if (containsControlCharacters(trimmed)) {
+  if (/\p{Cc}/u.test(trimmed)) {
     throw new Error(`${label} override contains invalid control characters.`);
   }
   return trimmed;
@@ -199,9 +186,7 @@ export async function prepareAgentCommandExecution(
     throw new Error('Invalid verbose level. Use "on", "full", or "off".');
   }
 
-  const laneRaw = normalizeOptionalString(opts.lane) ?? "";
-  const subagentLane: string = AGENT_LANE_SUBAGENT;
-  const isSubagentLane = laneRaw === subagentLane;
+  const isSubagentLane = normalizeOptionalString(opts.lane) === AGENT_LANE_SUBAGENT;
   const hasExplicitTimeoutOption = opts.timeout !== undefined;
   const timeoutSecondsRaw = hasExplicitTimeoutOption
     ? (parseStrictNonNegativeInteger(opts.timeout) ?? Number.NaN)
@@ -267,8 +252,7 @@ export async function prepareAgentCommandExecution(
   if (harnessSessionError) {
     throw new Error(harnessSessionError);
   }
-  const isOneShotModelRun = opts.modelRun === true || opts.promptMode === "none";
-  if (isOneShotModelRun && sessionKey && sessionEntryRaw?.modelSelectionLocked === true) {
+  if (isRawModelRun && sessionKey && sessionEntryRaw?.modelSelectionLocked === true) {
     throw new Error(AGENT_HARNESS_MODEL_RUN_FORBIDDEN_MESSAGE);
   }
   const sessionStore: Record<string, InternalSessionEntry> =
@@ -438,7 +422,7 @@ export async function prepareAgentCommandExecution(
       opts.transcriptMessage ??
       resolveInternalEventTranscriptBody(message, opts.internalEvents, opts.inputProvenance);
 
-    const prepared = {
+    return {
       opts: commandOpts,
       body,
       transcriptBody,
@@ -475,7 +459,6 @@ export async function prepareAgentCommandExecution(
       acpResolution,
       runLease,
     };
-    return prepared;
   } catch (error) {
     await runLease?.release();
     throw error;
