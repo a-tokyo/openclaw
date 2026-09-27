@@ -116,6 +116,7 @@ vi.mock("./runtime.js", () => ({
       },
     },
   }),
+  getOptionalMSTeamsRuntime: () => undefined,
 }));
 
 vi.mock("./graph-upload.js", async (importOriginal) => {
