@@ -565,7 +565,11 @@ export function projectChatTranscript(
       content: renderTurnRecapRow(turnRecap),
     });
   }
-  const typingIndicator = renderChatTypingIndicator(props.typingActors, avatarPlacement);
+  const typingIndicator = renderChatTypingIndicator(
+    props.typingActors,
+    avatarPlacement,
+    props.typingOverflow,
+  );
   if (typingIndicator) {
     transcriptRows.push({ kind: "content", key: "presence:typing", content: typingIndicator });
   }
