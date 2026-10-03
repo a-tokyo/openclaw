@@ -8,6 +8,7 @@ import {
   listManagedOpenClawGatewayServices,
   renderGatewayServiceCleanupHints,
 } from "./inspect.js";
+import type { ScheduledTaskSnapshot } from "./schtasks-state-probe.js";
 
 const { listScheduledTasksMock, readScheduledTaskCommandMock } = vi.hoisted(() => ({
   listScheduledTasksMock: vi.fn<typeof import("./schtasks-state-probe.js").listScheduledTasks>(),
@@ -161,37 +162,11 @@ describe("findExtraGatewayServices (win32)", () => {
     },
   );
 
-  it.each([{ actions: undefined }, { actions: [] }])(
-    "retains incomplete known selectors with missing actions $actions",
-    async ({ actions }) => {
-      listScheduledTasksMock.mockReturnValue([
-        { taskPath: "\\OpenClaw Gateway", state: null, actions },
-        { taskPath: "\\Selected Custom", state: null, actions },
-      ]);
-      const env = { ...nativeEnv, OPENCLAW_WINDOWS_TASK_NAME: "\\Selected Custom" };
-
-      const extras = await findExtraGatewayServices(env, { deep: true });
-
-      expect(extras.services).toEqual([]);
-      expect(extras.errors).toEqual([
-        {
-          source: "\\OpenClaw Gateway",
-          message: expect.stringContaining("could not be inspected"),
-        },
-        { source: "\\Selected Custom", message: expect.stringContaining("could not be inspected") },
-      ]);
-      expect(await listManagedOpenClawGatewayServices(env)).toEqual(extras);
-    },
-  );
-
   it.each([
     ["modern Gateway", "Services\\Selected Gateway", "openclaw", "gateway run", false, true],
     ["legacy command", "Services\\Selected Legacy", "clawdbot", "run", true, false],
     ["upgraded legacy task", "Clawdbot Gateway", "openclaw", "gateway run", true, true],
     ["Node", "Services\\Selected Node", "openclaw", "node run", true, false],
-    ["canonical modern Gateway", "OpenClaw Gateway", "openclaw", "gateway run", false, true],
-    ["canonical legacy command", "OpenClaw Gateway", "clawdbot", "run", true, false],
-    ["profile-named Node", "OpenClaw Gateway (dev)", "openclaw", "node run", true, false],
   ] as const)(
     "keeps selected %s diagnostic and managed projections separate",
     async (_kind, name, marker, args, extra, managedGateway) => {
@@ -212,45 +187,145 @@ describe("findExtraGatewayServices (win32)", () => {
     },
   );
 
-  it.each(["\\OpenClaw Gateway (dev)", "\\Clawdbot Gateway"])(
-    "reports unreadable known launcher %s before any contents are available",
-    async (label) => {
-      listScheduledTasksMock.mockReturnValue([task(label, "C:\\custom\\gateway.cmd", "")]);
-      readScheduledTaskCommandMock.mockRejectedValue(new Error("Access denied"));
-
-      const result = await findExtraGatewayServices(nativeEnv, { deep: true });
-
+  type IncompleteCase = {
+    name: string;
+    tasks: ScheduledTaskSnapshot[];
+    selected?: string;
+    read?: "missing" | "unreadable" | "recognizable";
+    projection?: "extras" | "both";
+    sources: string[];
+    message?: string;
+    exact?: boolean;
+  };
+  const knownLabels = ["\\OpenClaw Gateway (dev)", "\\Clawdbot Gateway"];
+  const missingLabels = [...knownLabels, "\\Custom Service"];
+  const custom = "\\Custom Assistant";
+  it.each<IncompleteCase>([
+    ...[undefined, []].map((actions) => ({
+      name: `known selectors with ${actions ? "empty" : "missing"} actions`,
+      tasks: ["\\OpenClaw Gateway", "\\Selected Custom"].map((taskPath) => ({
+        taskPath,
+        state: null,
+        actions,
+      })),
+      selected: "\\Selected Custom",
+      projection: "both" as const,
+      sources: ["\\OpenClaw Gateway", "\\Selected Custom"],
+    })),
+    ...knownLabels.map((label) => ({
+      name: `unreadable known launcher ${label}`,
+      tasks: [task(label, "C:\\custom\\gateway.cmd", "")],
+      read: "unreadable" as const,
+      projection: "both" as const,
+      sources: [label],
+      exact: true,
+    })),
+    ...["missing action", "unreadable launcher", "disappeared launcher", "multiple actions"].map(
+      (fault) => {
+        const selected = task(custom, "C:\\custom\\assistant.cmd", "");
+        if (fault === "missing action") {
+          selected.actions = [];
+        }
+        if (fault === "multiple actions") {
+          selected.actions = [0, 1].map(
+            () => task(custom, "C:\\OpenClaw\\openclaw.exe", "gateway run").actions[0]!,
+          );
+        }
+        return {
+          name: `selected custom task with ${fault}`,
+          tasks: [selected],
+          selected: custom,
+          read: fault === "unreadable launcher" ? ("unreadable" as const) : ("missing" as const),
+          sources: [custom],
+        };
+      },
+    ),
+    {
+      name: "unrelated running tasks with unreadable or missing actions",
+      tasks: [
+        { ...task("\\Maintenance", "C:\\tools\\maintenance.cmd", ""), state: 4 },
+        { taskPath: "\\Native Maintenance", state: 4, actions: [] },
+      ],
+      read: "unreadable",
+      sources: [],
+    },
+    {
+      name: "disappeared OpenClaw launchers with unknown native state",
+      tasks: missingLabels.map((label) => task(label, "C:\\OpenClaw\\gateway.cmd", "")),
+      read: "missing",
+      sources: missingLabels,
+      exact: true,
+    },
+    {
+      name: "mixed task whose later action runs the Gateway",
+      tasks: [
+        {
+          ...task("\\Mixed Assistant", "C:\\clawdbot\\clawdbot.exe", "run"),
+          actions: [
+            task(custom, "C:\\clawdbot\\clawdbot.exe", "run").actions[0]!,
+            task(custom, "C:\\OpenClaw\\openclaw.exe", "gateway run").actions[0]!,
+          ],
+        },
+      ],
+      sources: ["\\Mixed Assistant"],
+      message: "Multiple Scheduled Task actions",
+    },
+    ...[
+      ["direct", "C:\\custom\\assistant.bat", ""],
+      ["through cmd.exe", "C:\\Windows\\System32\\cmd.exe", "/c C:\\custom\\assistant.bat"],
+    ].map(([mode, executable, args]) => ({
+      name: `uninspectable selected BAT launcher ${mode}`,
+      tasks: [task(custom, executable!, args!)],
+      selected: custom,
+      read: "unreadable" as const,
+      sources: [custom],
+      exact: true,
+    })),
+    {
+      name: "recognizable launcher with an unreadable nested launcher",
+      tasks: [task("\\Custom Service", "C:\\fixtures\\service.cmd", "")],
+      read: "recognizable",
+      projection: "extras",
+      sources: ["\\Custom Service"],
+    },
+  ])(
+    "qualifies incomplete inventory: $name",
+    async ({ tasks, selected, read, projection, sources, message, exact }) => {
+      listScheduledTasksMock.mockReturnValue(tasks);
+      if (read === "missing") {
+        readScheduledTaskCommandMock.mockResolvedValue(null);
+      }
+      if (read === "unreadable") {
+        readScheduledTaskCommandMock.mockRejectedValue(new Error("Access denied"));
+      }
+      if (read === "recognizable") {
+        readScheduledTaskCommandMock.mockImplementationOnce(async (_env, options) => {
+          options?.onLauncherContent?.(
+            "@echo off\r\nnode C:\\openclaw\\dist\\entry.js gateway run\r\n",
+            "C:\\fixtures\\service.cmd",
+          );
+          throw new Error("Nested launcher could not be read");
+        });
+      }
+      const env = { ...nativeEnv, OPENCLAW_WINDOWS_TASK_NAME: selected };
+      const result = projection
+        ? await findExtraGatewayServices(env, { deep: true })
+        : await listManagedOpenClawGatewayServices(env, { requireComplete: true });
       expect(result).toEqual({
         services: [],
-        errors: [{ source: label, message: "Scheduled Task launcher could not be inspected." }],
+        errors: sources.map((source) => ({
+          source,
+          message: exact
+            ? "Scheduled Task launcher could not be inspected."
+            : expect.stringContaining(message ?? "could not be inspected"),
+        })),
       });
-      expect(await listManagedOpenClawGatewayServices(nativeEnv)).toEqual(result);
       expect(renderGatewayServiceCleanupHints(result.services)).toEqual([]);
+      if (projection === "both") {
+        expect(await listManagedOpenClawGatewayServices(env)).toEqual(result);
+      }
     },
   );
-
-  it("reports a recognizable launcher read failure without offering its deletion", async () => {
-    listScheduledTasksMock.mockReturnValue([
-      task("\\Custom Service", "C:\\fixtures\\service.cmd", ""),
-    ]);
-    readScheduledTaskCommandMock.mockImplementationOnce(async (_env, options) => {
-      options?.onLauncherContent?.(
-        "@echo off\r\nnode C:\\openclaw\\dist\\entry.js gateway run\r\n",
-        "C:\\fixtures\\service.cmd",
-      );
-      throw new Error("Nested launcher could not be read");
-    });
-
-    const result = await findExtraGatewayServices(nativeEnv, { deep: true });
-
-    expect(result).toEqual({
-      services: [],
-      errors: [
-        { source: "\\Custom Service", message: expect.stringContaining("could not be inspected") },
-      ],
-    });
-    expect(renderGatewayServiceCleanupHints(result.services)).toEqual([]);
-  });
   it.each(["absolute script", "relative script", "direct executable"] as const)(
     "keeps a modern Gateway beneath a legacy-named parent (%s)",
     async (entryKind) => {

@@ -10,10 +10,10 @@ import {
   prepareExternalMessageActionTargetForResolution,
   shouldDeferExternalMessageActionTargetResolution,
 } from "../../channels/plugins/message-action-dispatch.js";
+import type { AnyChannelPlugin as ChannelPlugin } from "../../channels/plugins/types.plugin.js";
 import type {
   ChannelId,
   ChannelMessageActionName,
-  ChannelPlugin,
   ChannelThreadingToolContext,
 } from "../../channels/plugins/types.public.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
@@ -59,26 +59,6 @@ async function resolveChannel(
     params.channel = selection.channel;
   }
   return selection;
-}
-
-function enforceCrossProviderEgressPolicyBeforeTargetResolution(params: {
-  channel: ChannelId;
-  action: ChannelMessageActionName;
-  args: Record<string, unknown>;
-  toolContext?: ChannelThreadingToolContext;
-  cfg: OpenClawConfig;
-  agentId?: string | null;
-}): void {
-  const currentProvider = params.toolContext?.currentChannelProvider;
-  if (!currentProvider || currentProvider === params.channel) {
-    return;
-  }
-  // Cross-context egress policy applies to direct and delegated callers alike;
-  // direct origin bypasses only the conversation-read visibility gate. A
-  // provider mismatch needs no target interpretation, so reject it before an
-  // external resolver can perform provider I/O. Same-provider aliases still
-  // wait for canonicalization before the full policy check below.
-  enforceCrossContextPolicy(params);
 }
 
 function addCandidateAndUnprefixedAlias(candidates: Set<string>, value?: string | null) {
@@ -199,22 +179,10 @@ async function resolveActionTarget(params: {
   return resolvedTarget;
 }
 
-async function resolveResolvedTargetOrThrow(params: {
-  cfg: OpenClawConfig;
-  channel: ChannelId;
-  input: string;
-  accountId?: string;
-  plugin?: ChannelPlugin;
-  preferredKind?: "group" | "user" | "channel";
-}): Promise<ResolvedMessagingTarget> {
-  const resolved = await resolveChannelTarget({
-    cfg: params.cfg,
-    channel: params.channel,
-    input: params.input,
-    accountId: params.accountId,
-    preferredKind: params.preferredKind,
-    plugin: params.plugin,
-  });
+async function resolveResolvedTargetOrThrow(
+  params: Parameters<typeof resolveChannelTarget>[0],
+): Promise<ResolvedMessagingTarget> {
+  const resolved = await resolveChannelTarget(params);
   if (!resolved.ok) {
     throw resolved.error;
   }
@@ -403,14 +371,20 @@ export async function prepareMessageRoute(params: {
     actionParams.accountId = accountId;
   }
   const dryRun = Boolean(input.dryRun ?? readBooleanParam(actionParams, "dryRun"));
-  enforceCrossProviderEgressPolicyBeforeTargetResolution({
-    channel,
-    action,
-    args: actionParams,
-    toolContext: input.toolContext,
-    cfg,
-    agentId,
-  });
+  const currentProvider = input.toolContext?.currentChannelProvider;
+  if (currentProvider && currentProvider !== channel) {
+    // Cross-provider egress needs no target lookup, so reject it before provider I/O.
+    // Same-provider aliases still wait for canonicalization below; direct operators
+    // bypass conversation-read visibility, never the shared egress policy.
+    enforceCrossContextPolicy({
+      channel,
+      action,
+      args: actionParams,
+      toolContext: input.toolContext,
+      cfg,
+      agentId,
+    });
+  }
   const defersExternalTargetResolution =
     delegatesActionToGateway &&
     !dryRun &&
@@ -485,13 +459,7 @@ export async function resolveMessageTarget(params: {
 }): Promise<ResolvedMessagingTarget | undefined> {
   const resolvedTarget = params.deferExternalTargetResolution
     ? undefined
-    : await resolveActionTarget({
-        cfg: params.cfg,
-        channel: params.channel,
-        args: params.args,
-        accountId: params.accountId,
-        plugin: params.plugin,
-      });
+    : await resolveActionTarget(params);
 
   enforceCrossContextPolicy({
     channel: params.channel,

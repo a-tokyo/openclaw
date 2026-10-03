@@ -14,6 +14,8 @@ import {
   encodeQuery,
   extractReplyText,
   parseCommentContentElements,
+  type FeishuDriveCommentCard,
+  type FeishuDriveCommentReply,
   type ParsedCommentContent,
   type ParsedCommentLinkedDocument,
 } from "./comment-shared.js";
@@ -63,14 +65,7 @@ type ResolveDriveCommentEventParams = {
   abortSignal?: AbortSignal;
 };
 
-type FeishuRequestClient = ReturnType<typeof createFeishuClient> & {
-  request(params: {
-    method: "GET" | "POST";
-    url: string;
-    data: unknown;
-    timeout: number;
-  }): Promise<unknown>;
-};
+type FeishuRequestClient = ReturnType<typeof createFeishuClient>;
 
 type FeishuOpenApiResponse<T> = {
   code?: number;
@@ -86,30 +81,6 @@ type FeishuDriveMetaBatchQueryResponse = FeishuOpenApiResponse<{
     url?: string;
   }>;
 }>;
-
-type FeishuDriveCommentReply = {
-  reply_id?: string;
-  user_id?: string;
-  create_time?: number;
-  update_time?: number;
-  content?: {
-    elements?: unknown[];
-  };
-};
-
-type FeishuDriveCommentCard = {
-  comment_id?: string;
-  user_id?: string;
-  create_time?: number;
-  update_time?: number;
-  is_whole?: boolean;
-  has_more?: boolean;
-  page_token?: string;
-  quote?: string;
-  reply_list?: {
-    replies?: FeishuDriveCommentReply[];
-  };
-};
 
 type FeishuDriveCommentBatchQueryResponse = FeishuOpenApiResponse<{
   items?: FeishuDriveCommentCard[];
@@ -434,7 +405,7 @@ async function requestFeishuOpenApi<T>(params: {
   };
 
   const result = await raceWithTimeoutAndAbort(
-    params.client.request({
+    params.client.request<T>({
       method: params.method,
       url: params.url,
       data: params.data ?? {},
@@ -1102,9 +1073,7 @@ export async function resolveDriveCommentEventTurn(params: ResolveDriveCommentEv
 
   const client = createClient
     ? createClient(account ?? ({ accountId } as ResolvedFeishuAccount))
-    : (createFeishuClient(
-        (await import("./accounts.js")).resolveFeishuAccount({ cfg, accountId }),
-      ) as FeishuRequestClient);
+    : createFeishuClient((await import("./accounts.js")).resolveFeishuAccount({ cfg, accountId }));
   const context = await fetchDriveCommentContext({
     client,
     fileToken,

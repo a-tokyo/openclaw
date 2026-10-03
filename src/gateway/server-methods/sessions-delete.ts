@@ -1,4 +1,3 @@
-// Destructive session deletion and lifecycle cleanup.
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import {
   ErrorCodes,
@@ -31,11 +30,8 @@ import { removeSessionWorktree } from "../../sessions/session-worktree-lifecycle
 import { resolvePluginSessionOwnershipError } from "../session-plugin-ownership.js";
 import { resolveRequestedSessionAgentId as resolveRequestedGlobalAgentId } from "../session-request-agent.js";
 import { invalidSessionRequest } from "../session-request-error.js";
-import {
-  loadGatewaySessionEntryReadOnly,
-  loadSessionEntry,
-  resolveGatewaySessionStoreTarget,
-} from "../session-utils.js";
+import { resolveGatewaySessionStoreTargetInWorker } from "../session-utils-store-worker.js";
+import { loadGatewaySessionEntryReadOnly, loadSessionEntry } from "../session-utils.js";
 import { prepareSessionWorkerPlacementRetirement } from "../worker-environments/session-placement-lifecycle.js";
 import { emitSessionsChanged } from "./session-change-event.js";
 import {
@@ -76,10 +72,18 @@ export async function deleteGatewaySession({
   const cfg = context.getRuntimeConfig();
   const requestedAgent = resolveRequestedGlobalAgentId(cfg, key, p.agentId);
   if (!requestedAgent.ok) {
-    return { ok: false, error: requestedAgent.error };
+    return requestedAgent;
   }
   const requestedAgentId = requestedAgent.agentId;
-  const target = resolveGatewaySessionStoreTarget({ cfg, key, agentId: requestedAgentId });
+  const target = await resolveGatewaySessionStoreTargetInWorker({
+    cfg,
+    key,
+    agentId: requestedAgentId,
+    assertActive: () => {
+      assertCallerCurrent?.();
+      sessionMutationAuthorization?.assertCurrent();
+    },
+  });
   const { storePath } = target;
   const compatibilityDefaultAgentId = tryResolveAgentOperationAgentId(cfg);
   const persistedStoreOwner = resolvePersistedSessionStoreOwnerForKey(cfg, key);
@@ -178,7 +182,6 @@ export async function deleteGatewaySession({
     expectedSessionId,
   ];
   let drain: SessionLifecycleDrain | undefined;
-  let deletedWorktreeId: string | undefined;
   let worktreePreserved: PreservedSessionWorktree | undefined;
   const deleteCurrent = async () => {
     try {
@@ -224,7 +227,7 @@ export async function deleteGatewaySession({
         );
       }
       // Reclaim may wait for an earlier placement operation that needs this mutex.
-      return await runExclusiveSessionLifecycleMutation({
+      return await runExclusiveSessionLifecycleMutation("delete", {
         scope: storePath,
         identities: deleteLifecycleIdentities,
         prepare: async () => drain?.handoffToMutation(),
@@ -266,7 +269,7 @@ export async function deleteGatewaySession({
             agentId: requestedAgentId,
           });
           const postCleanupEntry = postCleanupTarget.entry;
-          deletedWorktreeId = normalizeOptionalString(postCleanupEntry?.worktree?.id);
+          const deletedWorktreeId = normalizeOptionalString(postCleanupEntry?.worktree?.id);
           commitGuard();
           const pluginOwnerId = normalizeOptionalString(postCleanupEntry?.pluginOwnerId);
           const incognito =
@@ -346,26 +349,23 @@ export async function deleteGatewaySession({
     }
     return { ok: false, error: error.error };
   }
-  const deleted = deletion.deleted;
-  const archivedTranscripts = deletion.archivedTranscripts;
-  const archived = archivedTranscripts.map((entryLocal) => entryLocal.archivedPath);
-
   const response: SessionsDeleteResult = {
     ok: true,
     key: target.canonicalKey,
-    deleted,
-    archived,
+    deleted: deletion.deleted,
+    archived: deletion.archivedTranscripts.map((entry) => entry.archivedPath),
     ...(worktreePreserved ? { worktreePreserved } : {}),
   };
   onDeleted?.(response);
-  if (deleted) {
+  if (deletion.deleted) {
     emitSessionsChanged(context, {
       sessionKey: target.canonicalKey,
       sessionId: deletion.deletedSessionId,
       agentId: target.agentId,
       reason: "delete",
     });
-    emitSessionsChanged(context, { reason: "delete" });
+    // The storage owner published the exact removal; this notification refreshes the list.
+    emitSessionsChanged(context, { reason: "delete" }, { preparedPublication: true });
   }
   return { ok: true, result: response };
 }

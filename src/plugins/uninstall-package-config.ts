@@ -82,23 +82,19 @@ function removeMatchingLoadPaths(
   ownedPaths: readonly string[],
 ): { load: NonNullable<OpenClawConfig["plugins"]>["load"] | undefined; changed: boolean } {
   const loadPaths = load?.paths;
-  if (
-    ownedPaths.length === 0 ||
-    !Array.isArray(loadPaths) ||
-    !loadPaths.some((candidate) =>
-      ownedPaths.some((ownedPath) => loadPathMatchesInstallPath(candidate, ownedPath)),
-    )
-  ) {
+  if (ownedPaths.length === 0 || !Array.isArray(loadPaths)) {
     return { load, changed: false };
   }
   const nextLoadPaths = loadPaths.filter(
     (candidate) =>
       !ownedPaths.some((ownedPath) => loadPathMatchesInstallPath(candidate, ownedPath)),
   );
-  return {
-    load: nextLoadPaths.length > 0 ? { ...load, paths: nextLoadPaths } : undefined,
-    changed: true,
-  };
+  return nextLoadPaths.length === loadPaths.length
+    ? { load, changed: false }
+    : {
+        load: nextLoadPaths.length > 0 ? { ...load, paths: nextLoadPaths } : undefined,
+        changed: true,
+      };
 }
 
 export function removePluginRuntimePolicyFromConfig(
@@ -176,7 +172,7 @@ export function removePluginRuntimePolicyFromConfig(
     config: {
       ...cfg,
       plugins: Object.keys(cleanedPlugins).length > 0 ? cleanedPlugins : undefined,
-      channels: channels as OpenClawConfig["channels"],
+      ...(actions.channelConfig ? { channels: channels as OpenClawConfig["channels"] } : {}),
     },
     actions,
   };

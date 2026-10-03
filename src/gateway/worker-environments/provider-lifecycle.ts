@@ -8,6 +8,7 @@ import {
   type WorkerProvider,
 } from "../../plugins/types.js";
 import { sameWorkerBuild } from "../../worker/worker-build-identity.js";
+import { MAX_NODE_BOOTSTRAP_TIMEOUT_MS } from "./bootstrap-timeouts.js";
 import type { WorkerInstallationArtifact } from "./bundle.js";
 import { createDedicatedNodeLeaseAttestations } from "./dedicated-node-lease-attestations.js";
 import { readWorkerProjectPreparation } from "./preparation-identity.js";
@@ -17,7 +18,6 @@ import type { WorkerProviderLifecycleOptions } from "./provider-lifecycle.types.
 import { createWorkerMachineCatalog } from "./provider-machine-catalog.js";
 import { createWorkerNodeProvisioning } from "./provider-node-provisioning.js";
 import { createWorkerProviderOwnerLifecycle } from "./provider-owner-lifecycle.js";
-import { retireMismatchedWorkerLease } from "./provider-persisted-lease.js";
 import { prepareWorkerProviderProject } from "./provider-project-preparation.js";
 import { createWorkerProvisionCancellation } from "./provider-provisioning-cancellation.js";
 import { createWorkerRuntimeRefresher } from "./provider-runtime-refresh.js";
@@ -62,6 +62,7 @@ export function createWorkerProviderLifecycle(options: WorkerProviderLifecycleOp
     finishConfirmedProvisionCleanup,
     preserveIndeterminateProvisionCleanup,
     destroy,
+    retireMismatchedLease,
   } = createWorkerProviderOwnerLifecycle({
     ...options,
     providerFor,
@@ -106,7 +107,7 @@ export function createWorkerProviderLifecycle(options: WorkerProviderLifecycleOp
       await failBootstrap(record, leaseId, provider, error, "bootstrap_failure", patch),
   });
 
-  const refreshRuntime = createWorkerRuntimeRefresher({
+  const runtimeRefresher = createWorkerRuntimeRefresher({
     ...options,
     requireCurrentOwner,
     stopOwner,
@@ -187,11 +188,16 @@ export function createWorkerProviderLifecycle(options: WorkerProviderLifecycleOp
           `Worker provider ${provider.id} does not support ${executionMode} placement`,
         );
       }
+      // Grants are issued after allocation. Reserve the core policy's maximum now,
+      // including the connection wait that starts after the bootstrap command exits.
+      const nodeBootstrapTimeoutMs = provider.requiresNodeEnrollment
+        ? MAX_NODE_BOOTSTRAP_TIMEOUT_MS
+        : undefined;
       const providerTimeoutMs =
         options.providerCallTimeoutMs === undefined
           ? requireProviderOperationTimeoutMs(
               "provision",
-              provider.resolveProvisionTimeoutMs?.(profile),
+              provider.resolveProvisionTimeoutMs?.(profile, { nodeBootstrapTimeoutMs }),
             )
           : undefined;
       const preparation = readWorkerProjectPreparation(record.profileSnapshot.project);
@@ -271,6 +277,7 @@ export function createWorkerProviderLifecycle(options: WorkerProviderLifecycleOp
         return current;
       };
       const provisionOptions = {
+        nodeBootstrapTimeoutMs,
         profileId: record.profileId,
         assertCurrent,
         ...(machineClass ? { machineClass } : {}),
@@ -353,7 +360,11 @@ export function createWorkerProviderLifecycle(options: WorkerProviderLifecycleOp
       const detail = boundedError(error);
       const permanent =
         error instanceof WorkerProviderError || options.isServiceError(error, "invalid_profile");
-      if (record.state === "requested" || (preparationComplete && permanent)) {
+      // A current refusal cannot disprove allocation by an earlier attempt.
+      if (
+        record.state === "requested" ||
+        (provisioningTransition !== undefined && preparationComplete && permanent)
+      ) {
         await move(record, "failed", { lastError: detail });
         throw serviceError(
           permanent ? "invalid_profile" : "provider_failure",
@@ -539,7 +550,7 @@ export function createWorkerProviderLifecycle(options: WorkerProviderLifecycleOp
       ).catch(() => undefined);
       return;
     }
-    if (await retireMismatchedWorkerLease(record, provider, store, finishDestroy)) {
+    if (await retireMismatchedLease(record, provider)) {
       return;
     }
     const lease = lifecycleLease(record, leaseId);
@@ -601,11 +612,11 @@ export function createWorkerProviderLifecycle(options: WorkerProviderLifecycleOp
     }
     if (!record.sshEndpoint || record.state === "attached") {
       // Failed upgrades retain the old receipt and exact lease for recovery.
-      await refreshRuntime(record, provider, currentBundle, signal).catch(
-        async (error: unknown) => {
+      await runtimeRefresher
+        .refresh(record, provider, currentBundle, signal)
+        .catch(async (error: unknown) => {
           await saveError(requireCurrentOwner(record), error);
-        },
-      );
+        });
       return;
     }
     if (record.state === "draining") {
@@ -727,5 +738,6 @@ export function createWorkerProviderLifecycle(options: WorkerProviderLifecycleOp
     ...machineCatalog,
     providerFor,
     reconcileRecord,
+    readRuntimeRefresh: runtimeRefresher.read,
   };
 }

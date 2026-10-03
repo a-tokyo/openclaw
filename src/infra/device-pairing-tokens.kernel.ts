@@ -1,6 +1,5 @@
 import { normalizeDeviceAuthScopes } from "../shared/device-auth.js";
 import { resolveMissingRequestedScope, roleScopesAllow } from "../shared/operator-scope-compat.js";
-// Device token issuance, verification, rotation, and revocation for paired devices.
 import type {
   RotateDeviceTokenResult,
   RevokeDeviceTokenResult,
@@ -12,15 +11,12 @@ import {
 } from "./device-pairing-identity.js";
 import { requestDevicePairingMutationAdmission } from "./device-pairing-mutation.worker.js";
 import {
-  cloneDevicePairingTokens,
   loadDevicePairingStateForMutation,
-  normalizeDevicePairingId,
   normalizeDevicePairingRole,
 } from "./device-pairing-state.kernel.js";
 import {
   persistDevicePairingStoreState as persistState,
   updatePairedDeviceInTransaction,
-  type DevicePairingStoreState,
 } from "./device-pairing-store.js";
 import { createDeviceAuthToken } from "./device-pairing-token-utils.js";
 import type { DeviceAuthToken, PairedDevice } from "./device-pairing.types.js";
@@ -29,13 +25,6 @@ import { verifyPairingToken } from "./pairing-token.js";
 const SHARED_GATEWAY_AUTH_ISSUER_KIND = "shared-gateway-auth";
 const BROWSER_DEVICE_CLIENT_IDS = new Set(["openclaw-control-ui", "webchat-ui"]);
 const BROWSER_DEVICE_CLIENT_MODE = "webchat";
-
-function getPairedDeviceFromState(
-  state: DevicePairingStoreState,
-  deviceId: string,
-): PairedDevice | null {
-  return state.pairedByDeviceId[normalizeDevicePairingId(deviceId)] ?? null;
-}
 
 function isBrowserRelatedPairedDevice(device: Pick<PairedDevice, "clientId" | "clientMode">) {
   const clientMode = device.clientMode?.trim().toLowerCase();
@@ -234,7 +223,7 @@ function resolveDeviceTokenUpdateContext(params: { device: PairedDevice | null; 
   if (!listApprovedPairedDeviceRoles(device).includes(role)) {
     return null;
   }
-  const tokens = cloneDevicePairingTokens(device);
+  const tokens = { ...device.tokens };
   const existing = tokens[role];
   return { device, role, tokens, existing };
 }
@@ -250,7 +239,7 @@ export function rotateDeviceTokenInWorker(params: {
 }): RotateDeviceTokenResult {
   const state = loadDevicePairingStateForMutation(params.nowMs, params.baseDir);
   const context = resolveDeviceTokenUpdateContext({
-    device: getPairedDeviceFromState(state, params.deviceId),
+    device: state.pairedByDeviceId[params.deviceId.trim()] ?? null,
     role: params.role,
   });
   if (!context) {
@@ -324,7 +313,7 @@ export function revokeDeviceTokenInWorker(params: {
 }): RevokeDeviceTokenResult {
   const state = loadDevicePairingStateForMutation(params.nowMs, params.baseDir);
   const context = resolveDeviceTokenUpdateContext({
-    device: getPairedDeviceFromState(state, params.deviceId),
+    device: state.pairedByDeviceId[params.deviceId.trim()] ?? null,
     role: params.role,
   });
   if (!context || !context.existing) {

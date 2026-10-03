@@ -17,7 +17,6 @@ import {
   hasSensitiveConfigData,
   hintForPath,
   pathKey as configPathKey,
-  redactedPlaceholder,
   type JsonSchema,
 } from "./config-form.shared.ts";
 import { renderSettingsDefaultDescription, renderSettingsSegmented } from "./settings-ui.ts";
@@ -68,6 +67,21 @@ export type ConfigNodeRenderParams = {
 export type ConfigNodeRenderer = (
   params: ConfigNodeRenderParams,
 ) => TemplateResult | typeof nothing;
+
+export function configChildRenderOptions(params: ConfigNodeRenderParams) {
+  return {
+    hints: params.hints,
+    rawAvailable: params.rawAvailable,
+    maskSensitive: params.maskSensitive,
+    unsupported: params.unsupported,
+    disabled: params.disabled,
+    compact: params.compact,
+    commitOnBlur: params.commitOnBlur,
+    revealSensitive: params.revealSensitive,
+    isSensitivePathRevealed: params.isSensitivePathRevealed,
+    onToggleSensitivePath: params.onToggleSensitivePath,
+  };
+}
 
 export function resolveConfigFieldPresentation(params: ConfigNodeRenderParams) {
   const { label, help } = resolveConfigFieldMeta(params.path, params.schema, params.hints);
@@ -426,7 +440,7 @@ export function renderJsonTextareaControl(params: {
       aria-label=${params.ariaLabel}
       aria-describedby=${describedBy || nothing}
       aria-invalid="false"
-      placeholder=${sensitiveState.isRedacted ? redactedPlaceholder() : t("configForm.jsonValue")}
+      placeholder=${sensitiveState.isRedacted ? t("configForm.redactedPlaceholder") : t("configForm.jsonValue")}
       rows=${params.rows}
       .value=${renderedFallback}
       ?disabled=${disabled}

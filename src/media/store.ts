@@ -1,4 +1,3 @@
-// Media store persists loaded media files and metadata for later references.
 import crypto from "node:crypto";
 import fs, { type FileHandle } from "node:fs/promises";
 import path from "node:path";
@@ -17,7 +16,7 @@ import {
 } from "@openclaw/media-core/mime";
 import { hasHttpUrlPrefix } from "@openclaw/net-policy/url-protocol";
 import { truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
-import { FsSafeError, isPathInside, readLocalFileSafely } from "../infra/fs-safe.js";
+import { FsSafeError, isPathInside, type OpenResult } from "../infra/fs-safe.js";
 import { retryAsync } from "../infra/retry.js";
 import { writeSiblingTempFile } from "../infra/sibling-temp-file.js";
 import { captureChannelReadScope } from "../shared/channel-read-authority.js";
@@ -130,7 +129,6 @@ export function extractOriginalFilename(filePath: string): string {
   return basename;
 }
 
-/** Returns the configured absolute media-store root without creating it. */
 export function getMediaDir() {
   return path.join(resolveConfigDir(), "media");
 }
@@ -152,12 +150,6 @@ function findErrorWithCode(err: unknown, code: string): NodeJS.ErrnoException | 
   return findErrorWithCode(err.cause, code);
 }
 
-function hasRecoverableMissingMediaDirCause(err: unknown): boolean {
-  // Recursive mkdir repairs only the ENOENT race where cleanup pruned the directory.
-  // Structural ENOTDIR and generic fs-safe absence remain terminal diagnostics.
-  return findErrorWithCode(err, "ENOENT") !== undefined;
-}
-
 async function retryAfterRecreatingDir<T>(
   dir: string,
   run: () => Promise<T>,
@@ -175,7 +167,8 @@ async function retryAfterRecreatingDir<T>(
       attempts: 2,
       minDelayMs: 0,
       maxDelayMs: 0,
-      shouldRetry: (err) => canRetry() && hasRecoverableMissingMediaDirCause(err),
+      // Only ENOENT from cleanup pruning the directory is repairable by mkdir.
+      shouldRetry: (err) => canRetry() && findErrorWithCode(err, "ENOENT") !== undefined,
       onRetry: async () => {
         // Cleanup can prune the directory between mkdir and file open. Recreate
         // it once; further failures remain terminal instead of looping.
@@ -508,25 +501,54 @@ export async function saveMediaSource(
       maxBytes,
     });
   }
-  const baseId = crypto.randomUUID();
   try {
-    let buffer: Buffer;
-    if (captureChannelReadScope()) {
-      const { readLocalMediaFile } = await import("./local-media-access.js");
-      buffer = await readLocalMediaFile(source, "any", { maxBytes });
-    } else {
-      buffer = (await readLocalFileSafely({ filePath: source, maxBytes })).buffer;
-    }
-    const mime = await detectMime({ buffer, filePath: source });
-    const ext = extensionForMime(mime) ?? path.extname(source);
-    const id = buildSavedMediaId({ baseId, ext });
-    await writeSavedMediaBuffer({ subdir, id, buffer });
-    return { id, path: path.join(dir, id), size: buffer.byteLength, contentType: mime };
+    const { openLocalMediaFile } = await import("./local-media-access.js");
+    await using opened = await openLocalMediaFile(source, "any", { maxBytes });
+    return await saveMediaFile(opened, subdir, maxBytes);
   } catch (err) {
     if (err instanceof FsSafeError) {
       throw toSaveMediaSourceError(err, maxBytes);
     }
     throw err;
+  }
+}
+
+/** Copies a validated native descriptor into managed storage with bounded memory. */
+export async function saveMediaFile(
+  opened: OpenResult,
+  subdir: string,
+  maxBytes: number,
+  originalFilename?: string,
+  prefix?: Buffer,
+): Promise<SavedMedia> {
+  if (opened.stat.size > maxBytes) {
+    throw SaveMediaSourceError.tooLarge(maxBytes);
+  }
+  // Stream the admitted descriptor, not its pathname: swapping the path cannot
+  // redirect the copy after access validation. The caller owns descriptor disposal.
+  const stream = opened.handle.createReadStream({
+    autoClose: false,
+    start: prefix?.byteLength ?? 0,
+  });
+  const source = (async function* () {
+    // Persist the inspected header even if the source changes after MIME validation.
+    if (prefix) {
+      yield prefix;
+    }
+    yield* stream;
+  })();
+  try {
+    return await saveMediaStream(
+      source,
+      undefined,
+      subdir,
+      maxBytes,
+      originalFilename,
+      opened.realPath,
+      { durable: true },
+    );
+  } finally {
+    stream.destroy();
   }
 }
 
@@ -578,7 +600,7 @@ export async function saveMediaStream(
   maxBytes = MEDIA_MAX_BYTES,
   originalFilename?: string,
   detectionFilePathHint?: string,
-  options?: { assertCommitAllowed?: () => void },
+  options?: { assertCommitAllowed?: () => void; durable?: boolean },
 ): Promise<SavedMedia> {
   options?.assertCommitAllowed?.();
   const readScope = captureChannelReadScope();
@@ -631,12 +653,15 @@ export async function saveMediaStream(
           tempPrefix: `.${baseId}`,
           scope: readScope,
           assertCommitAllowed: options?.assertCommitAllowed,
+          durable: options?.durable,
           write,
         });
       }
       const saved = await writeSiblingTempFile({
         dir,
         mode: MEDIA_FILE_MODE,
+        syncTempFile: options?.durable,
+        syncParentDir: options?.durable,
         tempPrefix: `.${baseId}`,
         writeTemp: async (tempPath) => {
           const handle = await fs.open(tempPath, "wx", MEDIA_FILE_MODE);
@@ -699,13 +724,15 @@ export async function readMediaBuffer(
     throw new Error(`readMediaBuffer: media ID does not resolve to a file: ${JSON.stringify(id)}`);
   }
   if (opened.stat.size > maxBytes) {
-    throw new Error(
+    throw new FsSafeError(
+      "too-large",
       `readMediaBuffer: media ID ${JSON.stringify(id)} is ${opened.stat.size} bytes; maximum is ${maxBytes} bytes`,
     );
   }
   const buffer = await opened.handle.readFile();
   if (buffer.byteLength > maxBytes) {
-    throw new Error(
+    throw new FsSafeError(
+      "too-large",
       `readMediaBuffer: media ID ${JSON.stringify(id)} read ${buffer.byteLength} bytes; maximum is ${maxBytes} bytes`,
     );
   }

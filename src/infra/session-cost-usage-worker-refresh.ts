@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import type { ModelCostConfig } from "@openclaw/llm-core";
+import { safeParseJsonRecord } from "@openclaw/normalization-core/json-coercion";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import {
   parseSqliteSessionFileMarker,
@@ -68,16 +69,7 @@ async function readJsonlAnchorHash(filePath: string, offset: number): Promise<st
 }
 
 function parseJsonlRecord(line: Buffer): Record<string, unknown> | undefined {
-  const text = line.toString("utf8").trim();
-  if (!text) {
-    return undefined;
-  }
-  try {
-    const parsed: unknown = JSON.parse(text);
-    return isRecord(parsed) ? parsed : undefined;
-  } catch {
-    return undefined;
-  }
+  return safeParseJsonRecord(line.toString("utf8").trim());
 }
 
 async function scanJsonlRange(params: {
@@ -302,9 +294,8 @@ async function scanJsonlUsageRollup(params: RollupScanInput): Promise<UsageCostR
 function selectIncrementalSqliteRecords(
   records: Record<string, unknown>[],
   previousLeafId: string | undefined,
-): { records: Record<string, unknown>[]; visibleLeafId?: string } | undefined {
+): { visibleLeafId?: string } | undefined {
   let visibleLeafId = previousLeafId;
-  const visible: Record<string, unknown>[] = [];
   for (const record of records) {
     if (isSessionTranscriptLeafControl(record) || record.appendMode === "side") {
       return undefined;
@@ -322,10 +313,9 @@ function selectIncrementalSqliteRecords(
         return undefined;
       }
     }
-    visible.push(record);
     visibleLeafId = id;
   }
-  return { records: visible, ...(visibleLeafId ? { visibleLeafId } : {}) };
+  return { visibleLeafId };
 }
 
 function sqliteCheckpointAnchorHash(event: unknown): string {

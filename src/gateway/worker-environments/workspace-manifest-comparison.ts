@@ -6,6 +6,7 @@ import {
   type WorkerWorkspaceManifest,
   type WorkerWorkspaceManifestEntry,
 } from "./workspace-manifest.js";
+import { workspacePathAncestors } from "./workspace-path-ancestors.js";
 import { isDerivedWorkspacePath } from "./workspace-path-exclusions.js";
 
 export type WorkspaceNode =
@@ -36,9 +37,9 @@ export function sameEntry(left: WorkspaceNode, right: WorkspaceNode): boolean {
   }
 }
 
-export function manifestNodes(manifest: WorkerWorkspaceManifest): Map<string, WorkspaceNode> {
+export function manifestNodes(manifest: WorkerWorkspaceManifest) {
   const staged = stagedInputDirectoriesFromEntries(manifest.entries);
-  const nodes = new Map<string, WorkspaceNode>();
+  const nodes = new Map<string, Exclude<WorkspaceNode, undefined>>();
   for (const directory of manifest.directories ?? []) {
     if (!isDerivedWorkspacePath(directory, isStagedInputPath(directory, staged))) {
       nodes.set(directory, { path: directory, type: "directory" });
@@ -53,9 +54,8 @@ export function manifestNodes(manifest: WorkerWorkspaceManifest): Map<string, Wo
 }
 
 export function hasPathAncestor(paths: ReadonlySet<string>, entryPath: string): boolean {
-  const segments = entryPath.split("/");
-  for (let index = 1; index < segments.length; index += 1) {
-    if (paths.has(segments.slice(0, index).join("/"))) {
+  for (const ancestor of workspacePathAncestors(entryPath)) {
+    if (paths.has(ancestor)) {
       return true;
     }
   }

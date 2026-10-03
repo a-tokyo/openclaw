@@ -1,4 +1,3 @@
-/** Commands for adding, pasting, and logging into provider model auth profiles. */
 import {
   cancel,
   confirm as clackConfirm,
@@ -34,7 +33,6 @@ import { logConfigUpdated } from "../../config/logging.js";
 import { normalizeAgentModelRefForConfig } from "../../config/model-input.js";
 import type { ConfigFileSnapshot, OpenClawConfig } from "../../config/types.openclaw.js";
 import {
-  applyDefaultModel,
   applyProviderAuthConfigPatch,
   pickAuthMethod,
   restorePriorAgentsDefaultsModelUnlessOptIn,
@@ -48,6 +46,7 @@ import { applyAuthProfileConfig } from "../../plugins/provider-auth-helpers.js";
 import { runProviderPluginAuthMethodUnpersisted } from "../../plugins/provider-auth-method.js";
 import { persistProviderAuthProfilesAfterLogin } from "../../plugins/provider-auth-persistence.js";
 import type { ProviderAuthContext } from "../../plugins/provider-authentication.types.js";
+import { applyPrimaryModel } from "../../plugins/provider-model-primary.js";
 import { resolvePluginProvidersCore } from "../../plugins/providers.runtime.js";
 import {
   resolvePluginSetupProviderCore,
@@ -157,13 +156,10 @@ async function readPipedStdin(): Promise<string> {
 
 async function readPastedSecret(params: {
   message: string;
-  masked: boolean;
   validate?: (value: string | undefined) => string | undefined;
 }): Promise<string> {
   const promptParams = { message: params.message, validate: params.validate };
-  const input = process.stdin.isTTY
-    ? await (params.masked ? password(promptParams) : text(promptParams))
-    : await readPipedStdin();
+  const input = process.stdin.isTTY ? await password(promptParams) : await readPipedStdin();
   const normalized = normalizeSecretInput(input);
   const validationMessage = params.validate?.(normalized);
   if (validationMessage) {
@@ -180,10 +176,6 @@ type ResolvedModelsAuthContext = {
   workspaceDir: string;
   providers: ProviderPlugin[];
 };
-
-function listProvidersWithAuthMethods(providers: ProviderPlugin[]): ProviderPlugin[] {
-  return providers.filter((provider) => provider.auth.length > 0);
-}
 
 function listTokenAuthMethods(provider: ProviderPlugin): ProviderAuthMethod[] {
   return provider.auth.filter((method) => method.kind === "token");
@@ -297,7 +289,6 @@ async function resolveModelsAuthAgent(rawAgentId?: string | null, config?: OpenC
   return resolveModelsTargetAgent(cfg, rawAgentId ?? undefined, { kind: "mutation" });
 }
 
-/** Resolves a requested login provider or throws with available provider details. */
 export function resolveRequestedLoginProviderOrThrow(
   providers: ProviderPlugin[],
   rawProvider?: string,
@@ -320,82 +311,39 @@ export function resolveRequestedLoginProviderOrThrow(
   );
 }
 
-function resolveTokenMethodOrThrow(
-  provider: ProviderPlugin,
-  rawMethod?: string,
-): ProviderAuthMethod | null {
-  const tokenMethods = listTokenAuthMethods(provider);
-  if (rawMethod?.trim()) {
-    const matched = pickAuthMethod(provider, rawMethod);
-    if (matched && matched.kind === "token") {
-      return matched;
-    }
-    const available = tokenMethods.map((method) => method.id).join(", ") || "(none)";
-    throw new Error(
-      `Unknown token auth method "${rawMethod}" for provider "${provider.id}". Available token methods: ${available}.`,
-    );
-  }
-  return null;
-}
-
 async function pickProviderAuthMethod(params: {
   provider: ProviderPlugin;
   requestedMethod?: string;
   prompter: WizardPrompter;
+  tokenOnly?: boolean;
 }) {
   const rawRequestedMethod = params.requestedMethod?.trim();
   if (rawRequestedMethod) {
     return pickAuthMethod(params.provider, rawRequestedMethod);
   }
-  const oauthMethod = params.provider.auth.find((method) => method.kind === "oauth");
-  if (oauthMethod) {
-    return oauthMethod;
-  }
-  if (params.provider.auth.length === 1) {
-    return params.provider.auth[0] ?? null;
-  }
-  return await params.prompter
-    .select({
-      message: `Auth method for ${params.provider.label}`,
-      options: params.provider.auth.map((method) => ({
-        value: method.id,
-        label: method.label,
-        hint: method.hint,
-      })),
-    })
-    .then((id) => params.provider.auth.find((method) => method.id === id) ?? null);
-}
-
-async function pickProviderTokenMethod(params: {
-  provider: ProviderPlugin;
-  requestedMethod?: string;
-  prompter: WizardPrompter;
-}) {
-  const explicitTokenMethod = resolveTokenMethodOrThrow(params.provider, params.requestedMethod);
-  if (explicitTokenMethod) {
-    return explicitTokenMethod;
-  }
-  const tokenMethods = listTokenAuthMethods(params.provider);
-  if (tokenMethods.length === 0) {
+  const methods = params.tokenOnly ? listTokenAuthMethods(params.provider) : params.provider.auth;
+  if (params.tokenOnly && methods.length === 0) {
     return null;
   }
-  const setupTokenMethod = tokenMethods.find((method) => method.id === "setup-token");
-  if (setupTokenMethod) {
-    return setupTokenMethod;
+  const preferred = methods.find((method) =>
+    params.tokenOnly ? method.id === "setup-token" : method.kind === "oauth",
+  );
+  if (preferred) {
+    return preferred;
   }
-  if (tokenMethods.length === 1) {
-    return tokenMethods[0] ?? null;
+  if (methods.length === 1) {
+    return methods[0] ?? null;
   }
-  return await params.prompter
+  return params.prompter
     .select({
-      message: `Token method for ${params.provider.label}`,
-      options: tokenMethods.map((method) => ({
+      message: `${params.tokenOnly ? "Token" : "Auth"} method for ${params.provider.label}`,
+      options: methods.map((method) => ({
         value: method.id,
         label: method.label,
         hint: method.hint,
       })),
     })
-    .then((id) => tokenMethods.find((method) => method.id === id) ?? null);
+    .then((id) => methods.find((method) => method.id === id) ?? null);
 }
 
 async function persistProviderAuthResult(params: {
@@ -490,7 +438,7 @@ async function persistProviderAuthResult(params: {
           if (params.setDefault && defaultModel) {
             return profiles.length > 0
               ? applyProviderLoginDefaultModel(next, defaultModel)
-              : applyDefaultModel(next, defaultModel);
+              : applyPrimaryModel(next, defaultModel);
           }
           return next;
         },
@@ -677,21 +625,11 @@ async function runProviderAuthMethod(params: {
   const profiles = resolvedIdentity.profiles;
 
   const { profiles: persistedProfiles, authRefresh } = await persistProviderAuthResult({
+    ...params,
     result: connectionResult,
     profiles,
-    assertCurrent: params.assertCurrent,
-    signal: params.signal,
-    config: params.config,
-    configSnapshot: params.configSnapshot,
-    agentId: params.agentId,
-    agentDir: params.agentDir,
-    runtime: params.runtime,
-    prompter: params.prompter,
-    setDefault: params.setDefault,
     env: params.env ?? process.env,
-    beforePersistentEffect: params.beforePersistentEffect,
     validateCurrentCredential: resolvedIdentity.validateCurrentCredential,
-    refreshAfterLogin: params.refreshAfterLogin,
   });
   if (persistedProfiles.length > 0) {
     await completeProviderModelAccess({
@@ -710,7 +648,6 @@ async function runProviderAuthMethod(params: {
   return { result: connectionResult, profiles: persistedProfiles, authRefresh };
 }
 
-/** Runs an interactive provider setup-token auth flow. */
 export async function modelsAuthSetupTokenCommand(
   opts: { provider?: string; yes?: boolean; agent?: string },
   runtime: RuntimeEnv,
@@ -754,7 +691,7 @@ export async function modelsAuthSetupTokenCommand(
   }
 
   const prompter = createClackPrompter();
-  const method = await pickProviderTokenMethod({ provider, prompter });
+  const method = await pickProviderAuthMethod({ provider, prompter, tokenOnly: true });
   if (!method) {
     throw new Error(`Provider "${provider.id}" does not expose a token auth method.`);
   }
@@ -772,7 +709,6 @@ export async function modelsAuthSetupTokenCommand(
   });
 }
 
-/** Reads a pasted bearer/setup token and stores it as an auth profile. */
 export async function modelsAuthPasteTokenCommand(
   opts: {
     provider?: string;
@@ -808,7 +744,6 @@ export async function modelsAuthPasteTokenCommand(
   };
   const tokenInput = await readPastedSecret({
     message: `Paste token for ${provider}`,
-    masked: true,
     validate: validateTokenInput,
   });
   const token =
@@ -842,7 +777,6 @@ export async function modelsAuthPasteTokenCommand(
   }
 }
 
-/** Reads a pasted API key and stores it as an auth profile. */
 export async function modelsAuthPasteApiKeyCommand(
   opts: {
     provider?: string;
@@ -863,7 +797,6 @@ export async function modelsAuthPasteApiKeyCommand(
 
   const key = await readPastedSecret({
     message: `Paste API key for ${provider}`,
-    masked: true,
     validate: (value) => {
       const trimmed = value?.trim();
       if (!trimmed) {
@@ -893,7 +826,6 @@ export async function modelsAuthPasteApiKeyCommand(
   runtime.log(`Auth profile: ${profileId} (${provider}/api_key)`);
 }
 
-/** Interactive helper for adding token auth profiles, with provider/method prompts. */
 export async function modelsAuthAddCommand(opts: { agent?: string }, runtime: RuntimeEnv) {
   const { config, configSnapshot, agentId, agentDir, workspaceDir, providers } =
     await resolveModelsAuthContext({
@@ -1007,12 +939,7 @@ type LoginOptions = {
   setDefault?: boolean;
   yes?: boolean;
   agent?: string;
-  /**
-   * When true, remove any existing auth profiles for the resolved provider
-   * before invoking the auth flow. This is the escape hatch for stuck
-   * cached OAuth profiles where the standard `auth login` short-circuits
-   * because credentials already exist on disk.
-   */
+  /** Discard cached provider profiles before starting a replacement login. */
   force?: boolean;
 };
 
@@ -1082,7 +1009,7 @@ async function runModelsAuthLoginFlow(
     ownerPluginId: opts.ownerPluginId,
   });
   const prompter = opts.prompter;
-  let authProviders = listProvidersWithAuthMethods(context.providers);
+  let authProviders = context.providers.filter((provider) => provider.auth.length > 0);
   let requestedProvider = requestedProviderId
     ? resolveProviderMatch(authProviders, requestedProviderId)
     : null;
@@ -1096,7 +1023,7 @@ async function runModelsAuthLoginFlow(
       rawAgentId: opts.agent,
       config: context.config,
     });
-    authProviders = listProvidersWithAuthMethods(context.providers);
+    authProviders = context.providers.filter((provider) => provider.auth.length > 0);
   }
   if (authProviders.length === 0) {
     throw new Error(
@@ -1225,14 +1152,8 @@ async function runModelsAuthLoginFlow(
   let forcePurgedProviderProfiles = false;
   if (opts.force) {
     await opts.beforePersistentEffect?.();
-    // Purge existing profiles for this provider only after we have a valid
-    // auth method to invoke. Running the purge earlier (before method
-    // resolution) would delete the user's working credentials and then
-    // throw on an unresolvable `--method`, leaving them without a usable
-    // profile and no auth flow started. This is the documented escape
-    // hatch for stuck OAuth credentials (expired token, swapped account,
-    // etc.) where `auth login` would otherwise short-circuit on the cached
-    // profile.
+    // Resolve the method before purging profiles so an invalid --method cannot
+    // delete working credentials without starting a replacement login.
     try {
       const clearedStore = await removeProviderAuthProfilesWithLock({
         cfg: context.config,
@@ -1259,27 +1180,11 @@ async function runModelsAuthLoginFlow(
   }
 
   const { result, profiles, authRefresh } = await runProviderAuthMethod({
-    config: context.config,
-    configSnapshot: context.configSnapshot,
-    agentId: context.agentId,
-    agentDir: context.agentDir,
-    workspaceDir: context.workspaceDir,
+    ...opts,
+    ...context,
     provider: selectedProvider,
     method: chosenMethod,
-    runtime: opts.runtime,
     prompter,
-    profileId: opts.profileId,
-    setDefault: opts.setDefault,
-    credentialOnly: opts.credentialOnly,
-    assertCurrent: opts.assertCurrent,
-    env: opts.env,
-    isRemote: opts.isRemote,
-    signal: opts.signal,
-    openUrl: opts.openUrl,
-    browserAuthorization: opts.browserAuthorization,
-    beforePersistentEffect: opts.beforePersistentEffect,
-    refreshAfterLogin: opts.refreshAfterLogin,
-    onModelAccessRequested: opts.onModelAccessRequested,
     existingProfiles,
     allowMissingReusedProfile: forcePurgedProviderProfiles,
   });

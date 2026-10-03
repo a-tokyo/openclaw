@@ -1,10 +1,4 @@
 import type { GatewayClientRequestOptions } from "@openclaw/gateway-client";
-// Typed Control UI wrapper over the `browser.request` gateway method.
-//
-// The gateway method speaks an HTTP-shaped envelope ({method, path, body})
-// that is dispatched against the browser plugin's control routes, either
-// locally or via a browser-capable node. This module narrows the handful of
-// routes the browser panel needs and keeps route-path knowledge in one place.
 import { asFiniteNumber } from "@openclaw/normalization-core/number-coercion";
 import { asNullableRecord as asRecord } from "@openclaw/normalization-core/record-coerce";
 import { readStringValue } from "@openclaw/normalization-core/string-coerce";
@@ -12,6 +6,7 @@ import { GatewayRequestError, type GatewayBrowserClient } from "../../api/gatewa
 import { buildAssistantMediaUrl } from "../../app/assistant-media.ts";
 import { t } from "../../i18n/index.ts";
 import { registerBrowserEnglish } from "../../i18n/locales/en-browser.ts";
+import { readBlobAsDataUrl } from "../../lib/blob-data-url.ts";
 import { browserInspectScript } from "./browser-inspect-script.ts";
 import {
   readBrowserTabTarget,
@@ -533,13 +528,12 @@ export async function inspectBrowserElementAt(
 ): Promise<BrowserInspectedNode | null> {
   const x = Math.max(0, Math.round(params.x));
   const y = Math.max(0, Math.round(params.y));
-  const result = asRecord(
+  return readBrowserInspectedNode(
     await evaluateInBrowser(client, {
       targetId: params.targetId,
       fn: `() => { ${browserInspectScript}\nreturn openclawInspectBrowserElement(${x}, ${y}); }`,
     }),
   );
-  return readBrowserInspectedNode(result);
 }
 
 export function readBrowserInspectedNode(value: unknown): BrowserInspectedNode | null {
@@ -606,18 +600,8 @@ export async function fetchBrowserScreenshotDataUrl(params: {
   } finally {
     clearTimeout(timeout);
   }
-  return await new Promise<string>((resolve, reject) => {
-    const reader = new FileReader();
-    reader.addEventListener("load", () => {
-      if (typeof reader.result === "string") {
-        resolve(reader.result);
-      } else {
-        reject(new Error(t("browser.errors.screenshotReadFailed")));
-      }
-    });
-    reader.addEventListener("error", () =>
-      reject(reader.error ?? new Error(t("browser.errors.screenshotReadFailed"))),
-    );
-    reader.readAsDataURL(blob);
+  return readBlobAsDataUrl(blob, {
+    readError: () => t("browser.errors.screenshotReadFailed"),
+    invalidResultError: () => t("browser.errors.screenshotReadFailed"),
   });
 }

@@ -1,4 +1,3 @@
-/** Diagnostic helpers for embedded-agent compaction. */
 import { generateSecureToken } from "../../infra/secure-random.js";
 import { isRealConversationMessage } from "../compaction-real-conversation.js";
 import type { AgentMessage } from "../runtime/index.js";
@@ -7,12 +6,6 @@ import type { CompactionMessageMetrics } from "./compact.types.js";
 
 export function createDirectCompactionDiagId(): string {
   return `cmp-${Date.now().toString(36)}-${generateSecureToken(4)}`;
-}
-
-export function normalizeObservedTokenCount(value: unknown): number | undefined {
-  return typeof value === "number" && Number.isFinite(value) && value > 0
-    ? Math.floor(value)
-    : undefined;
 }
 
 function getMessageTextChars(msg: AgentMessage): number {

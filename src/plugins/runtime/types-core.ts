@@ -1,4 +1,3 @@
-// Core runtime types define system, config, and execution helper contracts for plugins.
 import type { CreateChannelIngressDrainOptions } from "../../channels/message/ingress-drain.js";
 import type { CreateChannelIngressQueueOptions } from "../../channels/message/ingress-queue.types.js";
 import type { ConfigMutationBase } from "../../config/mutation-types.js";
@@ -389,7 +388,7 @@ export type PluginRuntimeCore = {
      * budget timeouts for the run that will actually execute.
      */
     resolveCliBackendDispatchEligibility: typeof import("../../agents/embedded-agent-runner/cli-backend-dispatch-eligibility.js").resolveEmbeddedCliBackendDispatchEligibility;
-    ensureAgentWorkspace: typeof import("../../agents/workspace.js").ensureAgentWorkspace;
+    ensureAgentWorkspace: typeof import("./runtime-agent-workspace.js").ensurePluginAgentWorkspace;
     session: {
       resolveStorePath: typeof import("../../config/sessions/paths.js").resolveSessionStorePathCore;
       createSessionEntry: (

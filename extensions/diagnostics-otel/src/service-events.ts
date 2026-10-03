@@ -66,9 +66,8 @@ export function createDiagnosticsEventHandler(params: {
         case "message.delivery.started":
           return recorders.recordMessageDeliveryStarted(evt);
         case "message.delivery.completed":
-          return recorders.recordMessageDeliveryCompleted(evt, metadata);
         case "message.delivery.error":
-          return recorders.recordMessageDeliveryError(evt, metadata);
+          return recorders.recordMessageDeliveryFinished(evt, metadata);
         case "talk.event":
           return recorders.recordTalkEvent(evt, metadata);
         case "queue.lane.enqueue":
@@ -140,7 +139,7 @@ export function createDiagnosticsEventHandler(params: {
         case "tool.loop":
           return recorders.recordToolLoop(evt);
         case "diagnostic.memory.sample":
-          return recorders.recordMemorySample(evt);
+          return recorders.recordMemoryUsageMetrics(evt);
         case "diagnostic.memory.pressure":
           return recorders.recordMemoryPressure(evt);
         case "diagnostic.async_queue.dropped":

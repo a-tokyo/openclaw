@@ -1,4 +1,3 @@
-// Qa Lab plugin entrypoint registers its OpenClaw integration.
 import type { QaProviderDefinition } from "../shared/types.js";
 
 function isOpenAiModel(modelRef: string) {
@@ -24,9 +23,6 @@ export const liveFrontierProviderDefinition: QaProviderDefinition = {
   mode: "live-frontier",
   kind: "live",
   defaultModel: (options) => options?.preferredLiveModel ?? "openai/gpt-5.6-luna",
-  defaultImageGenerationProviderIds: ["openai"],
-  defaultImageGenerationModel: ({ modelProviderIds }) =>
-    modelProviderIds.includes("openai") ? "openai/gpt-image-1" : null,
   usesFastModeByDefault: isOpenAiModel,
   resolveModelParams: ({ modelRef, fastMode, thinkingDefault }) => ({
     transport: "sse",
@@ -55,7 +51,4 @@ export const liveFrontierProviderDefinition: QaProviderDefinition = {
         }
       : null;
   },
-  usesModelProviderPlugins: true,
-  scrubsLiveProviderEnv: false,
-  appliesLiveEnvAliases: true,
 };

@@ -11,6 +11,7 @@ import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type { HealthFinding } from "../flows/health-checks.js";
 import { expandHomePrefix, resolveOsHomeDir } from "../infra/home-dir.js";
 import { resolveOpenClawPackageRootSync } from "../infra/openclaw-root.js";
+import { decodeXml } from "../shared/xml.js";
 import { resolveBundledSkillsDir } from "../skills/loading/bundled-dir.js";
 import { resolveConfigDir, shortenHomePath } from "../utils.js";
 
@@ -65,28 +66,13 @@ function resolveSessionSnapshotBundledSkillsDir(params?: {
   return packageRoot ? path.join(packageRoot, "skills") : undefined;
 }
 
-function decodeXmlText(value: string): string {
-  return value
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&apos;/g, "'")
-    .replace(/&amp;/g, "&");
-}
-
 function extractSkillLocations(prompt: unknown): string[] {
-  if (typeof prompt !== "string" || !prompt.trim()) {
-    return [];
-  }
-  const locations: string[] = [];
-  const locationPattern = /<location>([\s\S]*?)<\/location>/g;
-  for (const match of prompt.matchAll(locationPattern)) {
-    const raw = match[1]?.trim();
-    if (raw) {
-      locations.push(decodeXmlText(raw));
-    }
-  }
-  return locations;
+  return typeof prompt === "string"
+    ? [...prompt.matchAll(/<location>([\s\S]*?)<\/location>/g)].flatMap((match) => {
+        const raw = match[1]?.trim();
+        return raw ? [decodeXml(raw)] : [];
+      })
+    : [];
 }
 
 function collectResolvedSkillPaths(value: unknown): string[] {
@@ -98,18 +84,16 @@ function collectResolvedSkillPaths(value: unknown): string[] {
     if (!isRecord(skill)) {
       continue;
     }
-    if (typeof skill.filePath === "string" && skill.filePath.trim()) {
-      paths.push(skill.filePath.trim());
-    }
-    if (typeof skill.baseDir === "string" && skill.baseDir.trim()) {
-      paths.push(path.join(skill.baseDir.trim(), "SKILL.md"));
-    }
-    if (isRecord(skill.sourceInfo)) {
-      if (typeof skill.sourceInfo.path === "string" && skill.sourceInfo.path.trim()) {
-        paths.push(skill.sourceInfo.path.trim());
+    const sourceInfo = isRecord(skill.sourceInfo) ? skill.sourceInfo : undefined;
+    for (const [filePath, baseDir] of [
+      [skill.filePath, skill.baseDir],
+      [sourceInfo?.path, sourceInfo?.baseDir],
+    ]) {
+      if (typeof filePath === "string" && filePath.trim()) {
+        paths.push(filePath.trim());
       }
-      if (typeof skill.sourceInfo.baseDir === "string" && skill.sourceInfo.baseDir.trim()) {
-        paths.push(path.join(skill.sourceInfo.baseDir.trim(), "SKILL.md"));
+      if (typeof baseDir === "string" && baseDir.trim()) {
+        paths.push(path.join(baseDir.trim(), "SKILL.md"));
       }
     }
   }
@@ -168,8 +152,7 @@ function isTempBackedOpenClawRoot(segments: readonly string[]): boolean {
   return lower[openclawIndex - 1] === "tmp" || lower[openclawIndex - 1] === "temp";
 }
 
-function isBundledRuntimeSkillsPath(cachedPath: string, skillRootIndex: number): boolean {
-  const beforeSkillRoot = splitPathSegments(cachedPath).slice(0, skillRootIndex);
+function isBundledRuntimeSkillsPath(beforeSkillRoot: readonly string[]): boolean {
   const lower = beforeSkillRoot.map((segment) => segment.toLowerCase());
   return (
     lower.some(
@@ -181,7 +164,7 @@ function isBundledRuntimeSkillsPath(cachedPath: string, skillRootIndex: number):
 function extractBundledSkillRelativeSegments(cachedPath: string): string[] | undefined {
   const segments = splitPathSegments(cachedPath);
   const skillRootIndex = segments.lastIndexOf("skills");
-  if (skillRootIndex < 0 || !isBundledRuntimeSkillsPath(cachedPath, skillRootIndex)) {
+  if (skillRootIndex < 0 || !isBundledRuntimeSkillsPath(segments.slice(0, skillRootIndex))) {
     return undefined;
   }
   const relativeSegments = segments.slice(skillRootIndex + 1);
@@ -198,10 +181,7 @@ function isInsidePath(baseDir: string, candidatePath: string): boolean {
   }
   const pathApi = baseIsWindows ? path.win32 : path;
   const relative = pathApi.relative(pathApi.resolve(baseDir), pathApi.resolve(candidatePath));
-  return (
-    relative === "" ||
-    (relative !== "" && !relative.startsWith("..") && !pathApi.isAbsolute(relative))
-  );
+  return relative === "" || (!relative.startsWith("..") && !pathApi.isAbsolute(relative));
 }
 function joinPathForRoot(root: string, ...segments: string[]): string {
   return isWindowsAbsolutePath(root)
@@ -239,10 +219,7 @@ function resolveExpectedBundledSkillPath(params: {
     return undefined;
   }
   const expectedPath = joinPathForRoot(params.bundledSkillsDir, ...relativeSegments);
-  if (params.pathExists(expectedPath)) {
-    return expectedPath;
-  }
-  return undefined;
+  return params.pathExists(expectedPath) ? expectedPath : undefined;
 }
 
 function resolveMovedBundledSkillPath(params: {

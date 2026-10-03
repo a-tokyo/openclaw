@@ -38,6 +38,7 @@ import {
   composeReleaseChildAttemptEvidence,
   formatReleaseStateOutcome,
   releasePlanGateFailures,
+  releaseManifestChildEvidence,
   MAX_RELEASE_ARTIFACT_BYTES,
   serializeReleaseArtifact,
   selectReleaseStateArtifacts,
@@ -421,6 +422,7 @@ async function validateReuse(executionPlan, signal) {
         validateReusableReleaseChild(selection, {
           repository: executionPlan.repository,
           targetSha: executionPlan.targetSha,
+          workflowSha: executionPlan.workflowSha,
           role,
           inputs: selection.inputs,
         }),
@@ -1211,10 +1213,6 @@ async function collectMode(mode) {
     },
   );
   const plan = executionPlan.children;
-  const policy = {
-    releaseProfile,
-    workflowRef: expected.workflowRef,
-  };
   const gateFailures = releasePlanGateFailures(executionPlan.gates);
   const failFast = mode === "decision" && process.env.FAIL_FAST === "true";
   const pollIntervalMs =
@@ -1268,7 +1266,6 @@ async function collectMode(mode) {
         },
       ],
       localFailures: gateFailures,
-      ...policy,
     });
     writePayload(decision, { cancelledRunIds, requested: true });
     finished = true;
@@ -1337,7 +1334,6 @@ async function collectMode(mode) {
       extraBlockers: [...executionPlan.blockers, ...decisionReuse.blockers],
       extraErrors: [...transportReadErrors, ...executionPlan.errors, ...decisionReuse.errors],
       localFailures: gateFailures,
-      ...policy,
     });
     if (Date.now() >= nextHeartbeat) {
       console.log(formatReleaseStateHeartbeat(mode, decision));
@@ -1365,7 +1361,6 @@ async function collectMode(mode) {
             ...cancellationErrors,
           ],
           localFailures: gateFailures,
-          ...policy,
         });
       }
     }
@@ -1493,25 +1488,7 @@ async function validateManifestMode() {
     ? Object.fromEntries(
         Object.entries(drain.children).map(([key, child]) => [
           key,
-          {
-            compositeJobsSha256: child.compositeJobsSha256,
-            dispatchActor: child.dispatchActor,
-            effectiveRunAttempt: child.runAttempt,
-            jobs: child.timing.jobs.map((job) => ({
-              acceptedRunAttempt: job.acceptedRunAttempt,
-              completedAt: job.completedAt,
-              conclusion: job.conclusion,
-              name: job.name,
-              startedAt: job.startedAt,
-              status: job.status,
-              url: job.url,
-            })),
-            observedRunAttempts: child.observedRunAttempts,
-            plannedRunAttempt: child.plannedRunAttempt,
-            repository: child.repository,
-            runId: child.runId,
-            triggeringActor: child.triggeringActor,
-          },
+          releaseManifestChildEvidence(child),
         ]),
       )
     : undefined;
@@ -1531,7 +1508,7 @@ async function validateManifestMode() {
   ) {
     throw new Error("release validation manifest differs from the immutable execution plan");
   }
-  rawManifest.advisoryJobs = [];
+  rawManifest.advisoryJobs = manifest.advisoryJobs;
   writeArtifact(manifestPath, rawManifest);
 }
 

@@ -21,7 +21,7 @@ vi.mock("../../logging/subsystem.js", async () => {
   };
 });
 import { resetAgentRunRegistryForTest } from "../../infra/agent-run-registry.js";
-import { executeSqliteQuerySync } from "../../infra/kysely-sync.js";
+import * as sqliteQueries from "../../infra/kysely-sync.js";
 import * as tmpDirOwner from "../../infra/tmp-openclaw-dir.js";
 import { beginSessionWorkAdmission } from "../../sessions/session-lifecycle-admission.js";
 import { closeCachedOpenClawAgentDatabase } from "../../state/openclaw-agent-db-lifecycle.js";
@@ -292,11 +292,19 @@ describe("SQLite historical session disk budget", () => {
         updatedAt: 100,
         archivedAt: 100,
         archiveReason: "active-session-cap",
+        skillsSnapshot: { prompt: "retained archived instructions", skills: [] },
       },
     );
     settlePhysicalUsage();
     const before = await measureSessionPhysicalDiskUsage(storePath);
     const maintenance = { maxDiskBytes: before.totalBytes - 1, highWaterBytes: 1 };
+    const execute = sqliteQueries.executeSqliteQuerySync;
+    vi.spyOn(sqliteQueries, "executeSqliteQuerySync").mockImplementation((db, query) => {
+      if (query.compile().sql.includes('order by "archived_at" asc')) {
+        throw new Error("Archived eviction scan ran on the calling thread");
+      }
+      return execute(db, query);
+    });
 
     await expect(
       inspectSqliteSessionHistoryDiskBudget({ storePath, mode: "enforce", maintenance }),
@@ -560,7 +568,7 @@ describe("SQLite historical session disk budget", () => {
           archiveReason: "active-session-cap",
         },
       );
-      const reclamation = await import("./session-accessor.sqlite-reclamation.js");
+      const reclamation = await import("./session-accessor.sqlite-reclamation-run.js");
       const reclaim = reclamation.runSqliteSessionReclamation;
       const historyRequests: string[] = [];
       let protectionChanged = false;
@@ -946,19 +954,15 @@ describe("SQLite historical session disk budget", () => {
     });
     try {
       settlePhysicalUsage();
-      expect(countHistoricalSessionIds()).toBe(1);
       const before = await measureSessionPhysicalDiskUsage(storePath);
-      const highWaterBytes = Math.max(1, before.totalBytes - 32 * 1024);
       const result = await enforceSqliteSessionHistoryDiskBudget({
         storePath,
         mode: "enforce",
         maintenance: {
           maxDiskBytes: before.totalBytes - 1,
-          highWaterBytes,
+          highWaterBytes: Math.max(1, before.totalBytes - 32 * 1024),
         },
       });
-
-      expect(highWaterBytes).toBeGreaterThan(0);
       expect(result?.removedEntries ?? 0).toBe(0);
       expect(sessionExists("admitted-history")).toBe(true);
       expect(sessionExists("live-history")).toBe(true);
@@ -1010,29 +1014,12 @@ describe("SQLite historical session disk budget", () => {
   });
 
   function sessionNodeExists(sessionKey: string): boolean {
-    const owner = database();
-    const db = getSessionKysely(owner.db);
-    return (
-      executeSqliteQuerySync(
-        owner.db,
-        db.selectFrom("session_nodes").select("session_key").where("session_key", "=", sessionKey),
-      ).rows.length === 1
-    );
-  }
-
-  function countHistoricalSessionIds(): number {
-    const owner = database();
-    const db = getSessionKysely(owner.db);
-    const liveIds = new Set(
-      executeSqliteQuerySync(
-        owner.db,
-        db.selectFrom("session_nodes").select("current_session_id"),
-      ).rows.map((row) => row.current_session_id),
-    );
-    return executeSqliteQuerySync(
-      owner.db,
-      db.selectFrom("session_windows").select("session_id"),
-    ).rows.filter((row) => !liveIds.has(row.session_id)).length;
+    const db = getSessionKysely(database().db);
+    const query = db
+      .selectFrom("session_nodes")
+      .select("session_key")
+      .where("session_key", "=", sessionKey);
+    return sqliteQueries.executeSqliteQuerySync(database().db, query).rows.length === 1;
   }
 });
 

@@ -35,11 +35,9 @@ function compareDefaultNodeOrder(
   b: NodeListNode,
   recencyField: "connectedAtMs" | "lastSeenAtMs",
 ): number {
-  const recencyOrder = compareNewestTimestamp(a[recencyField], b[recencyField]);
-  if (recencyOrder !== 0) {
-    return recencyOrder;
-  }
-  return a.nodeId.localeCompare(b.nodeId);
+  return (
+    compareNewestTimestamp(a[recencyField], b[recencyField]) || a.nodeId.localeCompare(b.nodeId)
+  );
 }
 
 /** Selects the implicit node target when a tool call omits an explicit node query. */
@@ -115,26 +113,17 @@ export function resolveNodeIdFromList(
   });
 }
 
-/** Loads nodes from the Gateway and resolves the requested or default node id. */
-export async function resolveAgentNodeId(
-  opts: GatewayCallOptions,
-  query?: string,
-  allowDefault = false,
-) {
-  return (await resolveAgentNode(opts, query, allowDefault)).nodeId;
+/** Loads nodes from the Gateway and resolves the requested node id. */
+export async function resolveAgentNodeId(opts: GatewayCallOptions, query: string) {
+  return (await resolveAgentNode(opts, query)).nodeId;
 }
 
-/** Loads nodes from the Gateway and returns the requested or default node record. */
+/** Loads nodes from the Gateway and returns the requested node record. */
 export async function resolveAgentNode(
   opts: GatewayCallOptions,
-  query?: string,
-  allowDefault = false,
+  query: string,
 ): Promise<NodeListNode> {
-  const nodes = await listNodes(opts);
-  return resolveNodeFromNodeList(nodes, query, {
-    allowDefault,
-    pickDefaultNode,
-  });
+  return resolveNodeFromNodeList(await listNodes(opts), query);
 }
 
 export async function invokeAgentNodeCommand(params: {
