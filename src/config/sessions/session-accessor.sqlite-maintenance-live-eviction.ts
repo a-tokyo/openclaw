@@ -4,7 +4,7 @@
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
 import { uniqueStrings } from "@openclaw/normalization-core/string-normalization";
 import { sql } from "kysely";
-import { executeSqliteQuerySync } from "../../infra/kysely-sync.js";
+import { executeSqliteQuerySync, sqliteStringSet } from "../../infra/kysely-sync.js";
 import {
   parseAgentSessionKey,
   parseThreadSessionSuffix,
@@ -32,7 +32,6 @@ import type {
   SessionEntryMaintenancePlan,
   SessionEntryMaintenanceResult,
 } from "./session-accessor.sqlite-lifecycle-types.js";
-import { readSessionMaintenanceKeyProjection } from "./session-accessor.sqlite-maintenance-candidates.js";
 import {
   cloneSessionEntry,
   getSessionKysely,
@@ -352,6 +351,39 @@ function readOldestCapacityEligibleLiveNode(params: {
   }
 }
 
+/** Rows that can match provider, admission, or lifecycle identities. Not the catalog. */
+function readIdentityPreserveStore(
+  database: OpenClawAgentDatabase,
+  identities: readonly string[],
+): Record<string, SessionEntry> {
+  const keys = [...new Set(identities.map((identity) => identity.trim()).filter(Boolean))];
+  if (keys.length === 0) {
+    return {};
+  }
+  const db = getSessionKysely(database.db);
+  const store: Record<string, SessionEntry> = {};
+  for (const row of executeSqliteQuerySync(
+    database.db,
+    db
+      .selectFrom("session_nodes")
+      .select(["current_session_id", "parent_session_key", "session_key", "updated_at"])
+      .where("archived_at", "is", null)
+      .where((eb) =>
+        eb.or([
+          eb("session_key", "in", sqliteStringSet(keys)),
+          eb("current_session_id", "in", sqliteStringSet(keys)),
+        ]),
+      ),
+  ).rows) {
+    store[row.session_key] = {
+      sessionId: row.current_session_id,
+      updatedAt: row.updated_at,
+      ...(row.parent_session_key ? { parentSessionKey: row.parent_session_key } : {}),
+    };
+  }
+  return store;
+}
+
 /** Plans at most one oldest capacity-eligible live session_node removal.
  *
  * This is the last-resort disk-budget tier. `capEntryCount` archives ordinary
@@ -368,11 +400,18 @@ export function planOldestCapacityEligibleSqliteLiveEntryRemoval(params: {
   preserveRecentMs?: number | null;
   unprotectSessionKeys?: ReadonlySet<string>;
 }): SessionEntryMaintenancePlan {
-  const projection = readSessionMaintenanceKeyProjection(params.database);
+  const snapshot = captureSessionMaintenancePreservation(params.storePath);
+  const unprotect = params.unprotectSessionKeys ?? new Set<string>();
   const preserveKeys = collectCapacityEligibleLivePreserveKeys({
     database: params.database,
     skipSessionKeys: params.skipSessionKeys,
-    store: projection,
+    store: readIdentityPreserveStore(params.database, [
+      ...snapshot.providerKeys,
+      ...snapshot.workIdentities,
+      ...snapshot.lifecycleIdentities.filter(
+        (identity) => !isLocalEvictionFenceIdentity(identity, unprotect),
+      ),
+    ]),
     storePath: params.storePath,
     unprotectSessionKeys: params.unprotectSessionKeys,
   });
@@ -390,12 +429,10 @@ export function planOldestCapacityEligibleSqliteLiveEntryRemoval(params: {
   const removedEntriesByKey = new Map([[victim.key, cloneSessionEntry(victim.entry)]]);
   // Referenced ids come from the database with the victim excluded. Cloning the
   // catalog here would mark the victim's own session id as still referenced.
-  const projectedStore = { ...projection };
-  delete projectedStore[victim.key];
   return planSqliteLiveEntryRemovals({
     archiveDirectory: params.archiveDirectory,
     database: params.database,
-    projectedStore,
+    projectedStore: {},
     removedEntriesByKey,
     removedKeys,
   });

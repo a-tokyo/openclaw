@@ -392,24 +392,21 @@ async function enforceSessionHistoryMaintenanceForDatabase(
     const pageDiagnostics: SqliteSessionArchivePruningDiagnostics = {
       trigger: "after-eviction",
     };
+    // The page reclaimer admits its own session writer. Do not hold another one around it.
     const checkpointCompleted = await withSqliteSessionPageReclamation(
       databaseOptions,
-      (reclaimPages) =>
-        runExclusiveSqliteSessionWrite(
-          resolved,
-          async () => {
-            try {
-              return await reclaimSqliteFreePages(databaseOptions, pageDiagnostics, {
-                reclaimPages,
-                onCheckpointIncomplete: (checkpoint) =>
-                  deferPhysicalBudgetForCheckpoint(params, databasePath, checkpoint),
-              });
-            } catch {
-              return true;
-            }
-          },
-          "session.history.free-pages",
-        ),
+      async (reclaimPages, assertCurrent, preparedOptions) => {
+        try {
+          return await reclaimSqliteFreePages(preparedOptions, pageDiagnostics, {
+            reclaimPages,
+            assertCurrent,
+            onCheckpointIncomplete: (checkpoint) =>
+              deferPhysicalBudgetForCheckpoint(params, databasePath, checkpoint),
+          });
+        } catch {
+          return true;
+        }
+      },
     );
     if (!checkpointCompleted) {
       pruning = {
