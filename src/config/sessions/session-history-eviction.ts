@@ -4,6 +4,7 @@ import {
   runExclusiveSessionLifecycleMutation,
 } from "../../sessions/session-lifecycle-admission.js";
 import { runQueuedStoreWrite, type StoreWriterQueue } from "../../shared/store-writer-queue.js";
+import { withOpenClawAgentDatabaseReadOnly } from "../../state/openclaw-agent-db-readonly.js";
 import {
   isIncognitoOpenClawAgentSqlitePath,
   openOpenClawAgentDatabase,
@@ -138,14 +139,19 @@ export async function inspectSqliteSessionHistoryDiskBudget(
   if (usage.totalBytes - usage.databaseWalBytes <= highWaterBytes) {
     return { diskBudget, wouldMutate: false };
   }
-  const database = openOpenClawAgentDatabase(databaseOptions);
-  const livePlan = planOldestCapacityEligibleSqliteLiveEntryRemoval({
-    archiveDirectory: resolveSqliteTranscriptArchiveDirectory(resolved),
-    database,
-    storePath: params.storePath,
-    preserveRecentMs: params.maintenance.preserveRecentMs,
-  });
-  return { diskBudget, wouldMutate: livePlan.entryRemovals.length > 0 };
+  // A writable open updates the state registry and file bytes. Preview must stay read-only.
+  const preview = withOpenClawAgentDatabaseReadOnly((database) => {
+    return planOldestCapacityEligibleSqliteLiveEntryRemoval({
+      archiveDirectory: resolveSqliteTranscriptArchiveDirectory(resolved),
+      database: database as OpenClawAgentDatabase,
+      storePath: params.storePath,
+      preserveRecentMs: params.maintenance.preserveRecentMs,
+    });
+  }, databaseOptions);
+  if (!preview.found) {
+    return { diskBudget, wouldMutate: false };
+  }
+  return { diskBudget, wouldMutate: preview.value.entryRemovals.length > 0 };
 }
 
 function collectCandidateAdditionalProtection(params: {
