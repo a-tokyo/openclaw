@@ -284,6 +284,7 @@ async function buildActivity(
           teamId: conversationRef.teamId,
           channelId: conversationType === "channel" ? chatId : undefined,
           tokenProvider,
+          assertDirectAdapterHandoff: options?.assertDirectAdapterHandoff,
           getTeamDetails: options?.getTeamDetails,
         });
 
