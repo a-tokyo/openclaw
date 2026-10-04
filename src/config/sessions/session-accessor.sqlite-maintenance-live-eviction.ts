@@ -33,15 +33,11 @@ import type {
   SessionEntryMaintenanceResult,
 } from "./session-accessor.sqlite-lifecycle-types.js";
 import {
-  cloneSessionEntry,
   getSessionKysely,
   toDatabaseOptions,
   type ResolvedSqliteReadScope,
 } from "./session-accessor.sqlite-scope.js";
-import {
-  parseSessionEntryJson as parseSessionEntryRow,
-  sessionEntryMetadataJson,
-} from "./session-accessor.sqlite-status.js";
+import { parseSessionEntryJson as parseSessionEntryRow } from "./session-accessor.sqlite-status.js";
 import { collectSessionAdmissionReferences } from "./session-history-eviction-candidates.js";
 import { normalizeStoreSessionKey } from "./store-entry.js";
 import { resolveSessionMaintenancePreserveKeys } from "./store-maintenance-preserve-snapshot.js";
@@ -286,7 +282,7 @@ function readOldestCapacityEligibleLiveNode(params: {
   // does not allow that alias in the same SELECT's WHERE.
   const candidates = db
     .selectFrom("session_nodes")
-    .select(["session_key", sessionEntryMetadataJson, liveNodeActivityAtSql().as("activity_at")])
+    .select(["session_key", "entry_json", liveNodeActivityAtSql().as("activity_at")])
     .where("archived_at", "is", null)
     .as("live_candidates");
   let cursor: { activityAt: number; sessionKey: string } | undefined;
@@ -316,7 +312,7 @@ function readOldestCapacityEligibleLiveNode(params: {
         activityAt: Number.isFinite(activity) ? activity : 0,
         sessionKey: row.session_key,
       };
-      const preview = parseSessionEntryRow(row);
+      const preview = parseSessionEntryRow({ entry_json: String(row.entry_json) }, "list");
       if (
         !preview ||
         !isCapacityEligibleLiveNode({
@@ -426,7 +422,7 @@ export function planOldestCapacityEligibleSqliteLiveEntryRemoval(params: {
   }
 
   const removedKeys = new Set([victim.key]);
-  const removedEntriesByKey = new Map([[victim.key, cloneSessionEntry(victim.entry)]]);
+  const removedEntriesByKey = new Map([[victim.key, { ...victim.entry }]]);
   // Referenced ids come from the database with the victim excluded. Cloning the
   // catalog here would mark the victim's own session id as still referenced.
   return planSqliteLiveEntryRemovals({
