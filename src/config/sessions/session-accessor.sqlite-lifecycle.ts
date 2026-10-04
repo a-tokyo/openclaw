@@ -434,9 +434,7 @@ async function deleteSqliteSessionEntryLifecycleLocked(
               const reclaimed = await runSqliteSessionReclamation({
                 diagnostics,
                 assertCommitAllowed: assertDeletionCurrent,
-                forceInProcess:
-                  typeof params.expectedDatabaseIdentity === "symbol" ||
-                  hasPreparedNativeSessionDeletion(),
+                forceInProcess: typeof params.expectedDatabaseIdentity === "symbol",
                 onInProcessCommit: recordCommit,
                 plan: reclamationPlan,
               });
@@ -528,7 +526,7 @@ async function deleteSqliteSessionEntryLifecycleLocked(
           result.archivedTranscripts.push(...historicalArchivedTranscripts);
           return result;
         },
-        { additionalIdentities: prepared.historicalGenerationIds },
+        { additionalIdentities: prepared.historicalGenerationIds, callerSettlesReceipts: true },
       );
     });
   } finally {
