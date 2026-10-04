@@ -151,6 +151,7 @@ export async function inspectSqliteSessionHistoryDiskBudget(
   const preview = withOpenClawAgentDatabaseReadOnly((database) => {
     return planOldestCapacityEligibleSqliteLiveEntryRemoval({
       archiveDirectory: resolveSqliteTranscriptArchiveDirectory(resolved),
+      // SAFETY: preview readers expose the same agentId, db, and path the planner reads.
       database: database as OpenClawAgentDatabase,
       storePath: params.storePath,
       preserveRecentMs: params.maintenance.preserveRecentMs,

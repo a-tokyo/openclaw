@@ -501,7 +501,7 @@ export async function reclaimSqliteLiveSessionEntriesToHighWater(params: {
       ),
     );
     let retargeted = false;
-    const published = await runExclusiveSessionLifecycleMutation({
+    const published = await runExclusiveSessionLifecycleMutation("history-evict", {
       scope: params.storePath,
       identities,
       run: async () => {
