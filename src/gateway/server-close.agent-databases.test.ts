@@ -7,6 +7,7 @@ import { setImmediate as nextTurn } from "node:timers/promises";
 import { collectNestedErrorCandidates } from "@openclaw/normalization-core/error-coercion";
 import { expect, it, vi } from "vitest";
 import { awaitGateBeforeSettlement, withinTest } from "../../test/helpers/promise.js";
+import { openContextEngineTurnOutboxWorkerStore } from "../agents/harness/context-engine-turn-outbox-store.js";
 import { isAgentRunRestartAbortReason } from "../agents/run-termination.js";
 import {
   createReplyOperation,
@@ -18,6 +19,7 @@ import {
   patchSessionEntryCore,
   replaceSessionEntry,
 } from "../config/sessions/session-accessor.js";
+import { applySessionEntryLifecycleMutation } from "../config/sessions/session-accessor.sqlite-projection.js";
 import { runSqliteSessionReclamation } from "../config/sessions/session-accessor.sqlite-reclamation-run.js";
 import { createSessionMaintenanceStatisticsOperation } from "../config/sessions/session-accessor.sqlite-reclamation.js";
 import { settlePendingFinalDelivery } from "../infra/outbound/delivery-completion.js";
@@ -51,6 +53,7 @@ import {
   openOpenClawAgentDatabase,
   resolveIncognitoOpenClawAgentSqlitePath,
 } from "../state/openclaw-agent-db.js";
+import type { IncognitoAgentDatabaseExecution } from "../state/openclaw-agent-execution-incognito.js";
 import { captureOpenClawAgentDatabaseExecution } from "../state/openclaw-agent-execution.js";
 import { readOpenClawAgentIntegrityVerification } from "../state/openclaw-quarantine-store.js";
 import { withExistingOpenClawStateDatabaseReadOnly } from "../state/openclaw-state-db-readonly.js";
@@ -64,6 +67,110 @@ import { readMentionStoreSnapshot } from "./mention-inbox-store.js";
 import type { MentionCommittedInput } from "./mention-inbox.types.js";
 import { createGatewayMetadataCloseFixture } from "./server-close.metadata.test-support.js";
 import type { GatewayServer } from "./server-public.js";
+
+it("settles an accepted incognito outbox write after the close prelude and before actor retirement", async ({
+  signal,
+}) => {
+  const fixture = await createGatewayMetadataCloseFixture("gateway-incognito-outbox-close");
+  const entered = createDeferredCore();
+  const release = createDeferredCore();
+  const accepted = createDeferredCore();
+  const joining = createDeferredCore();
+  let actor: IncognitoAgentDatabaseExecution | undefined;
+  let holding: Promise<void> | undefined;
+  let writing: Promise<void> | undefined;
+  let closing: Promise<void> | undefined;
+  let persisted: unknown;
+  try {
+    const port = await fixture.reservePort();
+    const server = await fixture.start(port);
+    const kernel = fixture.kernels.get(port);
+    assert(kernel);
+    const authority = { assertCurrent() {} };
+    actor = await captureOpenClawAgentDatabaseExecution({
+      kind: "ephemeral",
+      agentId: "main",
+      env: fixture.state.env,
+      authority,
+    });
+    assert(actor);
+    const target = {
+      sessionKey: "agent:main:dashboard:incognito-outbox-close",
+      sessionId: "outbox-close",
+    };
+    await actor.sessions.create(authority, {
+      sessionKey: target.sessionKey,
+      entry: { sessionId: target.sessionId, updatedAt: 1, incognito: true },
+    });
+    const message = await actor.sessions.transcript(authority, {
+      type: "session.message.append",
+      input: { ...target, fence: {}, message: { role: "user", content: "accepted question" } },
+    });
+    assert(message.ok && message.value.append?.anchor);
+    const admission = {
+      ...message.value.append.anchor,
+      logicalTurnId: "accepted-close-turn",
+      role: "user" as const,
+    };
+    const outbox = openContextEngineTurnOutboxWorkerStore({
+      agentId: actor.agentId,
+      path: actor.path,
+      incognito: { actor, authority, ...target },
+    });
+    holding = actor.run(authority, async () => {
+      entered.resolve();
+      await release.promise;
+    });
+    await withinTest(entered.promise, signal);
+    const filter = { engineId: "close-fixture", sessionId: target.sessionId };
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    kernel.scheduler.schedule({
+      id: "accepted-incognito-outbox",
+      delayMs: 0,
+      async run() {
+        writing = outbox.enqueueIntent({ ...filter, admission, isHeartbeat: false });
+        accepted.resolve();
+        await writing;
+        persisted = await outbox.readNextPending(filter);
+      },
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    await withinTest(accepted.promise, signal);
+    vi.useRealTimers();
+    const stop = kernel.scheduler.stop.bind(kernel.scheduler);
+    vi.spyOn(kernel.scheduler, "stop").mockImplementation(() => {
+      joining.resolve();
+      return stop();
+    });
+    closing = server.close({ reason: "incognito outbox close regression" });
+    await withinTest(
+      awaitGateBeforeSettlement(joining.promise, closing, "Gateway skipped scheduler settlement"),
+      signal,
+    );
+    expect(kernel.scheduler.signal.aborted).toBe(true);
+    expect(() => actor?.assertCurrent()).not.toThrow();
+    expect(persisted).toBeUndefined();
+    const late = vi.fn();
+    await kernel.scheduler
+      .schedule({ id: "refused-incognito-outbox", delayMs: 0, run: late })
+      .stop();
+    expect(late).not.toHaveBeenCalled();
+    release.resolve();
+    await withinTest(Promise.all([holding, writing, closing]), signal);
+    expect(persisted).toMatchObject({
+      advancement_key: admission.logicalTurnId,
+      session_id: target.sessionId,
+    });
+    expect(() => actor?.assertCurrent()).toThrow("Incognito session ended");
+  } finally {
+    release.resolve();
+    await Promise.allSettled([holding, writing, closing]);
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+    await actor?.close();
+    await fixture.cleanup();
+  }
+});
 
 it("persists accepted mentions and involvement before Gateway worker close and rejects records after the close prelude", async ({
   signal,
@@ -167,6 +274,7 @@ it("joins scheduled plugin work before closing stores while retaining a deleted 
   let closing: Promise<void> | undefined;
   let heldWriter: ReturnType<typeof patchSessionEntryCore> | undefined;
   let acceptedFinal: ReturnType<typeof settlePendingFinalDelivery> | undefined;
+  let acceptedLifecycle: ReturnType<typeof applySessionEntryLifecycleMutation> | undefined;
   try {
     const pluginId = fixture.pluginId;
     const registry = createEmptyPluginRegistry();
@@ -211,6 +319,21 @@ it("joins scheduled plugin work before closing stores while retaining a deleted 
         },
       );
     }
+    const lifecycleKey = "agent:main:lifecycle-close";
+    await replaceSessionEntry(
+      { agentId: "main", storePath: activeStore, sessionKey: lifecycleKey },
+      {
+        sessionId: "lifecycle-close-session",
+        updatedAt: 1,
+        sessionDiffBaseline: {
+          version: 1,
+          sessionId: "lifecycle-close-session",
+          root: "/synthetic",
+          files: [],
+        },
+        skillsSnapshot: { prompt: "before close", skills: [] },
+      },
+    );
     const retainedDatabase = path.join(fixture.state.agentDir("retired"), "openclaw-agent.sqlite");
     const operationId = randomUUID();
     beginAgentDeletionJournal(
@@ -289,8 +412,23 @@ it("joins scheduled plugin work before closing stores while retaining a deleted 
           },
           "delivered",
         );
+        acceptedLifecycle = applySessionEntryLifecycleMutation({
+          agentId: "main",
+          storePath: activeStore,
+          activeSessionKey: lifecycleKey,
+          upserts: [
+            {
+              sessionKey: lifecycleKey,
+              entry: {
+                sessionId: "lifecycle-close-session",
+                updatedAt: 2,
+                skillsSnapshot: { prompt: "accepted before close", skills: [] },
+              },
+            },
+          ],
+        });
         rootWorkEntered.resolve();
-        await acceptedFinal;
+        await Promise.all([acceptedFinal, acceptedLifecycle]);
       },
     });
     await vi.advanceTimersByTimeAsync(0);
@@ -314,14 +452,25 @@ it("joins scheduled plugin work before closing stores while retaining a deleted 
     releaseRootWork.resolve();
     await heldWriter;
     await expect(acceptedFinal).resolves.toEqual({ state: "delivered" });
+    await expect(acceptedLifecycle).resolves.toMatchObject({ removedEntries: 0 });
     await expect(closing).resolves.toBeUndefined();
     expect(disposed).toBe(true);
     expect(shared.isOpen).toBe(false);
     expect((await fs.stat(retainedDatabase)).isFile()).toBe(true);
+    const lifecycleEntry = loadSessionEntry({
+      agentId: "main",
+      storePath: activeStore,
+      sessionKey: lifecycleKey,
+    });
+    expect(lifecycleEntry?.skillsSnapshot).toEqual({
+      prompt: "accepted before close",
+      skills: [],
+    });
+    expect(lifecycleEntry?.sessionDiffBaseline).toBeUndefined();
     expect(
       loadSessionEntry({ agentId: "main", storePath: activeStore, sessionKey: "agent:main:main" })
         ?.pluginExtensions,
-    ).toBeUndefined();
+    ).toEqual({ [pluginId]: { active: true } });
     expect(
       loadSessionEntry({ agentId: "main", storePath: activeStore, sessionKey: "agent:main:main" }),
     ).toMatchObject({
@@ -333,7 +482,7 @@ it("joins scheduled plugin work before closing stores while retaining a deleted 
   } finally {
     stopEntered.resolve();
     releaseRootWork.resolve();
-    await Promise.allSettled([heldWriter, acceptedFinal, closing]);
+    await Promise.allSettled([heldWriter, acceptedFinal, acceptedLifecycle, closing]);
     vi.useRealTimers();
     vi.restoreAllMocks();
     await fixture.cleanup();

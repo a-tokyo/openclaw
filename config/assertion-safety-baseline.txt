@@ -1123,7 +1123,7 @@ packages/ai/src/transports/openai-completions-replay.ts	6
 packages/ai/src/transports/openai-completions-stream.ts	8
 packages/ai/src/transports/openai-completions-string-content.ts	5
 packages/ai/src/transports/openai-completions-transport.ts	9
-packages/ai/src/transports/openai-responses-client.ts	11
+packages/ai/src/transports/openai-responses-client.ts	10
 packages/ai/src/transports/openai-responses-compact-request.ts	2
 packages/ai/src/transports/openai-responses-continuation.ts	2
 packages/ai/src/transports/openai-responses-contracts.ts	1
@@ -1333,7 +1333,7 @@ src/agents/embedded-agent-runner/model.provider-hooks.ts	8
 src/agents/embedded-agent-runner/model.registry-resolution.ts	3
 src/agents/embedded-agent-runner/model.ts	3
 src/agents/embedded-agent-runner/openrouter-model-capabilities.ts	2
-src/agents/embedded-agent-runner/replay-history.ts	19
+src/agents/embedded-agent-runner/replay-history.ts	17
 src/agents/embedded-agent-runner/run-entry.ts	2
 src/agents/embedded-agent-runner/run.overflow-compaction.harness.ts	4
 src/agents/embedded-agent-runner/run/attempt-client-tools.ts	2
