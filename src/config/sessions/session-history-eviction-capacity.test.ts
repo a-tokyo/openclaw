@@ -19,14 +19,19 @@ import {
   replaceSessionEntry,
   resetSessionEntryLifecycle,
 } from "./session-accessor.js";
+import { finalizeSessionEntryMaintenancePlansAfterWriterReleaseBestEffort } from "./session-accessor.sqlite-maintenance.js";
 import { getSessionKysely } from "./session-accessor.sqlite-scope.js";
 import * as archivePruning from "./session-history-archive-pruning.js";
 import {
   enforceSqliteSessionHistoryDiskBudget,
   inspectSqliteSessionHistoryDiskBudget,
 } from "./session-history-eviction.js";
+import { planLiveEvictionInDatabase } from "./session-live-eviction-plan.worker.js";
 import { resolveSqliteTargetFromSessionStorePath } from "./session-sqlite-target.js";
-import { registerSessionMaintenancePreserveKeysProvider } from "./store-maintenance-preserve.js";
+import {
+  captureSessionMaintenancePreservation,
+  registerSessionMaintenancePreserveKeysProvider,
+} from "./store-maintenance-preserve.js";
 import { resolveMaintenanceConfigFromInput } from "./store-maintenance.js";
 
 describe("SQLite live-node disk budget eviction", () => {
@@ -385,6 +390,74 @@ describe("SQLite live-node disk budget eviction", () => {
     expect(sessionExists("default-budget-thread")).toBe(true);
   });
 
+  it("skips an idle thread whose transcript is cold", async () => {
+    const coldKey = "agent:main:slack:channel:c15:thread:15";
+    const hotKey = "agent:main:slack:channel:c16:thread:16";
+    await replaceSessionEntry(
+      { sessionKey: coldKey, storePath },
+      { sessionId: "cold-oldest", updatedAt: 5 },
+    );
+    await appendTranscriptMessage(
+      { sessionId: "cold-oldest", sessionKey: coldKey, storePath },
+      { message: { role: "user", content: "cold " + "x".repeat(64 * 1024) } },
+    );
+    await replaceSessionEntry(
+      { sessionKey: hotKey, storePath },
+      { sessionId: "hot-newer", updatedAt: 15 },
+    );
+    await appendTranscriptMessage(
+      { sessionId: "hot-newer", sessionKey: hotKey, storePath },
+      { message: { role: "user", content: "hot " + "y".repeat(64 * 1024) } },
+    );
+    markCold("cold-oldest");
+    settlePhysicalUsage();
+    const before = await measureSessionPhysicalDiskUsage(storePath);
+    const result = await enforceSqliteSessionHistoryDiskBudget({
+      storePath,
+      mode: "enforce",
+      maintenance: {
+        maxDiskBytes: before.totalBytes - 1,
+        maxDiskBytesExplicit: true,
+        highWaterBytes: Math.max(1, before.totalBytes - 1),
+      },
+    });
+
+    expect(result?.removedEntries).toBe(1);
+    expect(sessionNodeExists(coldKey)).toBe(true);
+    expect(sessionNodeExists(hotKey)).toBe(false);
+  });
+
+  it("keeps a thread whose transcript goes cold before the eviction commits", async () => {
+    const threadKey = "agent:main:slack:channel:c17:thread:17";
+    await replaceSessionEntry(
+      { sessionKey: threadKey, storePath },
+      { sessionId: "late-cold", updatedAt: 5 },
+    );
+    await appendTranscriptMessage(
+      { sessionId: "late-cold", sessionKey: threadKey, storePath },
+      { message: { role: "user", content: "late " + "x".repeat(64 * 1024) } },
+    );
+    const live = planLiveEvictionInDatabase(database(), {
+      archiveDirectory: path.join(tempDir, "archives"),
+      preserveRecentMs: null,
+      skipSessionKeys: [],
+      snapshot: captureSessionMaintenancePreservation(storePath),
+      unprotectSessionKeys: [],
+    });
+    expect(live.plan.entryRemovals.map((removal) => removal.sessionKey)).toEqual([threadKey]);
+    markCold("late-cold");
+    const target = resolveSqliteTargetFromSessionStorePath(storePath);
+    const removed: string[] = [];
+    await finalizeSessionEntryMaintenancePlansAfterWriterReleaseBestEffort(
+      { agentId: target.agentId ?? "main", env: process.env, path: target.path ?? "" },
+      [live.plan],
+      { onEntryRemoved: (sessionKey) => removed.push(sessionKey) },
+    );
+
+    expect(removed).toEqual([]);
+    expect(sessionNodeExists(threadKey)).toBe(true);
+  });
+
   it("marks only an operator-set budget as explicit", () => {
     expect(resolveMaintenanceConfigFromInput().maxDiskBytesExplicit).toBe(false);
     expect(resolveMaintenanceConfigFromInput({ maxDiskBytes: "400mb" }).maxDiskBytesExplicit).toBe(
@@ -477,6 +550,17 @@ describe("SQLite live-node disk budget eviction", () => {
       owner.db.exec(`PRAGMA incremental_vacuum(${freePages});`);
     }
     owner.walMaintenance.checkpoint();
+  }
+
+  function markCold(sessionId: string): void {
+    database()
+      .db.prepare(
+        `INSERT INTO session_transcript_cold_archives
+          (session_id, generation, archive_name, archive_sha256, event_count, raw_bytes,
+           archive_bytes, last_seq, archived_at, storage, archive_blob)
+         VALUES (?, 'test', ?, ?, 1, 1, 1, 1, ?, 'sqlite', x'00')`,
+      )
+      .run(sessionId, `${sessionId}.cold.zst`, "0".repeat(64), Date.now());
   }
 
   function setSessionUpdatedAt(sessionId: string, updatedAt: number): void {

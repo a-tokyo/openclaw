@@ -13,6 +13,7 @@ import { readSessionEntryStore } from "./session-accessor.sqlite-entry-inventory
 import {
   collectProjectedReferencedSessionIds,
   collectSessionStateIdsForEntry,
+  hasColdSessionTranscript,
   planSessionStateDeleteIfUnreferenced,
   readSessionGenerationIdsForKeys,
 } from "./session-accessor.sqlite-lifecycle-state.js";
@@ -281,7 +282,8 @@ function readOldestCapacityEligibleLiveNode(params: {
           key: row.session_key,
           preserveKeys: params.preserveKeys,
           preserveRecentMs: params.preserveRecentMs,
-        })
+        }) &&
+        !hasColdSessionTranscript(params.database, entry)
       ) {
         return { entry, key: row.session_key };
       }
@@ -325,7 +327,13 @@ function planSqliteLiveEntryRemoval(params: {
   }
   return {
     ...emptyLiveEntryPlan(),
-    entryRemovals: [{ expectedEntry: { ...params.entry }, sessionKey: params.sessionKey }],
+    entryRemovals: [
+      {
+        expectedEntry: { ...params.entry },
+        maintenanceReason: "disk-evicted",
+        sessionKey: params.sessionKey,
+      },
+    ],
     stateDeletePlans: deletePlans,
   };
 }
