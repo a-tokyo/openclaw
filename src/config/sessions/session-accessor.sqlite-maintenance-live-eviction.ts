@@ -1,468 +1,76 @@
 // Live-node capacity eviction for the SQLite session disk budget.
-// Extracted from session-accessor.sqlite-maintenance.ts to stay within max-lines.
 
-import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
-import { uniqueStrings } from "@openclaw/normalization-core/string-normalization";
-import { sql } from "kysely";
-import { executeSqliteQuerySync, sqliteStringSet } from "../../infra/kysely-sync.js";
+import { runExclusiveSessionLifecycleMutation } from "../../sessions/session-lifecycle-admission.js";
 import {
-  parseAgentSessionKey,
-  parseThreadSessionSuffix,
-} from "../../sessions/session-key-utils.js";
-import {
-  collectActiveSessionWorkAdmissions,
-  runExclusiveSessionLifecycleMutation,
-} from "../../sessions/session-lifecycle-admission.js";
-import {
+  isIncognitoOpenClawAgentSqlitePath,
   openOpenClawAgentDatabase,
-  type OpenClawAgentDatabase,
+  resolveOpenClawAgentSqlitePath,
+  type OpenClawAgentDatabaseOptions,
 } from "../../state/openclaw-agent-db.js";
-import { sessionDeliveryOrigin } from "../../utils/delivery-context.read.js";
 import { measureSessionPhysicalDiskUsage, type SessionPhysicalDiskUsage } from "./disk-budget.js";
-import type { SessionStateDeletePlan } from "./session-accessor.sqlite-archive-types.js";
-import { readSessionEntryStore } from "./session-accessor.sqlite-entry-inventory.js";
 import { emitArchivedTranscriptUpdates } from "./session-accessor.sqlite-events.js";
+import { finalizeSessionEntryMaintenancePlansAfterWriterReleaseBestEffort } from "./session-accessor.sqlite-maintenance.js";
 import {
-  collectProjectedReferencedSessionIds,
-  collectSessionStateIdsForEntry,
-  planSessionStateDeleteIfUnreferenced,
-  readSessionGenerationIdsForKeys,
-} from "./session-accessor.sqlite-lifecycle-state.js";
-import type {
-  SessionEntryMaintenancePlan,
-  SessionEntryMaintenanceResult,
-} from "./session-accessor.sqlite-lifecycle-types.js";
-import {
-  getSessionKysely,
   toDatabaseOptions,
   type ResolvedSqliteReadScope,
 } from "./session-accessor.sqlite-scope.js";
-import { parseSessionEntryJson as parseSessionEntryRow } from "./session-accessor.sqlite-status.js";
-import { collectSessionAdmissionReferences } from "./session-history-eviction-candidates.js";
-import { normalizeStoreSessionKey } from "./store-entry.js";
-import { resolveSessionMaintenancePreserveKeys } from "./store-maintenance-preserve-snapshot.js";
+import { withSqliteMutationWorkerLifetime } from "./session-accessor.sqlite-worker-request.js";
+import type { LiveEvictionPlan } from "./session-history-eviction-worker.types.js";
+import { planLiveEvictionInDatabase } from "./session-live-eviction-plan.worker.js";
+import { maintenanceLane } from "./session-transcript-worker-resources.js";
+import { withSessionHistoryWorkerDatabase } from "./session-transcript-worker-runtime.js";
 import { captureSessionMaintenancePreservation } from "./store-maintenance-preserve.js";
-import { resolveMaintenanceConfig } from "./store-maintenance-runtime.js";
-import { isRecentSessionMaintenanceEntry } from "./store-maintenance.js";
-import type { SessionEntry } from "./types.js";
 
-/**
- * True when the session key identifies a durable human conversation surface
- * (thread, channel, group, Telegram topic) — the only live nodes the disk
- * budget may destructively reclaim as a last resort.
- */
-function isDurableConversationSessionKey(
-  sessionKey: string,
-  entry: SessionEntry | undefined,
-): boolean {
-  const parsed = parseAgentSessionKey(sessionKey);
-  const rest = normalizeLowercaseStringOrEmpty(parsed?.rest ?? sessionKey);
-  if (parseThreadSessionSuffix(sessionKey).threadId) {
-    return true;
-  }
-  if (
-    /^[^:]+:(?:group|channel):.+$/.test(rest) ||
-    /^telegram:(?:direct|dm):.+:topic:[^:]+$/.test(rest)
-  ) {
-    return true;
-  }
-  const chatType = normalizeLowercaseStringOrEmpty(
-    entry?.chatType ?? sessionDeliveryOrigin(entry)?.chatType,
-  );
-  return chatType === "group" || chatType === "channel" || chatType === "thread";
-}
+type LiveEvictionReadMode = "in-process" | "worker";
 
-const LIVE_VICTIM_PAGE_SIZE = 64;
-
-function emptyLiveEntryPlan(): SessionEntryMaintenancePlan {
-  return {
-    archivedSessionKeys: [],
-    entryRemovals: [],
-    stateDeletePlans: [],
-    archived: 0,
-    capArchived: 0,
-    modelRunPruned: 0,
-    pruned: 0,
-    capped: 0,
-  };
-}
-
-/** Activity order matches `getSessionMaintenanceActivityAt` without loading prompt payloads. */
-function liveNodeActivityAtSql() {
-  return /* kysely-allow-raw: activity timestamp is not a stored column. */ sql<number>`CASE WHEN json_valid(entry_json) THEN MAX(
-    COALESCE(json_extract(entry_json, '$.lastInteractionAt'), 0),
-    COALESCE(json_extract(entry_json, '$.lastActivityAt'), 0),
-    COALESCE(json_extract(entry_json, '$.sessionStartedAt'), 0),
-    "updated_at"
-  ) ELSE "updated_at" END`;
-}
-
-function isLocalEvictionFenceIdentity(identity: string, unprotect: ReadonlySet<string>): boolean {
-  const trimmed = identity.trim();
-  return (
-    trimmed.length > 0 &&
-    (unprotect.has(trimmed) || unprotect.has(normalizeStoreSessionKey(trimmed)))
-  );
-}
-
-function collectAdmissionProtectedSessionIds(params: {
-  database: Pick<OpenClawAgentDatabase, "db">;
-  storePath: string;
-}): Set<string> {
-  return collectSessionAdmissionReferences({
-    database: params.database,
-    admissionIdentities: [...(collectActiveSessionWorkAdmissions().get(params.storePath) ?? [])],
-  });
-}
-
-function collectAdmissionProtectedStoreKeys(params: {
-  database: OpenClawAgentDatabase;
-  storePath: string;
-}): Set<string> {
-  const protectedSessionIds = collectAdmissionProtectedSessionIds(params);
-  if (protectedSessionIds.size === 0) {
-    return new Set();
-  }
-  const keys = new Set<string>();
-  const db = getSessionKysely(params.database.db);
-  for (const row of executeSqliteQuerySync(
-    params.database.db,
-    db.selectFrom("session_nodes").select(["current_session_id", "session_key"]),
-  ).rows) {
-    if (
-      protectedSessionIds.has(row.session_key) ||
-      protectedSessionIds.has(row.current_session_id)
-    ) {
-      keys.add(row.session_key);
-    }
-  }
-  for (const row of executeSqliteQuerySync(
-    params.database.db,
-    db.selectFrom("session_windows").select(["session_id", "session_key"]),
-  ).rows) {
-    if (protectedSessionIds.has(row.session_id)) {
-      keys.add(row.session_key);
-    }
-  }
-  return keys;
-}
-
-function collectCapacityEligibleLivePreserveKeys(params: {
-  baseKeys?: Iterable<string | undefined>;
-  database: OpenClawAgentDatabase;
-  skipSessionKeys?: ReadonlySet<string>;
-  store: Record<string, SessionEntry>;
-  storePath: string;
-  unprotectSessionKeys?: ReadonlySet<string>;
-}): Set<string> {
-  const snapshot = captureSessionMaintenancePreservation(params.storePath);
-  const unprotect = params.unprotectSessionKeys ?? new Set<string>();
-  // Drop only this eviction's lifecycle identities. A provider that starts
-  // protecting the victim while the fence is waited for must still veto deletion.
-  const preserveKeys = resolveSessionMaintenancePreserveKeys({
-    baseKeys: params.baseKeys,
-    snapshot: {
-      ...snapshot,
-      lifecycleIdentities: snapshot.lifecycleIdentities.filter(
-        (identity) => !isLocalEvictionFenceIdentity(identity, unprotect),
-      ),
-    },
-    store: params.store,
-  });
-  for (const key of params.skipSessionKeys ?? []) {
-    preserveKeys.add(key);
-  }
-  for (const key of collectAdmissionProtectedStoreKeys({
-    database: params.database,
-    storePath: params.storePath,
-  })) {
-    preserveKeys.add(key);
-  }
-  return preserveKeys;
-}
-
-function planSqliteLiveEntryRemovals(params: {
+/** Plans one oldest idle durable-conversation removal. Discovery reads run in the maintenance worker. */
+export async function readLiveEvictionPlan(params: {
   archiveDirectory: string;
-  database: OpenClawAgentDatabase;
-  projectedStore: Record<string, SessionEntry>;
-  removedEntriesByKey: Map<string, SessionEntry>;
-  removedKeys: Set<string>;
-}): SessionEntryMaintenancePlan {
-  const removedSessionIds = new Set<string>();
-  for (const entry of params.removedEntriesByKey.values()) {
-    for (const sessionId of collectSessionStateIdsForEntry(entry)) {
-      removedSessionIds.add(sessionId);
-    }
-  }
-  for (const sessionId of readSessionGenerationIdsForKeys(params.database, [
-    ...params.removedKeys,
-  ])) {
-    removedSessionIds.add(sessionId);
-  }
-  const referencedSessionIds = collectProjectedReferencedSessionIds({
-    database: params.database,
-    excludedSessionKeys: [...params.removedKeys],
-    projectedStore: params.projectedStore,
-  });
-  const deletePlans: SessionStateDeletePlan[] = [];
-  for (const sessionId of removedSessionIds) {
-    const plan = planSessionStateDeleteIfUnreferenced({
-      archiveTranscript: true,
-      archiveDirectory: params.archiveDirectory,
-      database: params.database,
-      referencedSessionIds,
-      sessionId,
-    });
-    if (plan) {
-      deletePlans.push(plan);
-    }
-  }
-  return {
-    archivedSessionKeys: [],
-    entryRemovals: [...params.removedEntriesByKey].map(([sessionKey, entry]) => ({
-      expectedEntry: entry,
-      sessionKey,
-    })),
-    stateDeletePlans: deletePlans,
-    archived: 0,
-    capArchived: 0,
-    modelRunPruned: 0,
-    pruned: 0,
-    capped: 0,
-  };
-}
-
-function resolveLivePreserveRecentMs(preserveRecentMs?: number | null): number | null {
-  return preserveRecentMs === undefined
-    ? (resolveMaintenanceConfig().preserveRecentMs ?? null)
-    : preserveRecentMs;
-}
-
-function isCapacityEligibleLiveNode(params: {
-  entry: SessionEntry;
-  key: string;
-  preserveKeys: ReadonlySet<string>;
-  preserveRecentMs: number | null;
-  skipSessionKeys?: ReadonlySet<string>;
-}): boolean {
-  const { entry, key } = params;
-  if (params.skipSessionKeys?.has(key)) {
-    return false;
-  }
-  if (entry.archivedAt !== undefined || entry.pinnedAt !== undefined) {
-    return false;
-  }
-  if (entry.modelSelectionLocked === true || entry.status === "running") {
-    return false;
-  }
-  if (params.preserveKeys.has(key) || params.preserveKeys.has(normalizeStoreSessionKey(key))) {
-    return false;
-  }
-  const parsed = parseAgentSessionKey(key);
-  if (parsed?.rest === "main" || key === "global") {
-    return false;
-  }
-  if (isRecentSessionMaintenanceEntry({ key, entry, preserveRecentMs: params.preserveRecentMs })) {
-    return false;
-  }
-  // Only durable conversation surfaces (threads, channels, groups, topics)
-  // are eligible. Ordinary session entries are not destructively reclaimable.
-  return isDurableConversationSessionKey(key, entry);
-}
-
-/** Oldest eligible live node, paging metadata instead of the full catalog. */
-function readOldestCapacityEligibleLiveNode(params: {
-  database: OpenClawAgentDatabase;
-  preserveKeys: ReadonlySet<string>;
-  preserveRecentMs: number | null;
-  skipSessionKeys?: ReadonlySet<string>;
-}): { entry: SessionEntry; key: string } | undefined {
-  const db = getSessionKysely(params.database.db);
-  // Alias the activity expression so the page cursor can filter it. SQLite
-  // does not allow that alias in the same SELECT's WHERE.
-  const candidates = db
-    .selectFrom("session_nodes")
-    .select(["session_key", "entry_json", liveNodeActivityAtSql().as("activity_at")])
-    .where("archived_at", "is", null)
-    .as("live_candidates");
-  let cursor: { activityAt: number; sessionKey: string } | undefined;
-  for (;;) {
-    let query = db
-      .selectFrom(candidates)
-      .selectAll()
-      .orderBy("activity_at", "asc")
-      .orderBy("session_key", "asc")
-      .limit(LIVE_VICTIM_PAGE_SIZE);
-    if (cursor) {
-      const after = cursor;
-      query = query.where((eb) =>
-        eb.or([
-          eb("activity_at", ">", after.activityAt),
-          eb.and([
-            eb("activity_at", "=", after.activityAt),
-            eb("session_key", ">", after.sessionKey),
-          ]),
-        ]),
-      );
-    }
-    const rows = executeSqliteQuerySync(params.database.db, query).rows;
-    for (const row of rows) {
-      const activity = row.activity_at;
-      cursor = {
-        activityAt: Number.isFinite(activity) ? activity : 0,
-        sessionKey: row.session_key,
-      };
-      const preview = parseSessionEntryRow({ entry_json: String(row.entry_json) }, "list");
-      if (
-        !preview ||
-        !isCapacityEligibleLiveNode({
-          entry: preview,
-          key: row.session_key,
-          preserveKeys: params.preserveKeys,
-          preserveRecentMs: params.preserveRecentMs,
-          skipSessionKeys: params.skipSessionKeys,
-        })
-      ) {
-        continue;
-      }
-      const entry = readSessionEntryStore(params.database, { sessionKeys: [row.session_key] })[
-        row.session_key
-      ];
-      if (
-        entry &&
-        isCapacityEligibleLiveNode({
-          entry,
-          key: row.session_key,
-          preserveKeys: params.preserveKeys,
-          preserveRecentMs: params.preserveRecentMs,
-          skipSessionKeys: params.skipSessionKeys,
-        })
-      ) {
-        return { entry, key: row.session_key };
-      }
-    }
-    if (rows.length < LIVE_VICTIM_PAGE_SIZE) {
-      return undefined;
-    }
-  }
-}
-
-/** Rows that can match provider, admission, or lifecycle identities. Not the catalog. */
-function readIdentityPreserveStore(
-  database: OpenClawAgentDatabase,
-  identities: readonly string[],
-): Record<string, SessionEntry> {
-  const keys = [...new Set(identities.map((identity) => identity.trim()).filter(Boolean))];
-  if (keys.length === 0) {
-    return {};
-  }
-  const db = getSessionKysely(database.db);
-  const store: Record<string, SessionEntry> = {};
-  for (const row of executeSqliteQuerySync(
-    database.db,
-    db
-      .selectFrom("session_nodes")
-      .select(["current_session_id", "parent_session_key", "session_key", "updated_at"])
-      .where("archived_at", "is", null)
-      .where((eb) =>
-        eb.or([
-          eb("session_key", "in", sqliteStringSet(keys)),
-          eb("current_session_id", "in", sqliteStringSet(keys)),
-        ]),
-      ),
-  ).rows) {
-    store[row.session_key] = {
-      sessionId: row.current_session_id,
-      updatedAt: row.updated_at,
-      ...(row.parent_session_key ? { parentSessionKey: row.parent_session_key } : {}),
-    };
-  }
-  return store;
-}
-
-/** Plans at most one oldest capacity-eligible live session_node removal.
- *
- * This is the last-resort disk-budget tier. `capEntryCount` archives ordinary
- * sessions instead of deleting them, so this function bypasses the cap path
- * entirely and directly selects the oldest idle live node for deletion.
- * Always-protected entries (primary, pinned, model-locked, active/admitted,
- * recently active) are never victims.
- */
-export function planOldestCapacityEligibleSqliteLiveEntryRemoval(params: {
-  archiveDirectory: string;
-  database: OpenClawAgentDatabase;
-  skipSessionKeys?: ReadonlySet<string>;
-  storePath: string;
+  databaseOptions: OpenClawAgentDatabaseOptions;
   preserveRecentMs?: number | null;
+  readMode?: LiveEvictionReadMode;
+  skipSessionKeys?: ReadonlySet<string>;
+  storePath: string;
   unprotectSessionKeys?: ReadonlySet<string>;
-}): SessionEntryMaintenancePlan {
-  const snapshot = captureSessionMaintenancePreservation(params.storePath);
-  const unprotect = params.unprotectSessionKeys ?? new Set<string>();
-  const preserveKeys = collectCapacityEligibleLivePreserveKeys({
-    database: params.database,
-    skipSessionKeys: params.skipSessionKeys,
-    store: readIdentityPreserveStore(params.database, [
-      ...snapshot.providerKeys,
-      ...snapshot.workIdentities,
-      ...snapshot.lifecycleIdentities.filter(
-        (identity) => !isLocalEvictionFenceIdentity(identity, unprotect),
-      ),
-    ]),
-    storePath: params.storePath,
-    unprotectSessionKeys: params.unprotectSessionKeys,
-  });
-  const victim = readOldestCapacityEligibleLiveNode({
-    database: params.database,
-    preserveKeys,
-    preserveRecentMs: resolveLivePreserveRecentMs(params.preserveRecentMs),
-    skipSessionKeys: params.skipSessionKeys,
-  });
-  if (!victim) {
-    return emptyLiveEntryPlan();
-  }
-
-  const removedKeys = new Set([victim.key]);
-  const removedEntriesByKey = new Map([[victim.key, { ...victim.entry }]]);
-  // Referenced ids come from the database with the victim excluded. Cloning the
-  // catalog here would mark the victim's own session id as still referenced.
-  return planSqliteLiveEntryRemovals({
+}): Promise<LiveEvictionPlan> {
+  const plan = {
     archiveDirectory: params.archiveDirectory,
-    database: params.database,
-    projectedStore: {},
-    removedEntriesByKey,
-    removedKeys,
+    preserveRecentMs: params.preserveRecentMs ?? null,
+    skipSessionKeys: [...(params.skipSessionKeys ?? [])],
+    snapshot: captureSessionMaintenancePreservation(params.storePath),
+    unprotectSessionKeys: [...(params.unprotectSessionKeys ?? [])],
+  };
+  const path = resolveOpenClawAgentSqlitePath(params.databaseOptions);
+  if (
+    params.readMode === "in-process" ||
+    isIncognitoOpenClawAgentSqlitePath(path, params.databaseOptions)
+  ) {
+    return planLiveEvictionInDatabase(openOpenClawAgentDatabase(params.databaseOptions), plan);
+  }
+  const options = { ...params.databaseOptions, path };
+  return withSqliteMutationWorkerLifetime(options, async ({ assertCurrent }) => {
+    assertCurrent();
+    const live = await withSessionHistoryWorkerDatabase(
+      options,
+      (owner) => owner.readLiveEvictionPlan({ env: options.env ?? process.env, plan }),
+      maintenanceLane,
+    );
+    assertCurrent();
+    return live;
   });
-}
-
-function sqliteSessionNodeExists(database: OpenClawAgentDatabase, sessionKey: string): boolean {
-  const db = getSessionKysely(database.db);
-  return (
-    executeSqliteQuerySync(
-      database.db,
-      db
-        .selectFrom("session_nodes")
-        .select("session_key")
-        .where("session_key", "=", sessionKey)
-        .limit(1),
-    ).rows.length > 0
-  );
 }
 
 /** Last-resort live-node disk eviction. Historical generations must already be exhausted. */
 export async function reclaimSqliteLiveSessionEntriesToHighWater(params: {
   archiveDirectory: string;
-  database: OpenClawAgentDatabase;
-  finalizePlans: (
-    scope: Pick<ResolvedSqliteReadScope, "agentId" | "env" | "path">,
-    plans: readonly SessionEntryMaintenancePlan[],
-  ) => Promise<SessionEntryMaintenanceResult>;
   highWaterBytes: number;
   pruneArchivesToHighWater: () => Promise<{
     removedFiles: number;
     usage: SessionPhysicalDiskUsage;
     checkpointIncomplete?: number;
   }>;
-  reclaimFreePages: () => boolean | void | Promise<boolean | void>;
+  readMode?: LiveEvictionReadMode;
+  reclaimFreePages: () => Promise<boolean>;
   resolved: Pick<ResolvedSqliteReadScope, "agentId" | "env" | "path">;
   storePath: string;
   usage: SessionPhysicalDiskUsage;
@@ -477,61 +85,52 @@ export async function reclaimSqliteLiveSessionEntriesToHighWater(params: {
   let removedFiles = 0;
   const skipSessionKeys = new Set<string>();
   const databaseOptions = toDatabaseOptions(params.resolved);
-  const livePlanParams = {
+  const planParams = {
     archiveDirectory: params.archiveDirectory,
-    database: params.database,
+    databaseOptions,
+    preserveRecentMs: params.preserveRecentMs,
+    readMode: params.readMode,
     skipSessionKeys,
     storePath: params.storePath,
-    preserveRecentMs: params.preserveRecentMs,
   };
   while (usage.totalBytes > params.highWaterBytes) {
-    livePlanParams.database = openOpenClawAgentDatabase(databaseOptions);
-    const livePlan = planOldestCapacityEligibleSqliteLiveEntryRemoval(livePlanParams);
-    const victim = livePlan.entryRemovals[0];
+    const live = await readLiveEvictionPlan(planParams);
+    const victim = live.plan.entryRemovals[0];
     if (!victim) {
       break;
     }
-    const identities = uniqueStrings(
-      [
-        victim.sessionKey,
-        victim.expectedEntry?.sessionId,
-        ...readSessionGenerationIdsForKeys(livePlanParams.database, [victim.sessionKey]),
-      ].filter(
-        (identity): identity is string => typeof identity === "string" && identity.length > 0,
-      ),
-    );
-    let retargeted = false;
+    const { identities } = live;
+    let removed = false;
     const published = await runExclusiveSessionLifecycleMutation("history-evict", {
       scope: params.storePath,
       identities,
       run: async () => {
-        livePlanParams.database = openOpenClawAgentDatabase(databaseOptions);
-        const fencedPlan = planOldestCapacityEligibleSqliteLiveEntryRemoval({
-          ...livePlanParams,
+        const fenced = await readLiveEvictionPlan({
+          ...planParams,
           unprotectSessionKeys: new Set(identities),
         });
-        if (fencedPlan.entryRemovals[0]?.sessionKey !== victim.sessionKey) {
-          retargeted = true;
+        if (fenced.plan.entryRemovals[0]?.sessionKey !== victim.sessionKey) {
           return null;
         }
-        return await params.finalizePlans(params.resolved, [fencedPlan]);
+        return await finalizeSessionEntryMaintenancePlansAfterWriterReleaseBestEffort(
+          params.resolved,
+          [fenced.plan],
+          {
+            onEntryRemoved: () => {
+              removed = true;
+            },
+          },
+        );
       },
     });
-    if (retargeted) {
-      skipSessionKeys.add(victim.sessionKey);
-      usage = await measureSessionPhysicalDiskUsage(params.storePath);
-      continue;
-    }
-    livePlanParams.database = openOpenClawAgentDatabase(databaseOptions);
     skipSessionKeys.add(victim.sessionKey);
-    if (!published || sqliteSessionNodeExists(livePlanParams.database, victim.sessionKey)) {
+    if (!published || !removed) {
       usage = await measureSessionPhysicalDiskUsage(params.storePath);
       continue;
     }
     removedEntries += 1;
     emitArchivedTranscriptUpdates(published.archivedTranscripts);
-    const reclaimed = await params.reclaimFreePages();
-    if (reclaimed === false) {
+    if (!(await params.reclaimFreePages())) {
       break;
     }
     usage = await measureSessionPhysicalDiskUsage(params.storePath);
@@ -543,7 +142,6 @@ export async function reclaimSqliteLiveSessionEntriesToHighWater(params: {
         break;
       }
     }
-    livePlanParams.database = openOpenClawAgentDatabase(databaseOptions);
   }
   return { removedEntries, removedFiles, usage };
 }

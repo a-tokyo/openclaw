@@ -328,7 +328,7 @@ export function planSessionStateAfterEntryRemoval(params: {
 
 /** Ids of every persisted generation owned by the given logical session keys. */
 export function readSessionGenerationIdsForKeys(
-  database: OpenClawAgentDatabase,
+  database: Pick<OpenClawAgentDatabase, "db">,
   keys: Iterable<string>,
   options: { exactStoredKeys?: boolean } = {},
 ): string[] {

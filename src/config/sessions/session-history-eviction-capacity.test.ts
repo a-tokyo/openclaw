@@ -27,6 +27,7 @@ import {
 } from "./session-history-eviction.js";
 import { resolveSqliteTargetFromSessionStorePath } from "./session-sqlite-target.js";
 import { registerSessionMaintenancePreserveKeysProvider } from "./store-maintenance-preserve.js";
+import { resolveMaintenanceConfigFromInput } from "./store-maintenance.js";
 
 describe("SQLite live-node disk budget eviction", () => {
   let testState: OpenClawTestState;
@@ -100,6 +101,7 @@ describe("SQLite live-node disk budget eviction", () => {
       const before = await measureSessionPhysicalDiskUsage(storePath);
       const maintenance = {
         maxDiskBytes: before.totalBytes - 1,
+        maxDiskBytesExplicit: true,
         highWaterBytes: Math.max(1, before.totalBytes - 1),
       };
       const inspected = await inspectSqliteSessionHistoryDiskBudget({
@@ -163,6 +165,7 @@ describe("SQLite live-node disk budget eviction", () => {
       const before = await measureSessionPhysicalDiskUsage(storePath);
       const maintenance = {
         maxDiskBytes: before.totalBytes - 1,
+        maxDiskBytesExplicit: true,
         highWaterBytes: Math.max(1, before.totalBytes - 1),
       };
       const inspected = await inspectSqliteSessionHistoryDiskBudget({
@@ -224,6 +227,7 @@ describe("SQLite live-node disk budget eviction", () => {
     const before = await measureSessionPhysicalDiskUsage(storePath);
     const maintenance = {
       maxDiskBytes: before.totalBytes - 1,
+      maxDiskBytesExplicit: true,
       highWaterBytes: Math.max(1, before.totalBytes - 1),
       preserveRecentMs: 7 * dayMs,
     };
@@ -291,6 +295,7 @@ describe("SQLite live-node disk budget eviction", () => {
         mode: "enforce",
         maintenance: {
           maxDiskBytes: before.totalBytes - 1,
+          maxDiskBytesExplicit: true,
           highWaterBytes: Math.max(1, before.totalBytes - 1),
         },
       });
@@ -338,12 +343,59 @@ describe("SQLite live-node disk budget eviction", () => {
       mode: "enforce",
       maintenance: {
         maxDiskBytes: before.totalBytes - 1,
+        maxDiskBytesExplicit: true,
         highWaterBytes: Math.max(1, before.totalBytes - 1),
       },
     });
     expect(result?.removedEntries).toBe(1);
     expect(sessionNodeExists(oldestKey)).toBe(false);
     expect(sessionNodeExists(newerKey)).toBe(true);
+  });
+
+  it("keeps idle durable live nodes under the default disk budget", async () => {
+    const threadKey = "agent:main:slack:channel:c14:thread:14";
+    await replaceSessionEntry(
+      { sessionKey: threadKey, storePath },
+      { sessionId: "default-budget-thread", updatedAt: 5 },
+    );
+    await appendTranscriptMessage(
+      { sessionId: "default-budget-thread", sessionKey: threadKey, storePath },
+      { message: { role: "user", content: "idle " + "x".repeat(64 * 1024) } },
+    );
+    settlePhysicalUsage();
+    const before = await measureSessionPhysicalDiskUsage(storePath);
+    const maintenance = {
+      maxDiskBytes: before.totalBytes - 1,
+      highWaterBytes: Math.max(1, before.totalBytes - 1),
+    };
+    const inspected = await inspectSqliteSessionHistoryDiskBudget({
+      storePath,
+      mode: "enforce",
+      maintenance,
+    });
+    const result = await enforceSqliteSessionHistoryDiskBudget({
+      storePath,
+      mode: "enforce",
+      maintenance,
+    });
+
+    expect(inspected.wouldMutate).toBe(false);
+    expect(result?.removedEntries ?? 0).toBe(0);
+    expect(sessionNodeExists(threadKey)).toBe(true);
+    expect(sessionExists("default-budget-thread")).toBe(true);
+  });
+
+  it("marks only an operator-set budget as explicit", () => {
+    expect(resolveMaintenanceConfigFromInput().maxDiskBytesExplicit).toBe(false);
+    expect(resolveMaintenanceConfigFromInput({ maxDiskBytes: "400mb" }).maxDiskBytesExplicit).toBe(
+      true,
+    );
+    expect(resolveMaintenanceConfigFromInput({ maxDiskBytes: false }).maxDiskBytesExplicit).toBe(
+      false,
+    );
+    expect(resolveMaintenanceConfigFromInput({ maxDiskBytes: "big" }).maxDiskBytesExplicit).toBe(
+      false,
+    );
   });
 
   it("does not wipe live durables when highWaterBytes is 0", async () => {
@@ -373,6 +425,7 @@ describe("SQLite live-node disk budget eviction", () => {
       mode: "enforce",
       maintenance: {
         maxDiskBytes: before.totalBytes - 1,
+        maxDiskBytesExplicit: true,
         highWaterBytes: 0,
       },
     });

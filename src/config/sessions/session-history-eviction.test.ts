@@ -960,6 +960,7 @@ describe("SQLite historical session disk budget", () => {
         mode: "enforce",
         maintenance: {
           maxDiskBytes: before.totalBytes - 1,
+          maxDiskBytesExplicit: true,
           highWaterBytes: Math.max(1, before.totalBytes - 32 * 1024),
         },
       });
