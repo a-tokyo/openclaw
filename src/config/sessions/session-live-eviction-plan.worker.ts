@@ -62,7 +62,7 @@ function isDurableConversationSessionKey(
 
 function emptyLiveEntryPlan(): SessionEntryMaintenancePlan {
   return {
-    archivedSessionKeys: [],
+    archivedEntries: [],
     entryRemovals: [],
     stateDeletePlans: [],
     archived: 0,
