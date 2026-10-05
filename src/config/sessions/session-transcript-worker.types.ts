@@ -81,6 +81,7 @@ import type {
 import type { SessionEntrySnapshotField } from "./session-entry-snapshots.js";
 import type { PublishedSessionTranscriptArchive } from "./session-history-archive-pruning.types.js";
 import type * as EvictionWorker from "./session-history-eviction-worker.types.js";
+import type { SessionContextMessagesWorkerInput } from "./session-history-read.types.js";
 import type {
   ChatHistoryDisplayRequest,
   ChatHistoryDisplayResult,
@@ -464,6 +465,7 @@ export type SessionTranscriptWorkerInput =
   | SessionSqliteTargetWorkerInput
   | SessionHistoryWorkerInput
   | SessionModelContextWorkerInput
+  | SessionContextMessagesWorkerInput
   | SessionEntryWorkerInput
   | SessionResetRecallWorkerInput
   | SessionBranchSummaryWorkerInput;
@@ -567,6 +569,7 @@ export type SessionTranscriptWorkerValues = SessionTranscriptInventoryWorkerValu
   };
   "usage-cache": SessionCostUsageCacheReadResult;
   "model-context": ReturnType<typeof readSessionTranscriptModelContext>;
+  "context-messages": import("./session-history-read.types.js").SessionTranscriptContextSnapshot;
   "session-reset-recall": {
     cutoff: import("../../../packages/memory-host-sdk/src/host/session-reset-recall.js").SessionResetRecallCutoff;
   };
