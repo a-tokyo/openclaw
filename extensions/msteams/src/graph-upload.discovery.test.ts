@@ -1,3 +1,4 @@
+import { withFetchPreconnect } from "openclaw/plugin-sdk/test-env";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { resolveUploadSiteId } from "./graph-upload.js";
 import { MSTEAMS_REQUEST_TIMEOUT_MS } from "./request-timeout.js";
@@ -18,6 +19,10 @@ type GraphRoute = {
   includes: string;
   respond: (init?: RequestInit) => Response | Promise<Response>;
 };
+
+function stubGraphFetch(fetchFn: ReturnType<typeof vi.fn>) {
+  vi.stubGlobal("fetch", withFetchPreconnect(fetchFn));
+}
 
 function createGraphFetch(...routes: GraphRoute[]): ReturnType<typeof vi.fn> {
   return vi.fn(async (url: string, init?: RequestInit) => {
@@ -100,6 +105,7 @@ function expectMSTeamsTimeout(promise: Promise<unknown>, label: string, timeoutM
 describe("resolveUploadSiteId dynamic resolution", () => {
   afterEach(() => {
     vi.useRealTimers();
+    vi.unstubAllGlobals();
     tokenProvider.getAccessToken.mockClear();
   });
 
@@ -122,12 +128,12 @@ describe("resolveUploadSiteId dynamic resolution", () => {
       fixedGraphRoute("/sites/root", { id: "site-discovered" }),
     );
 
+    stubGraphFetch(fetchFn);
     const result = await resolveUploadSiteId({
       teamId: "19:team-cold@thread.skype",
       channelId: "19:channel-cold@thread.tacv2",
       tokenProvider,
       getTeamDetails,
-      fetchFn: fetchFn as unknown as typeof fetch,
     });
 
     expect(result).toBe("site-discovered");
@@ -139,13 +145,13 @@ describe("resolveUploadSiteId dynamic resolution", () => {
       fixedGraphRoute("membershipType", { membershipType: "private" }),
     );
 
+    stubGraphFetch(fetchFn);
     await expect(
       resolveUploadSiteId({
         teamId: "19:team-private@thread.skype",
         channelId: "19:private@thread.tacv2",
         tokenProvider,
         getTeamDetails: async () => ({ aadGroupId: "group-private" }),
-        fetchFn: fetchFn as unknown as typeof fetch,
       }),
     ).rejects.toThrow("standard channels only");
     expect(fetchFn.mock.calls.some(([url]) => String(url).includes("/sites/root"))).toBe(false);
@@ -160,13 +166,13 @@ describe("resolveUploadSiteId dynamic resolution", () => {
       fixedGraphRoute("/sites/root", { id: "site-should-not-load" }),
     );
 
+    stubGraphFetch(fetchFn);
     await expect(
       resolveUploadSiteId({
         teamId: "19:team-revoked@thread.skype",
         channelId: "19:channel-revoked@thread.tacv2",
         tokenProvider,
         getTeamDetails,
-        fetchFn: fetchFn as unknown as typeof fetch,
         ...authority.handoff,
       }),
     ).rejects.toMatchObject({ cause: authority.error });
@@ -186,13 +192,13 @@ describe("resolveUploadSiteId dynamic resolution", () => {
       fixedGraphRoute("/sites/root", { id: "site-should-not-load" }),
     );
 
+    stubGraphFetch(fetchFn);
     await expect(
       resolveUploadSiteId({
         teamId: "19:team-after-lookup@thread.skype",
         channelId: "19:channel-after-lookup@thread.tacv2",
         tokenProvider,
         getTeamDetails,
-        fetchFn: fetchFn as unknown as typeof fetch,
         ...authority.handoff,
       }),
     ).rejects.toMatchObject({ cause: authority.error });
@@ -216,13 +222,13 @@ describe("resolveUploadSiteId dynamic resolution", () => {
       fixedGraphRoute("/sites/root", { id: "site-should-not-load" }),
     );
 
+    stubGraphFetch(fetchFn);
     await expect(
       resolveUploadSiteId({
         teamId: "19:team-after-membership@thread.skype",
         channelId: "19:channel-after-membership@thread.tacv2",
         tokenProvider,
         getTeamDetails: async () => ({ aadGroupId: "group-standard" }),
-        fetchFn: fetchFn as unknown as typeof fetch,
         ...authority.handoff,
       }),
     ).rejects.toMatchObject({ cause: authority.error });
@@ -234,13 +240,13 @@ describe("resolveUploadSiteId dynamic resolution", () => {
     const fetchFn = createGraphFetch();
     const getTeamDetails = vi.fn(async () => ({ aadGroupId: "unused" }));
 
+    stubGraphFetch(fetchFn);
     const result = await resolveUploadSiteId({
       configuredSiteId: "explicit-site",
       teamId: "19:team@thread.skype",
       channelId: "19:private@thread.tacv2",
       tokenProvider,
       getTeamDetails,
-      fetchFn: fetchFn as unknown as typeof fetch,
     });
 
     expect(result).toBe("explicit-site");
@@ -254,12 +260,12 @@ describe("resolveUploadSiteId dynamic resolution", () => {
       fixedGraphRoute("membershipType", { membershipType: "standard" }),
       hangingGraphRoute("/sites/root"),
     );
+    stubGraphFetch(fetchFn);
     const discovery = resolveUploadSiteId({
       teamId: "19:team-hang@thread.skype",
       channelId: "19:channel-hang@thread.tacv2",
       tokenProvider,
       getTeamDetails: async () => ({ aadGroupId: "group-hang" }),
-      fetchFn: fetchFn as unknown as typeof fetch,
     });
 
     await vi.advanceTimersByTimeAsync(0);
