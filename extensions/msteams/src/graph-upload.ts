@@ -33,7 +33,6 @@ export async function resolveUploadSiteId(
     channelId?: string;
     tokenProvider: MSTeamsAccessTokenProvider;
     getTeamDetails?: (teamId: string) => Promise<{ aadGroupId?: string }>;
-    fetchFn?: typeof fetch;
   } & MSTeamsSendHandoff,
 ): Promise<string> {
   if (params.configuredSiteId !== undefined) {
@@ -69,14 +68,12 @@ export async function resolveUploadSiteId(
       groupId,
       channelId: params.channelId,
       tokenProvider: params.tokenProvider,
-      fetchFn: params.fetchFn,
       ...handoff,
     });
   }
   return await resolveTeamSiteId({
     groupId,
     tokenProvider: params.tokenProvider,
-    fetchFn: params.fetchFn,
     ...handoff,
   });
 }
@@ -194,7 +191,6 @@ async function assertStandardChannelForAutoUpload(
     groupId: string;
     channelId: string;
     tokenProvider: MSTeamsAccessTokenProvider;
-    fetchFn?: typeof fetch;
   } & MSTeamsSendHandoff,
 ): Promise<void> {
   const data = await requestSharePointJson<{ membershipType?: string }>(params, {
