@@ -4,7 +4,6 @@ import {
   resolveSessionWorkStartError,
   type InternalSessionEntry as SessionEntry,
 } from "../../config/sessions.js";
-import { buildRestartRecoveryClaimCleanupPatch } from "../../config/sessions/restart-recovery-state.js";
 import {
   listSessionEntriesByStatus,
   loadExactSessionEntry,
@@ -22,6 +21,7 @@ import {
 import { resolveExecDefaults } from "../exec-defaults.js";
 import type { MainSessionRecoveryAdmission } from "./main-session-recovery-admission.js";
 import type { MainSessionRecoveryCapacity } from "./main-session-recovery-capacity.js";
+import { buildMainSessionRecoverySettlementPatch } from "./main-session-recovery-clear.js";
 import { createCurrentProcessOwnerLookup } from "./main-session-recovery-live-owners.js";
 import {
   getMainSessionRecoveryRetryCount,
@@ -108,11 +108,10 @@ async function completePendingFinalRecoveryWithNotice(
       const pending = current.pendingFinalDelivery;
       completed = true;
       return {
-        ...buildRestartRecoveryClaimCleanupPatch({
+        ...buildMainSessionRecoverySettlementPatch({
           entry: current,
           recordTerminalSource: true,
         }),
-        abortedLastRun: false,
         endedAt,
         lifecycleRunId: undefined,
         lastRunId: resolveRestartRecoveryTerminalClientRunId(current),
@@ -131,7 +130,6 @@ async function completePendingFinalRecoveryWithNotice(
               },
             }
           : {}),
-        restartRecoveryRuns: undefined,
         runtimeMs:
           typeof current.startedAt === "number"
             ? Math.max(0, endedAt - current.startedAt)
@@ -168,11 +166,31 @@ export function loadExpectedRestartRecoveryTarget(params: {
     : undefined;
 }
 
+export type MainSessionRecoverySkipReason =
+  | "stopped"
+  | "not_main_session"
+  | "work_start_blocked"
+  | "dispatch_target_unavailable"
+  | "live_owner"
+  | "already_handled"
+  | "state_changed"
+  | "inactive"
+  | "blocked"
+  | "tombstoned"
+  | "exhausted"
+  | "message_action_authority_unavailable"
+  | "observation_only"
+  | "pending_delivery"
+  | "invalid_harness_completion"
+  | "delegated_authority_unavailable"
+  | "dispatch_skipped";
+
 export async function recoverStore(params: {
   storeAgentId?: string;
   cfg?: OpenClawConfig;
   observationOnly?: boolean;
   onExhaustedTarget?: (target: ExhaustedRestartRecoveryTarget) => void;
+  onSkipped?: (reason: MainSessionRecoverySkipReason) => void;
   storePath: string;
   stateDir?: string;
   handledSessionKeys: Set<string>;
@@ -186,12 +204,16 @@ export async function recoverStore(params: {
   gatewayRuntime: GatewayRecoveryRuntime;
 }): Promise<{ started: number; settled: number; failed: number; skipped: number }> {
   const result = { started: 0, settled: 0, failed: 0, skipped: 0 };
+  const recordSkip = (reason: MainSessionRecoverySkipReason) => {
+    result.skipped++;
+    params.onSkipped?.(reason);
+  };
   const shouldContinue = () => params.shouldContinue?.() !== false;
   const stopped = () => {
     if (shouldContinue()) {
       return false;
     }
-    result.skipped++;
+    recordSkip("stopped");
     return true;
   };
   const hasCurrentProcessOwner = createCurrentProcessOwnerLookup(params);
@@ -218,6 +240,12 @@ export async function recoverStore(params: {
   for (const { sessionKey, entry: loadedEntry } of entries.toSorted((a, b) =>
     a.sessionKey.localeCompare(b.sessionKey),
   )) {
+    const skip = (reason: MainSessionRecoverySkipReason) => {
+      recordSkip(reason);
+      mainSessionRecoveryLog.info(
+        `skipped interrupted main session: ${sessionKey} reason=${reason}`,
+      );
+    };
     if (stopped()) {
       return result;
     }
@@ -229,11 +257,11 @@ export async function recoverStore(params: {
       continue;
     }
     if (!isMainRestartRecoveryCandidate(entry, sessionKey)) {
-      result.skipped++;
+      skip("not_main_session");
       continue;
     }
     if (resolveSessionWorkStartError(sessionKey, entry)) {
-      result.skipped++;
+      skip("work_start_blocked");
       continue;
     }
     const dispatchTarget = resolveRestartRecoveryDispatchTarget({
@@ -244,7 +272,7 @@ export async function recoverStore(params: {
       storePath: params.storePath,
     });
     if (!dispatchTarget) {
-      result.skipped++;
+      skip("dispatch_target_unavailable");
       continue;
     }
     const agentId = dispatchTarget.agentId;
@@ -252,12 +280,12 @@ export async function recoverStore(params: {
     const dispatchSessionKey =
       params.expectedTarget?.canonicalSessionKey ?? dispatchTarget.sessionKey;
     if (hasCurrentProcessOwner(entry, sessionKey)) {
-      result.skipped++;
+      skip("live_owner");
       continue;
     }
     const resumeDedupeKey = JSON.stringify([agentId, dispatchSessionKey]);
     if (params.handledSessionKeys.has(resumeDedupeKey)) {
-      result.skipped++;
+      skip("already_handled");
       continue;
     }
 
@@ -276,7 +304,7 @@ export async function recoverStore(params: {
       target,
     });
     if (!observed.entry || observed.transition.kind !== "observed") {
-      result.skipped++;
+      skip("state_changed");
       continue;
     }
     if (stopped()) {
@@ -289,7 +317,7 @@ export async function recoverStore(params: {
       recoveryView.status === "blocked" ||
       recoveryView.status === "tombstoned"
     ) {
-      result.skipped++;
+      skip(recoveryView.status);
       continue;
     }
     if (
@@ -312,11 +340,19 @@ export async function recoverStore(params: {
             ? recoveryView.reason
             : "message-tool-only recovery authority is unavailable",
       });
-      result[tombstone === "notice_failed" ? "failed" : "skipped"]++;
+      if (tombstone === "notice_failed") {
+        result.failed++;
+      } else {
+        skip(
+          recoveryView.status === "exhausted"
+            ? "exhausted"
+            : "message_action_authority_unavailable",
+        );
+      }
       continue;
     }
     if (params.observationOnly) {
-      result.skipped++;
+      skip("observation_only");
       continue;
     }
     const expectedRecoverySourceRunId = normalizeOptionalString(
@@ -332,7 +368,7 @@ export async function recoverStore(params: {
     if (pendingAction === "defer") {
       // The exact durable queue owner is still responsible for settlement.
       // Dispatching a second recovery turn would duplicate that delivery.
-      result.skipped++;
+      skip("pending_delivery");
       continue;
     }
     if (pendingAction === "complete") {
@@ -343,15 +379,21 @@ export async function recoverStore(params: {
         pendingFinalDeliveryIntentId: entry.pendingFinalDelivery?.intentId,
         reason: "delivered-terminal-receipt",
       });
-      result[completion.outcome === "completed" ? "settled" : "skipped"]++;
       if (completion.outcome === "completed") {
+        result.settled++;
         params.handledSessionKeys.add(resumeDedupeKey);
+      } else {
+        skip("state_changed");
       }
       continue;
     }
     if (pendingAction === "notice") {
       const completed = await completePendingFinalRecoveryWithNotice(entry, target);
-      result[completed ? "settled" : "skipped"]++;
+      if (completed) {
+        result.settled++;
+      } else {
+        skip("state_changed");
+      }
       continue;
     }
     const harnessCompletion = entry.restartRecoveryHarnessCompletion;
@@ -402,14 +444,14 @@ export async function recoverStore(params: {
       });
       if (reconciliation.outcome === "reconciled") {
         params.handledSessionKeys.add(resumeDedupeKey);
-        result.skipped++;
+        skip("invalid_harness_completion");
       } else if (
         reconciliation.entry?.status === "running" &&
         reconciliation.entry.abortedLastRun === true
       ) {
         result.failed++;
       } else {
-        result.skipped++;
+        skip("state_changed");
       }
       continue;
     }
@@ -472,7 +514,11 @@ export async function recoverStore(params: {
         observation: recoveryView.observation,
         reason: "delegated recovery sender authority is unavailable",
       });
-      result[tombstone === "notice_failed" ? "failed" : "skipped"]++;
+      if (tombstone === "notice_failed") {
+        result.failed++;
+      } else {
+        skip("delegated_authority_unavailable");
+      }
       continue;
     }
 
@@ -523,7 +569,7 @@ export async function recoverStore(params: {
           continue;
         }
         if (completion.outcome === "changed") {
-          result.skipped++;
+          skip("state_changed");
           continue;
         }
         resumeOptions = { forceRestartSafeTools: true };
@@ -551,7 +597,11 @@ export async function recoverStore(params: {
       recoveryCapacity: params.recoveryCapacity,
       shouldContinue: params.shouldContinue,
     });
-    result[resumeResult]++;
+    if (resumeResult === "skipped") {
+      skip("dispatch_skipped");
+    } else {
+      result[resumeResult]++;
+    }
     if (resumeResult === "started" || resumeResult === "settled") {
       params.handledSessionKeys.add(resumeDedupeKey);
     } else if (resumeResult === "failed") {

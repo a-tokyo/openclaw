@@ -30,6 +30,7 @@ import type {
   ReplySessionInitializationCommitResult,
 } from "./session-accessor.types.js";
 import { assertCanonicalSqliteSessionKeysCurrent } from "./session-canonical-key.js";
+import { SessionMaintenancePreservationConflictError } from "./session-mutation-conflict-error.js";
 import { resolveReplySessionInitializationUpserts } from "./session-reset-entry.js";
 import type { ReplySessionInitializationUpsertDescriptor } from "./session-reset.types.js";
 import { resolveSessionStorePathForScope } from "./session-store-path.js";
@@ -142,12 +143,44 @@ async function loadReplySessionInitializationEntriesAsync(
   });
 }
 
-/** Loads the declared reply-session rows without exposing a mutable store. */
-export function loadReplySessionInitializationSnapshot(
+function captureReplySessionInitializationSource(params: ReplySessionInitializationSelection) {
+  const captured = captureLifecycleDatabaseScope(resolveSqliteScope(params));
+  const source = supportsOpenClawAgentDatabaseExecution(toDatabaseOptions(captured))
+    ? readDatabasePathIdentitySync(captured.path)
+    : undefined;
+  const database = { ...toDatabaseOptions(captured), path: source?.canonicalPath ?? captured.path };
+  const assertSourceCurrent = (creating = false) => {
+    if (!source) {
+      return;
+    }
+    const current = readDatabasePathIdentitySync(captured.path);
+    if (
+      current.canonicalPath !== source.canonicalPath ||
+      ((!creating || source.key.startsWith("file:")) &&
+        (current.key !== source.key || current.birthtime !== source.birthtime))
+    ) {
+      throw new Error("Reply initialization database changed after its snapshot");
+    }
+  };
+  return { captured, database, source, assertSourceCurrent };
+}
+
+/** Prepares the declared reply rows and stored model parent through their existing reader. */
+export async function loadReplySessionInitializationSnapshot(
   params: ReplySessionInitializationSelection,
-): ReplySessionInitializationSnapshot {
+): Promise<ReplySessionInitializationSnapshot> {
+  assertSessionInitializationAgentScope(params.agentId, params.sessionKey);
   const storePath = resolveSessionStorePathForScope(params);
-  const store = loadReplySessionInitializationEntries({ ...params, storePath });
+  const { database, source, assertSourceCurrent } = captureReplySessionInitializationSource({
+    ...params,
+    storePath,
+  });
+  const store = await loadReplySessionInitializationEntriesAsync(
+    { ...params, storePath },
+    database,
+    source,
+  );
+  assertSourceCurrent();
   const resolved = resolveSessionEntryFromStore({ store, sessionKey: params.sessionKey });
   const currentEntry = resolved.existing ? { ...resolved.existing } : undefined;
   return {
@@ -201,24 +234,11 @@ export async function commitReplySessionInitialization(params: {
     sessionKey: params.sessionKey,
     storePath: params.storePath,
   });
-  const captured = captureLifecycleDatabaseScope(resolveSqliteScope({ ...params, storePath }));
-  const source = supportsOpenClawAgentDatabaseExecution(toDatabaseOptions(captured))
-    ? readDatabasePathIdentitySync(captured.path)
-    : undefined;
-  const database = { ...toDatabaseOptions(captured), path: source?.canonicalPath ?? captured.path };
-  const assertSourceCurrent = (creating = false) => {
-    if (!source) {
-      return;
-    }
-    const current = readDatabasePathIdentitySync(captured.path);
-    if (
-      current.canonicalPath !== source.canonicalPath ||
-      ((!creating || source.key.startsWith("file:")) &&
-        (current.key !== source.key || current.birthtime !== source.birthtime))
-    ) {
-      throw new Error("Reply initialization database changed after its snapshot");
-    }
-  };
+  const { captured, database, source, assertSourceCurrent } =
+    captureReplySessionInitializationSource({
+      ...params,
+      storePath,
+    });
   const store = await loadReplySessionInitializationEntriesAsync(
     { ...params, storePath },
     database,
@@ -301,22 +321,23 @@ export async function commitReplySessionInitialization(params: {
     await applySessionEntryLifecycleMutation(mutation, { ...captured, path: database.path });
   } catch (error) {
     if (
-      !(error instanceof SessionEntryLifecycleUpsertConflictError) ||
-      error.sessionKey !== resolved.normalizedKey
+      !(error instanceof SessionMaintenancePreservationConflictError) &&
+      (!(error instanceof SessionEntryLifecycleUpsertConflictError) ||
+        error.sessionKey !== resolved.normalizedKey)
     ) {
       throw error;
     }
     const current = await loadReplySessionInitializationEntriesAsync(
       {
         agentId: params.agentId,
-        sessionKey: error.sessionKey,
+        sessionKey: resolved.normalizedKey,
         storePath,
       },
       database,
       source?.key.startsWith("file:") ? source : undefined,
     );
     assertSourceCurrent(true);
-    return createStaleReplySessionInitializationResult(current[error.sessionKey]);
+    return createStaleReplySessionInitializationResult(current[resolved.normalizedKey]);
   }
   if (staleCommit !== undefined) {
     return createStaleReplySessionInitializationResult(staleCommit ?? undefined);
