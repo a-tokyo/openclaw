@@ -33,13 +33,6 @@ type TrajectoryRuntimeInit = {
   workspaceDir?: string;
 };
 
-type TrajectoryRuntimeRecorder = {
-  enabled: true;
-  recordEvent: (type: string, data?: Record<string, unknown>) => void;
-  flush: () => Promise<void>;
-  describeFlushState: () => string | undefined;
-};
-
 const TRAJECTORY_RUNTIME_DATA_STRING_MAX_CHARS = 32_768;
 const TRAJECTORY_RUNTIME_DATA_ARRAY_MAX_ITEMS = 64;
 const TRAJECTORY_RUNTIME_DATA_OBJECT_MAX_KEYS = 64;
@@ -218,25 +211,21 @@ function limitTrajectoryPayloadValue(
 
 function sanitizeTrajectoryPayload(data: Record<string, unknown>): Record<string, unknown> {
   const finalPromptText = data.finalPromptText;
-  const redactedFinalPromptText =
-    typeof finalPromptText === "string" ? (redactSecrets(finalPromptText) as string) : undefined;
-  const boundedData =
-    typeof finalPromptText === "string" &&
-    typeof redactedFinalPromptText === "string" &&
-    (Buffer.byteLength(finalPromptText, "utf8") > TRAJECTORY_RUNTIME_FINAL_PROMPT_MAX_BYTES ||
-      Buffer.byteLength(redactedFinalPromptText, "utf8") >
-        TRAJECTORY_RUNTIME_FINAL_PROMPT_MAX_BYTES)
-      ? {
-          ...data,
-          finalPromptText: truncateUtf8Prefix(
-            redactedFinalPromptText,
-            TRAJECTORY_RUNTIME_FINAL_PROMPT_MAX_BYTES,
-          ),
-          finalPromptTextOriginalLength: finalPromptText.length,
-        }
-      : typeof redactedFinalPromptText === "string"
-        ? { ...data, finalPromptText: redactedFinalPromptText }
-        : data;
+  let boundedData = data;
+  if (typeof finalPromptText === "string") {
+    const redactedFinalPromptText = redactSecrets(finalPromptText);
+    boundedData = { ...data, finalPromptText: redactedFinalPromptText };
+    if (
+      Buffer.byteLength(finalPromptText, "utf8") > TRAJECTORY_RUNTIME_FINAL_PROMPT_MAX_BYTES ||
+      Buffer.byteLength(redactedFinalPromptText, "utf8") > TRAJECTORY_RUNTIME_FINAL_PROMPT_MAX_BYTES
+    ) {
+      boundedData.finalPromptText = truncateUtf8Prefix(
+        redactedFinalPromptText,
+        TRAJECTORY_RUNTIME_FINAL_PROMPT_MAX_BYTES,
+      );
+      boundedData.finalPromptTextOriginalLength = finalPromptText.length;
+    }
+  }
   return redactSecrets(
     sanitizeDiagnosticPayload(limitTrajectoryPayloadValue(boundedData)),
   ) as Record<string, unknown>;
@@ -328,9 +317,7 @@ export function toTrajectoryToolDefinitions(
     .toSorted((left, right) => left.name.localeCompare(right.name));
 }
 
-export async function createTrajectoryRuntimeRecorder(
-  input: TrajectoryRuntimeInit,
-): Promise<TrajectoryRuntimeRecorder | null> {
+export async function createTrajectoryRuntimeRecorder(input: TrajectoryRuntimeInit) {
   const params = {
     ...input,
     env: { ...(input.env ?? process.env) },
@@ -364,8 +351,8 @@ export async function createTrajectoryRuntimeRecorder(
   let seq = 0;
 
   return {
-    enabled: true,
-    recordEvent: (type, data) => {
+    enabled: true as const,
+    recordEvent: (type: string, data?: Record<string, unknown>) => {
       const nextSeq = seq + 1;
       const event: TrajectoryEvent = {
         traceSchema: "openclaw-trajectory",

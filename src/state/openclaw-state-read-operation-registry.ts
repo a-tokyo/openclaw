@@ -1,7 +1,8 @@
 import type { DatabaseSync } from "node:sqlite";
 import type { configHealthReadOperations } from "../config/io.health-state.kernel.js";
 import type { MentionReadOperations } from "../gateway/mention-inbox.worker-contract.js";
-import type { deferredPluginMigrationReadOperations } from "../infra/deferred-plugin-migrations.js";
+import type { localWorkspaceReadOperations } from "../gateway/worker-environments/local-workspace-store.kernel.js";
+import type { DeferredPluginMigrationReadOperations } from "../infra/deferred-plugin-migrations.contract.js";
 import type { RestartSentinelReadOperations } from "../infra/restart-sentinel.read.worker-contract.js";
 import type { DiagnosticReadOperations } from "../infra/sqlite-audit-record.read-contract.js";
 import type { SqliteWorkerCommand } from "../infra/sqlite-worker-contract.js";
@@ -15,7 +16,8 @@ import {
   type WorkerOperations,
 } from "./worker-operation-registry.js";
 
-type Operations = DiagnosticReadOperations &
+type Operations = WorkerOperations<typeof localWorkspaceReadOperations> &
+  DiagnosticReadOperations &
   GeneratedHtmlProvenanceReadOperations &
   PairingReadOperations &
   MentionReadOperations &
@@ -24,11 +26,15 @@ type Operations = DiagnosticReadOperations &
   SessionStateReadOperations &
   SecretStoreReadOperations &
   WorkerOperations<typeof configHealthReadOperations> &
-  WorkerOperations<typeof deferredPluginMigrationReadOperations>;
+  DeferredPluginMigrationReadOperations;
 export type RegisteredStateReadCommand = SqliteWorkerCommand<Operations>;
 export type RegisteredStateReadResult = Operations[keyof Operations]["output"];
 
 export const stateReadRegistry = createWorkerOperationRegistry<Operations, DatabaseSync>({
+  localWorkspace: () =>
+    import("../gateway/worker-environments/local-workspace-store.kernel.js").then(
+      (m) => m.localWorkspaceReadOperations,
+    ),
   config: () =>
     import("../config/io.health-state.kernel.js").then((m) => m.configHealthReadOperations),
   plugins: () =>

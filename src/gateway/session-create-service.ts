@@ -132,7 +132,6 @@ export async function createGatewaySession(
   }
   // Fresh account authority covers title generation and resource preparation,
   // not just the final row. An inherited parent pin is not a new selection.
-  let selectedDefaultProfile: string | undefined;
   let validateRuntimeSelection: (() => ErrorShape | undefined) | undefined;
   const commitGuard =
     personalModelSelection ||
@@ -158,8 +157,6 @@ export async function createGatewaySession(
             personalModelSelection,
             personalAccountDefaults,
           ],
-          personalAccountDefaults,
-          readDefaultProfile: () => selectedDefaultProfile,
           validateSelection: () => validateRuntimeSelection?.(),
         })
       : params.commitGuard;
@@ -985,7 +982,6 @@ export async function createGatewaySession(
             }
             validateAccountModel = account.validate;
             validateRuntimeSelection = account.validate;
-            selectedDefaultProfile = account.profileId;
             commitGuard?.();
             if (account.profileId) {
               // Pin before the first turn; later default changes must not claim this session.
@@ -1005,6 +1001,8 @@ export async function createGatewaySession(
           },
           entry,
           catalog: preparedModelCatalog?.entries,
+          // Thinking policy was already validated by the patch owner; create discards hydration.
+          hydrateThinkingCatalog: false,
           validateModelSelection:
             validateAccountModel ?? patched.validateModelSelection ?? modelSelection.validate,
           ...(params.agentRuntime !== undefined || params.model !== undefined
@@ -1023,8 +1021,7 @@ export async function createGatewaySession(
         if (params.fork !== true) {
           return { ...patched, entry };
         }
-        const forkParentSessionKey = canonicalParentSessionKey;
-        if (!forkParentSessionKey || !currentParentSessionEntry || !parentSessionTarget) {
+        if (!canonicalParentSessionKey || !currentParentSessionEntry || !parentSessionTarget) {
           return {
             ok: false,
             error: errorShape(ErrorCodes.UNAVAILABLE, "failed to resolve parent session for fork"),
@@ -1051,7 +1048,7 @@ export async function createGatewaySession(
                   },
                 }
               : {}),
-            parentSessionKey: forkParentSessionKey,
+            parentSessionKey: canonicalParentSessionKey,
             sessionKey: target.canonicalKey,
             storePath: parentSessionTarget.storePath,
             ...(forkMaxTokens ? { maxTokens: forkMaxTokens } : {}),
@@ -1086,7 +1083,7 @@ export async function createGatewaySession(
             entry,
             forkResult.transcript,
             {
-              sessionKey: forkParentSessionKey,
+              sessionKey: canonicalParentSessionKey,
               entry: currentParentSessionEntry,
             },
             existingEntry,

@@ -17,7 +17,7 @@ import { hasProviderOwnedSession } from "../../config/sessions/entry-freshness.j
 import { resolveGroupSessionKey } from "../../config/sessions/group.js";
 import { resolveSessionLifecycleTimestampsAsync } from "../../config/sessions/lifecycle-read.js";
 import {
-  hasTerminalMainSessionTranscriptNewerThanRegistry,
+  hasTerminalMainSessionTranscriptNewerThanRegistrySync,
   isRestartRecoveryTombstone,
   resolveSessionWorkStartError,
 } from "../../config/sessions/lifecycle.js";
@@ -274,7 +274,6 @@ export async function resolveReplySessionPreprocessingState(
   };
 }
 
-/** Initializes or reuses the reply session state for one inbound turn. */
 export async function initSessionState(params: InitSessionStateParams): Promise<SessionInitResult> {
   prepareChannelParticipantObservation(params.ctx);
   return await runWithSessionInitConflictRetry(async () => await initSessionStateAttempt(params), {
@@ -678,14 +677,14 @@ async function initSessionStateAttemptLocked(
     : undefined;
   const terminalMainTranscriptNewerThanRegistry =
     !isSystemEvent &&
-    (await hasTerminalMainSessionTranscriptNewerThanRegistry({
+    hasTerminalMainSessionTranscriptNewerThanRegistrySync({
       entry,
       sessionScope,
       sessionKey,
       agentId,
       mainKey,
       storePath,
-    }));
+    });
   const recoverTerminalVisibleEntry =
     canReuseExistingEntry &&
     !isSystemEvent &&

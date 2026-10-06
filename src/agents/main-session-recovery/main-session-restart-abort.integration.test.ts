@@ -50,6 +50,7 @@ it.each(["before settlement", "after settlement", "persisted interruption"] as c
         storePath: path.join(state.sessionsDir(), "sessions.json"),
       };
       const admitted = buildRestartSafeChatTranscriptState({
+        sourceIngress: "control-ui",
         admission: { requestFingerprint: "synthetic-request" },
         clientRunId: runId,
         startedAt: 100,
@@ -161,7 +162,9 @@ it.each(["before settlement", "after settlement", "persisted interruption"] as c
             expect(dispatch).not.toHaveBeenCalled();
             expect(loadSessionEntry(target)?.restartRecoveryTerminalRunIds).toContain(runId);
             expect(info).toHaveBeenCalledWith(
-              "main-session restart recovery startup complete: started=0 settled=0 failed=0 skipped=1 skipReasons=live_owner:1",
+              expect.stringContaining(
+                "main-session restart recovery startup complete: started=0 settled=0 failed=0 skipped=1 skipReasons=live_owner:1",
+              ),
             );
           } finally {
             info.mockRestore();

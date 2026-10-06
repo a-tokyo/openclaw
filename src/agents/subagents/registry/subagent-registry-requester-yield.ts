@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from "node:util";
 import type { ProgressContinuationState } from "../../../channels/progress-continuation.js";
 import { captureOpenClawStateWorkerContext } from "../../../state/openclaw-state-worker-context.js";
 import type { AcceptedSessionSpawn } from "../../accepted-session-spawn.js";
@@ -20,6 +21,7 @@ import {
   isRequesterCompletionCohortCurrent,
   isRequesterYieldCohortMember,
   isRequesterSettleWakeForRun,
+  sameRequesterSettleBatch,
 } from "./subagent-requester-settle-identity.js";
 import {
   compareSubagentRunGeneration,
@@ -286,12 +288,7 @@ export async function markRequesterTurnYieldedInRuns(params: {
           params.requesterAgentId,
           requesterTurnRunId,
         );
-        if (
-          selected.length !== selectedEntries.length ||
-          selected.some(
-            (entry) => !selectedEntries.some((old) => isSameSubagentRunOwner(old, entry)),
-          )
-        ) {
+        if (!sameRequesterSettleBatch(selected, selectedEntries)) {
           throw new SubagentRegistryMutationRejectedError(
             "Requester yield membership changed before admission",
           );
@@ -381,7 +378,8 @@ export async function settleRequesterTurnAfterSessionSpawns(params: {
   }
 
   const childRunIds = new Set(selectedEntries.map((entry) => entry.runId));
-  const batchRunIds = [...childRunIds].toSorted();
+  const selectedBatchRunIds = [...childRunIds].toSorted();
+  let batchRunIds = selectedBatchRunIds;
   let rearmGeneration: number | undefined;
   let needsCohortRelease = false;
   let yieldedFinalDeliverable = false;
@@ -492,19 +490,27 @@ export async function settleRequesterTurnAfterSessionSpawns(params: {
           );
         });
       const preparedWake = firstEntry.requesterSettleWake;
+      const preparedBatchRunIds = preparedWake?.batchRunIds;
       const preparedCohort =
         params.requesterYielded &&
         !requesterAlreadyDeliveredFinal &&
         preparedWake?.requesterYieldBatch === true &&
         preparedWake.rearmGeneration !== undefined &&
+        preparedBatchRunIds !== undefined &&
+        isDeepStrictEqual(
+          preparedBatchRunIds.filter((runId) => params.runs.has(runId)),
+          selectedBatchRunIds,
+        ) &&
         entries.every((entry) => {
           const wake = entry.requesterSettleWake;
           return (
             wake?.status === "pending" &&
             wake.attemptCount === 0 &&
-            isRequesterYieldCohortMember(entry, batchRunIds, preparedWake.rearmGeneration)
+            isRequesterYieldCohortMember(entry, preparedBatchRunIds, preparedWake.rearmGeneration)
           );
         });
+      // Retirement removes obsolete rows, not the surviving wake's frozen identity.
+      batchRunIds = preparedCohort ? preparedBatchRunIds : selectedBatchRunIds;
       rearmGeneration = preparedCohort ? preparedWake.rearmGeneration : undefined;
       needsCohortRelease = params.requesterYielded && !requesterAlreadyDeliveredFinal;
       yieldedFinalDeliverable = preparedCohort

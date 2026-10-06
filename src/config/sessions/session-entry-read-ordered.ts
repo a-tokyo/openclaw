@@ -4,6 +4,7 @@ import { sessionChanges } from "../../sessions/session-row-changes.js";
 import { getOpenClawAgentDatabaseIfOpen } from "../../state/openclaw-agent-db.js";
 import { runOpenClawAgentWriteAdmissions } from "../../state/openclaw-agent-write-admission.js";
 import type { CanonicalSessionReaderContinuation } from "./session-canonical-key.js";
+import { SessionEntryChangedDuringReadError } from "./session-entry-read-errors.js";
 import { captureSessionEntryWorkerRequest } from "./session-entry-read-request.js";
 import type {
   PreparedSessionEntryWorkerRead,
@@ -27,7 +28,7 @@ type ReadSessionStore = <T>(
 export async function withOrderedSessionEntriesInWorker<T>(
   inputs: readonly SessionEntryWorkerRead[],
   consume: (reads: readonly PreparedSessionEntryWorkerRead[]) => T,
-  readStore: ReadSessionStore,
+  { readStore, onReadAdmitted }: { readStore: ReadSessionStore; onReadAdmitted?: () => void },
 ): Promise<T> {
   const selected: Array<{
     input: SessionEntryWorkerRead;
@@ -115,14 +116,16 @@ export async function withOrderedSessionEntriesInWorker<T>(
                   revision === undefined ||
                   readSqliteNativeMutationRevision(native.db) !== revision))
             ) {
-              throw new Error("Session entry changed during read");
+              throw new SessionEntryChangedDuringReadError();
             }
           }
           if (changed) {
-            throw new Error("Session entry changed during read");
+            throw new SessionEntryChangedDuringReadError();
           }
         };
         try {
+          assertCurrent();
+          onReadAdmitted?.();
           const reads: PreparedSessionEntryWorkerRead[] = [];
           for (const { input: selectedInput, owner, database, continuation } of selected) {
             assertCurrent();
@@ -145,6 +148,7 @@ export async function withOrderedSessionEntriesInWorker<T>(
           unsubscribe();
         }
       },
+      true,
     );
   };
   return enter(0);

@@ -1,8 +1,5 @@
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
-import type {
-  TranscriptMessageAppendOptions,
-  TranscriptMessageAppendResult,
-} from "../config/sessions/session-accessor.js";
+import type { TranscriptMessageAppendResult } from "../config/sessions/session-accessor.js";
 import type { SessionTranscriptContextVersion } from "../config/sessions/session-accessor.sqlite-contract.js";
 import {
   readSessionTranscriptContextMessages,
@@ -10,6 +7,7 @@ import {
   validateSessionTranscriptContextVersion,
 } from "../config/sessions/session-accessor.sqlite-model-context.js";
 import type {
+  LockedTranscriptMessageAppendOptions,
   SessionTranscriptReadScope,
   SessionTranscriptRuntimeTarget,
 } from "../config/sessions/session-accessor.types.js";
@@ -72,8 +70,8 @@ export function captureCodexSessionContextReader(
     lifecycleRevision: actor.sessions.readSharing(target.sessionKey)?.entry?.lifecycleRevision,
     admission: resolveSessionTranscriptReadFence(target),
   };
-  return (readTarget, read) =>
-    actor.sessions.withSharedState(async () => {
+  return async (readTarget, read) => {
+    const value = await actor.sessions.withSharedState(async () => {
       assertCurrent();
       const { bindIncognitoSessionComputeReader } =
         await import("../config/sessions/session-incognito-compute-read.js");
@@ -85,6 +83,10 @@ export function captureCodexSessionContextReader(
         signal,
       }).nativeContext(readTarget, read);
     });
+    assertCurrent();
+    actor.assertReadable();
+    return value;
+  };
 }
 
 function assertCodexSessionSyncAccess(target: SessionTranscriptReadScope, method: string) {
@@ -151,7 +153,7 @@ export async function readCodexSessionTranscriptEventsBeforeAdmission(
 export type CodexSessionTranscriptMirrorWriteLockContext =
   InternalSessionTranscriptWriteLockContext & {
     appendMessageWithMessageSequence: <TMessage>(
-      options: Omit<TranscriptMessageAppendOptions<TMessage>, "config">,
+      options: Omit<LockedTranscriptMessageAppendOptions<TMessage>, "config">,
     ) => Promise<{
       lifecycleRevision?: string;
       messageSeq?: number;

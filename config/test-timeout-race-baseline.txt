@@ -61,7 +61,7 @@ src/gateway/server-methods/cron-creator-transports.integration.test.ts	1
 src/gateway/server-methods/environments.pairing-snapshot.test.ts	1
 src/gateway/server-methods/models-auth-login.catalog.integration.test.ts	1
 src/gateway/server-methods/models-auth-login.test.ts	2
-src/gateway/server-methods/models-connect-publication.integration.test.ts	2
+src/gateway/server-methods/models-connect-publication.integration.test.ts	1
 src/gateway/server-methods/models-dispatch.catalog.integration.test.ts	2
 src/gateway/server-methods/models-dispatch.lifecycle.integration.test.ts	2
 src/gateway/server-methods/send.scheduled-reads.integration.test.ts	2
@@ -77,7 +77,6 @@ src/gateway/server.node-chat-subscriptions.test.ts	2
 src/gateway/server.node-pairing-ssh-verify.test.ts	2
 src/gateway/server.plugins-install-authority.test.ts	6
 src/gateway/server.portals.session.test.ts	3
-src/gateway/server.sessions.mcp-cleanup.test.ts	2
 src/gateway/server.shared-auth-rotation.test.ts	2
 src/gateway/server.spawn-broker.test.ts	1
 src/gateway/server.visible-spawn-fallback.product-proof.test.ts	1

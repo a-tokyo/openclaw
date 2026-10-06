@@ -1,13 +1,7 @@
-// In-process gateway run loop, restart signaling, drain, and update respawn handling.
 import { randomUUID } from "node:crypto";
 import { performance } from "node:perf_hooks";
 import { MessageChannel } from "node:worker_threads";
-import {
-  captureGatewayRestartTraceHandoff,
-  createGatewayRestartTraceHandoffEnv,
-  markGatewayRestartTrace,
-  startGatewayRestartTrace,
-} from "../../gateway/restart-trace.js";
+import * as restartTrace from "../../gateway/restart-trace.js";
 import { GatewayStartupCleanupError } from "../../gateway/server-shutdown.js";
 import type { startGatewayServer } from "../../gateway/server.js";
 import type { GatewayInstallationReplacement } from "../../gateway/stale-install.js";
@@ -449,7 +443,9 @@ export async function runGatewayLoop(params: {
 
     const respawnOptions = {
       decision: restartDecision,
-      env: createGatewayRestartTraceHandoffEnv(captureGatewayRestartTraceHandoff()),
+      env: restartTrace.createGatewayRestartTraceHandoffEnv(
+        restartTrace.captureGatewayRestartTraceHandoff(),
+      ),
     };
     const isStandaloneUpdate = Boolean(foregroundHandoff) || (isUpdateRestart && !supervisorMode);
     const respawn = isStandaloneUpdate
@@ -491,7 +487,7 @@ export async function runGatewayLoop(params: {
     }
     if (respawn.mode === "supervised") {
       const restartKind = isUpdateRestart ? "update-process" : "full-process";
-      markGatewayRestartTrace("restart.full-process-handoff", [
+      restartTrace.markGatewayRestartTrace("restart.full-process-handoff", [
         ["kind", restartKind],
         ["mode", respawn.mode],
         ["pid", "none"],
@@ -502,7 +498,7 @@ export async function runGatewayLoop(params: {
         reason: restartReason,
         processInstanceId,
         supervisorMode: supervisorMode ?? "external",
-        restartTrace: captureGatewayRestartTraceHandoff(),
+        restartTrace: restartTrace.captureGatewayRestartTraceHandoff(),
       });
       if (supervisorMode === "external" && !handoff) {
         gatewayLog.warn(
@@ -664,7 +660,9 @@ export async function runGatewayLoop(params: {
     if (action === "restart") {
       activeRestartRequest = acceptedRequest;
     } else if (!isRestart) {
-      startGatewayRestartTrace("stop.signal.received", [["signal", acceptedRequest.signal]]);
+      restartTrace.startGatewayRestartTrace("stop.signal.received", [
+        ["signal", acceptedRequest.signal],
+      ]);
     }
     let forceExitTimer: ReturnType<typeof setTimeout> | null = null;
     let shutdownDeadline: number | undefined;
@@ -679,7 +677,7 @@ export async function runGatewayLoop(params: {
       forceExitTimer = setTimeout(() => {
         const exitOk = budget.nativeStopBudget && !restartWithoutSupervisor && !shutdownFailure;
         gatewayLog.warn(
-          `shutdown deadline reached; abandoning unfinished cleanup and active work before ${action}; last observed: ${lastDrainCounts}; cleanup incomplete; exitCode=${exitOk ? 0 : 1}`,
+          `shutdown deadline reached; abandoning unfinished cleanup and active work before ${action}; last observed: ${lastDrainCounts}; pending close steps: ${restartTrace.formatGatewayPendingCloseSteps()}; cleanup incomplete; exitCode=${exitOk ? 0 : 1}`,
         );
         void forceExitAfterStabilityBundle(
           isRestart ? "gateway.restart_shutdown_timeout" : "gateway.stop_shutdown_timeout",
@@ -818,7 +816,7 @@ export async function runGatewayLoop(params: {
               reason: isRestart ? "gateway restarting" : "gateway stopping",
               restartExpectedMs: isRestart ? 1500 : null,
               ...(isRestart ? { drainTimeoutMs: drainBudget.closeDrainTimeoutMs() } : {}),
-              ...loopExit.interruptedRestartExitOptions({
+              ...loopExit.interruptedShutdownExitOptions({
                 request: acceptedRequest,
                 drainCutShort,
                 ownsProcessLifecycle: params.ownsProcessLifecycle,
@@ -1015,7 +1013,7 @@ export async function runGatewayLoop(params: {
     shuttingDown = true;
     gatewayLog.info(`received ${signal}; ${isRestart ? "restarting" : "shutting down"}`);
     if (isRestart) {
-      startGatewayRestartTrace("restart.signal.received", [
+      restartTrace.startGatewayRestartTrace("restart.signal.received", [
         ["signal", signal],
         ["reason", restartReason ?? signal],
         ["force", acceptedRequest.restartIntent?.force === true],
@@ -1041,8 +1039,6 @@ export async function runGatewayLoop(params: {
 
   const onSigterm = () => {
     observeSignal("SIGTERM");
-    // Debug-level: every accepted signal is announced by request()'s
-    // "received <signal>; ..." line, so an info pre-log would double up.
     gatewayLog.debug("signal SIGTERM received");
     if (terminalHostedStop && terminalHostedStop === hostLifecycle) {
       // Kernel cleanup is already joined. A native stop signal belongs to this
@@ -1150,12 +1146,7 @@ export async function runGatewayLoop(params: {
         signalRestartIntent ?? undefined,
       );
     } catch (err) {
-      // Defense in depth: if anything in the listener body throws, the
-      // SIGUSR2 emit has already advanced emittedRestartToken but no one
-      // called markGatewayRestartHandled. Without unsticking the
-      // token here, every subsequent scheduleGatewayRestart() would
-      // silently coalesce into the dead in-flight signal and the gateway
-      // would never restart again until manually kickstarted.
+      // Release the emitted token so later restarts do not coalesce into this failed signal.
       gatewayLog.error(`SIGUSR2 handler failed: ${formatErrorMessage(err)}`);
       try {
         eagerLifecycleRuntime.markGatewayRestartHandled();
@@ -1191,8 +1182,6 @@ export async function runGatewayLoop(params: {
       hostExitRequested = true;
       request("stop", "host lifeline closed");
     });
-    // Keep process alive; SIGUSR2 triggers an in-process restart (no supervisor required).
-    // SIGTERM/SIGINT still exit after a graceful shutdown.
     let isFirstIteration = true;
     let retryAfterTriage = false;
     for (;;) {
@@ -1297,10 +1286,7 @@ export async function runGatewayLoop(params: {
         startupFailedWithoutServerHandle = true;
         startupFailedBeforeServerHandle = true;
         if (!pendingStartupRequest) {
-          // Release the gateway lock so that `daemon restart/stop` (which
-          // discovers PIDs via the gateway port) can still manage the process.
-          // Without this, the process holds the lock but is not listening,
-          // forcing manual cleanup. (#35862)
+          // A failed listener must release its lock for daemon restart/stop (#35862).
           await releaseLockIfHeld();
         }
         writeStabilityBundle("gateway.restart_startup_failed", err);
