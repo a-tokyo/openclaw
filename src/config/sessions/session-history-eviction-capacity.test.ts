@@ -29,7 +29,7 @@ import {
 import { planLiveEvictionInDatabase } from "./session-live-eviction-plan.worker.js";
 import { resolveSqliteTargetFromSessionStorePath } from "./session-sqlite-target.js";
 import {
-  captureSessionMaintenancePreservation,
+  prepareSessionMaintenancePreservation,
   registerSessionMaintenancePreserveKeysProvider,
 } from "./store-maintenance-preserve.js";
 import { resolveMaintenanceConfigFromInput } from "./store-maintenance.js";
@@ -286,14 +286,17 @@ describe("SQLite live-node disk budget eviction", () => {
         return underBudget ? { ...usage, totalBytes: 1 } : usage;
       },
     );
-    const unregister = registerSessionMaintenancePreserveKeysProvider(() => {
-      preserveCalls += 1;
-      if (preserveCalls < 2) {
-        return [];
-      }
-      underBudget = true;
-      return [oldestKey];
-    });
+    const unregister = registerSessionMaintenancePreserveKeysProvider(async () => ({
+      capture: () => {
+        preserveCalls += 1;
+        if (preserveCalls < 2) {
+          return [];
+        }
+        underBudget = true;
+        return [oldestKey];
+      },
+      dispose() {},
+    }));
     try {
       const result = await enforceSqliteSessionHistoryDiskBudget({
         storePath,
@@ -437,11 +440,14 @@ describe("SQLite live-node disk budget eviction", () => {
       { sessionId: "late-cold", sessionKey: threadKey, storePath },
       { message: { role: "user", content: "late " + "x".repeat(64 * 1024) } },
     );
+    const prepared = await prepareSessionMaintenancePreservation(storePath);
+    const snapshot = prepared.capture();
+    prepared.dispose();
     const live = planLiveEvictionInDatabase(database(), {
       archiveDirectory: path.join(tempDir, "archives"),
       preserveRecentMs: null,
       skipSessionKeys: [],
-      snapshot: captureSessionMaintenancePreservation(storePath),
+      snapshot,
       unprotectSessionKeys: [],
     });
     expect(live.plan.entryRemovals.map((removal) => removal.sessionKey)).toEqual([threadKey]);

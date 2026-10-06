@@ -184,8 +184,8 @@ export function createSessionHistoryWorkerReaders(
     readLiveEvictionPlan: reader(
       "live-eviction",
       "a live eviction plan",
-      (input) => ({ kind: "live-eviction", ...input }),
       (value) => value.live,
+      (input) => ({ kind: "live-eviction", ...input }),
     ),
     readArchivePruning: reader(
       "session-archive-pruning",

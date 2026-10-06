@@ -19,7 +19,7 @@ import type { LiveEvictionPlan } from "./session-history-eviction-worker.types.j
 import { planLiveEvictionInDatabase } from "./session-live-eviction-plan.worker.js";
 import { maintenanceLane } from "./session-transcript-worker-resources.js";
 import { withSessionHistoryWorkerDatabase } from "./session-transcript-worker-runtime.js";
-import { captureSessionMaintenancePreservation } from "./store-maintenance-preserve.js";
+import { prepareSessionMaintenancePreservation } from "./store-maintenance-preserve.js";
 
 type LiveEvictionReadMode = "in-process" | "worker";
 
@@ -33,13 +33,19 @@ export async function readLiveEvictionPlan(params: {
   storePath: string;
   unprotectSessionKeys?: ReadonlySet<string>;
 }): Promise<LiveEvictionPlan> {
-  const plan = {
-    archiveDirectory: params.archiveDirectory,
-    preserveRecentMs: params.preserveRecentMs ?? null,
-    skipSessionKeys: [...(params.skipSessionKeys ?? [])],
-    snapshot: captureSessionMaintenancePreservation(params.storePath),
-    unprotectSessionKeys: [...(params.unprotectSessionKeys ?? [])],
-  };
+  const prepared = await prepareSessionMaintenancePreservation(params.storePath);
+  let plan;
+  try {
+    plan = {
+      archiveDirectory: params.archiveDirectory,
+      preserveRecentMs: params.preserveRecentMs ?? null,
+      skipSessionKeys: [...(params.skipSessionKeys ?? [])],
+      snapshot: prepared.capture(),
+      unprotectSessionKeys: [...(params.unprotectSessionKeys ?? [])],
+    };
+  } finally {
+    prepared.dispose();
+  }
   const path = resolveOpenClawAgentSqlitePath(params.databaseOptions);
   if (
     params.readMode === "in-process" ||
