@@ -191,6 +191,11 @@ function collectCapacityEligibleLivePreserveKeys(
   return preserveKeys;
 }
 
+function isStoredRunningStatus(status: SessionEntry["status"]): boolean {
+  const stored: string | undefined = status;
+  return stored === "running";
+}
+
 function isCapacityEligibleLiveNode(params: {
   entry: SessionEntry;
   key: string;
@@ -201,7 +206,8 @@ function isCapacityEligibleLiveNode(params: {
   if (entry.archivedAt !== undefined || entry.pinnedAt !== undefined) {
     return false;
   }
-  if (entry.modelSelectionLocked === true || entry.status === "running") {
+  // Older rows can still store "running". The persisted status type no longer includes it.
+  if (entry.modelSelectionLocked === true || isStoredRunningStatus(entry.status)) {
     return false;
   }
   if (params.preserveKeys.has(key) || params.preserveKeys.has(normalizeStoreSessionKey(key))) {
