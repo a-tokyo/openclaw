@@ -20,12 +20,11 @@ import {
 import type { SessionEntryMaintenancePlan } from "./session-accessor.sqlite-lifecycle-types.js";
 import { getSessionKysely } from "./session-accessor.sqlite-scope.js";
 import { parseSessionEntryJson as parseSessionEntryRow } from "./session-accessor.sqlite-status.js";
-import { collectSessionAdmissionReferences } from "./session-history-eviction-candidates.js";
 import type {
   LiveEvictionPlan,
   LiveEvictionPlanInput,
 } from "./session-history-eviction-worker.types.js";
-import { normalizeStoreSessionKey } from "./store-entry.js";
+import { foldedSessionKeyAliasCandidates, normalizeStoreSessionKey } from "./store-entry.js";
 import { resolveSessionMaintenancePreserveKeys } from "./store-maintenance-preserve-snapshot.js";
 import { isRecentSessionMaintenanceEntry } from "./store-maintenance.js";
 import type { SessionEntry } from "./types.js";
@@ -91,12 +90,30 @@ function isLocalEvictionFenceIdentity(identity: string, unprotect: ReadonlySet<s
   );
 }
 
+/** Admitted ids plus their stored-key spellings. Bounded by the admission snapshot, not the catalog. */
+function admissionLookupIds(identities: readonly string[]): string[] {
+  const ids = new Set<string>();
+  for (const identity of identities) {
+    const trimmed = identity.trim();
+    if (!trimmed) {
+      continue;
+    }
+    ids.add(trimmed);
+    const normalized = normalizeStoreSessionKey(trimmed);
+    ids.add(normalized);
+    for (const alias of foldedSessionKeyAliasCandidates(normalized)) {
+      ids.add(alias);
+    }
+  }
+  return [...ids];
+}
+
 /** Store keys whose current or prior generation is admitted. Reads only the admitted ids. */
 function collectAdmissionProtectedStoreKeys(
   database: LiveEvictionDatabase,
   admissionIdentities: readonly string[],
 ): Set<string> {
-  const protectedIds = [...collectSessionAdmissionReferences({ database, admissionIdentities })];
+  const protectedIds = admissionLookupIds(admissionIdentities);
   if (protectedIds.length === 0) {
     return new Set();
   }
@@ -121,7 +138,12 @@ function collectAdmissionProtectedStoreKeys(
     db
       .selectFrom("session_windows")
       .select("session_key")
-      .where("session_id", "in", sqliteStringSet(protectedIds)),
+      .where((eb) =>
+        eb.or([
+          eb("session_id", "in", sqliteStringSet(protectedIds)),
+          eb("session_key", "in", sqliteStringSet(protectedIds)),
+        ]),
+      ),
   ).rows) {
     keys.add(row.session_key);
   }
@@ -289,7 +311,7 @@ function readOldestCapacityEligibleLiveNode(params: {
           preserveKeys: params.preserveKeys,
           preserveRecentMs: params.preserveRecentMs,
         }) &&
-        !hasColdSessionTranscript(params.database, entry)
+        !hasColdSessionTranscript(params.database, entry, row.session_key)
       ) {
         return { entry, key: row.session_key };
       }

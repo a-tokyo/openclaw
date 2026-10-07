@@ -170,7 +170,7 @@ function deferColdDiskEvictions(
     const cold =
       removal.maintenanceReason === "disk-evicted" &&
       removal.expectedEntry !== undefined &&
-      hasColdSessionTranscript(database, removal.expectedEntry);
+      hasColdSessionTranscript(database, removal.expectedEntry, removal.sessionKey);
     if (cold) {
       changed.push(removal);
     }

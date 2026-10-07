@@ -430,6 +430,54 @@ describe("SQLite live-node disk budget eviction", () => {
     expect(sessionNodeExists(hotKey)).toBe(false);
   });
 
+  it("skips a thread whose older generation is cold while the current transcript is hot", async () => {
+    const coldKey = "agent:main:slack:channel:c18:thread:18";
+    const hotKey = "agent:main:slack:channel:c19:thread:19";
+    await replaceSessionEntry(
+      { sessionKey: coldKey, storePath },
+      { sessionId: "cold-generation", updatedAt: 5 },
+    );
+    await appendTranscriptMessage(
+      { sessionId: "cold-generation", sessionKey: coldKey, storePath },
+      { message: { role: "user", content: "old " + "x".repeat(64 * 1024) } },
+    );
+    await resetSessionEntryLifecycle({
+      storePath,
+      target: { canonicalKey: coldKey, storeKeys: [coldKey] },
+      buildNextEntry: () => ({ sessionId: "hot-current", updatedAt: 6 }),
+    });
+    await appendTranscriptMessage(
+      { sessionId: "hot-current", sessionKey: coldKey, storePath },
+      { message: { role: "user", content: "current" } },
+    );
+    await replaceSessionEntry(
+      { sessionKey: hotKey, storePath },
+      { sessionId: "hot-only", updatedAt: 15 },
+    );
+    await appendTranscriptMessage(
+      { sessionId: "hot-only", sessionKey: hotKey, storePath },
+      { message: { role: "user", content: "hot " + "y".repeat(64 * 1024) } },
+    );
+    markCold("cold-generation");
+    settlePhysicalUsage();
+    const before = await measureSessionPhysicalDiskUsage(storePath);
+    const result = await enforceSqliteSessionHistoryDiskBudget({
+      storePath,
+      mode: "enforce",
+      maintenance: {
+        maxDiskBytes: before.totalBytes - 1,
+        maxDiskBytesExplicit: true,
+        highWaterBytes: Math.max(1, before.totalBytes - 1),
+      },
+    });
+
+    expect(result?.removedEntries).toBe(1);
+    expect(sessionNodeExists(coldKey)).toBe(true);
+    expect(sessionExists("hot-current")).toBe(true);
+    expect(sessionExists("cold-generation")).toBe(true);
+    expect(sessionNodeExists(hotKey)).toBe(false);
+  });
+
   it("keeps a thread whose transcript goes cold before the eviction commits", async () => {
     const threadKey = "agent:main:slack:channel:c17:thread:17";
     await replaceSessionEntry(

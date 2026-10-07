@@ -227,10 +227,17 @@ export function readReferencedSessionIdsAfterTargetMutation(
 export function hasColdSessionTranscript(
   database: Pick<OpenClawAgentDatabase, "db">,
   entry: SessionEntry,
+  sessionKey?: string,
 ): boolean {
-  return collectSessionStateIdsForEntry(entry).some((sessionId) =>
-    readSessionColdTranscript(database.db, sessionId),
-  );
+  const sessionIds = new Set(collectSessionStateIdsForEntry(entry));
+  if (sessionKey) {
+    for (const sessionId of readSessionGenerationIdsForKeys(database, [sessionKey], {
+      exactStoredKeys: true,
+    })) {
+      sessionIds.add(sessionId);
+    }
+  }
+  return [...sessionIds].some((sessionId) => readSessionColdTranscript(database.db, sessionId));
 }
 
 export function planSessionStateDeleteIfUnreferenced(params: {
