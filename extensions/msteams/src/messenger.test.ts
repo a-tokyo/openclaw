@@ -13,14 +13,23 @@ import { teamsMarkdownDeliveryCases } from "./format.test-fixtures.js";
 const graphUploadMockState = vi.hoisted(() => ({
   uploadAndShareSharePoint: vi.fn(),
   getDriveItemProperties: vi.fn(),
+  resolveUploadSiteId: vi.fn(),
 }));
 
 vi.mock("./graph-upload.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./graph-upload.js")>();
+  graphUploadMockState.resolveUploadSiteId.mockImplementation(async (params) => {
+    const explicit = params.configuredSiteId?.trim();
+    if (explicit) {
+      return explicit;
+    }
+    throw new Error("No SharePoint site ID available for file upload.");
+  });
   return {
     ...actual,
     uploadAndShareSharePoint: graphUploadMockState.uploadAndShareSharePoint,
     getDriveItemProperties: graphUploadMockState.getDriveItemProperties,
+    resolveUploadSiteId: graphUploadMockState.resolveUploadSiteId,
   };
 });
 
@@ -135,6 +144,14 @@ describe("msteams messenger", () => {
     setMSTeamsRuntime(runtimeStub);
     graphUploadMockState.uploadAndShareSharePoint.mockReset();
     graphUploadMockState.getDriveItemProperties.mockReset();
+    graphUploadMockState.resolveUploadSiteId.mockReset();
+    graphUploadMockState.resolveUploadSiteId.mockImplementation(async (params) => {
+      const explicit = params.configuredSiteId?.trim();
+      if (explicit) {
+        return explicit;
+      }
+      throw new Error("No SharePoint site ID available for file upload.");
+    });
   });
 
   describe("renderReplyPayloadsToMessages", () => {
@@ -310,7 +327,7 @@ describe("msteams messenger", () => {
             messages: [{ text: "one", mediaUrl: localFile }],
             tokenProvider: { getAccessToken: async () => "token" },
           }),
-        ).rejects.toThrow("channels.msteams.sharePointSiteId is required");
+        ).rejects.toThrow("No SharePoint site ID available");
       } finally {
         await rm(tmpDir, { recursive: true, force: true });
       }
