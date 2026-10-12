@@ -8,13 +8,21 @@ import {
   type OpenClawAgentDatabaseOptions,
 } from "../../state/openclaw-agent-db.js";
 import { measureSessionPhysicalDiskUsage, type SessionPhysicalDiskUsage } from "./disk-budget.js";
+import type { SqliteSessionArchivePruningDiagnostics } from "./session-accessor.sqlite-contract.js";
 import { emitArchivedTranscriptUpdates } from "./session-accessor.sqlite-events.js";
 import { finalizeSessionEntryMaintenancePlansAfterWriterReleaseBestEffort } from "./session-accessor.sqlite-maintenance.js";
+import { withSqliteSessionPageReclamation } from "./session-accessor.sqlite-page-reclamation.js";
 import {
   toDatabaseOptions,
   type ResolvedSqliteReadScope,
 } from "./session-accessor.sqlite-scope.js";
 import { withSqliteMutationWorkerLifetime } from "./session-accessor.sqlite-worker-request.js";
+import { reclaimSqliteFreePages } from "./session-history-archive-pruning.js";
+import {
+  deferPhysicalBudgetForCheckpoint,
+  type SessionHistoryCheckpointGate,
+  type SessionHistoryDiskBudgetParams,
+} from "./session-history-budget-state.js";
 import type { LiveEvictionPlan } from "./session-history-eviction-worker.types.js";
 import { planLiveEvictionInDatabase } from "./session-live-eviction-plan.worker.js";
 import { maintenanceLane } from "./session-transcript-worker-resources.js";
@@ -22,6 +30,65 @@ import { withSessionHistoryWorkerDatabase } from "./session-transcript-worker-ru
 import { prepareSessionMaintenancePreservation } from "./store-maintenance-preserve.js";
 
 type LiveEvictionReadMode = "in-process" | "worker";
+
+/** Idle durable conversations are capacity victims only under an operator-set budget. */
+export function evictsLiveConversations(
+  maintenance: SessionHistoryDiskBudgetParams["maintenance"],
+): boolean {
+  const { highWaterBytes, maxDiskBytes, maxDiskBytesExplicit } = maintenance;
+  return (
+    maxDiskBytesExplicit === true &&
+    maxDiskBytes != null &&
+    maxDiskBytes > 0 &&
+    highWaterBytes != null &&
+    highWaterBytes > 0
+  );
+}
+
+export async function reclaimSessionPagesAfterEviction(params: {
+  databaseOptions: OpenClawAgentDatabaseOptions;
+  databasePath: string;
+  checkpointGate: SessionHistoryCheckpointGate;
+  budget: SessionHistoryDiskBudgetParams;
+  onIncomplete: (pruning: {
+    usage: SessionPhysicalDiskUsage;
+    removedFiles: number;
+    completed: false;
+    checkpointIncomplete: number;
+    checkpoint: SqliteSessionArchivePruningDiagnostics["checkpoint"];
+  }) => void;
+}): Promise<boolean> {
+  const pageDiagnostics: SqliteSessionArchivePruningDiagnostics = { trigger: "after-eviction" };
+  params.checkpointGate.afterNs = process.hrtime.bigint();
+  const checkpointCompleted = await withSqliteSessionPageReclamation(
+    params.databaseOptions,
+    async (reclaimPages, assertCurrent, preparedOptions) => {
+      try {
+        return await reclaimSqliteFreePages(preparedOptions, pageDiagnostics, {
+          reclaimPages,
+          checkpointGate: params.checkpointGate,
+          assertCurrent,
+          onCheckpointIncomplete: (checkpoint) =>
+            deferPhysicalBudgetForCheckpoint(params.budget, params.databasePath, checkpoint),
+        });
+      } catch {
+        // The durable deletion succeeded; a later pass can reclaim pages.
+        assertCurrent();
+        return true;
+      }
+    },
+  );
+  if (!checkpointCompleted) {
+    params.onIncomplete({
+      usage: await measureSessionPhysicalDiskUsage(params.budget.storePath),
+      removedFiles: 0,
+      completed: false,
+      checkpointIncomplete: pageDiagnostics.checkpointIncomplete ?? 1,
+      checkpoint: pageDiagnostics.checkpoint,
+    });
+  }
+  return checkpointCompleted;
+}
 
 /** Plans one oldest idle durable-conversation removal. Discovery reads run in the maintenance worker. */
 export async function readLiveEvictionPlan(params: {

@@ -1,12 +1,16 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { awaitGateBeforeSettlement, withinTest } from "../../test/helpers/promise.js";
 import { observeHostDataSql } from "../../test/helpers/sqlite-statement-execution-counter.js";
 import {
   loadSessionEntry,
   patchSessionEntryCore,
-  replaceTranscriptEvents,
   upsertSessionEntryCore,
 } from "../config/sessions/session-accessor.js";
+import { replaceTranscriptEvents } from "../config/sessions/session-accessor.sqlite-transcript-write.test-support.js";
+import { resolveSessionPublicShare } from "../config/sessions/session-public-share.js";
+import * as historyReaders from "../config/sessions/session-transcript-worker-readers.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { sessionChanges } from "../sessions/session-row-changes.js";
 import { closeOpenClawAgentDatabasesForTest } from "../state/openclaw-agent-db.js";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import {
@@ -39,7 +43,7 @@ function currentProjection() {
 function readPublicSessionShare(
   config: OpenClawConfig,
   target: typeof locator,
-  options: { offset?: number } = {},
+  options: { offset?: number; card?: boolean } = {},
 ) {
   return readShare(config, target, { ...options, projection: currentProjection() });
 }
@@ -57,7 +61,10 @@ async function withPublicTestState(run: () => Promise<void>) {
   });
 }
 
-async function seed(messages: string[], target = locator) {
+async function seed(
+  messages: Array<string | { role: string; content: string; provenance?: { kind: string } }>,
+  target = locator,
+) {
   await upsertSessionEntryCore(target, {
     sessionId: target.sessionId,
     updatedAt: 1,
@@ -70,7 +77,7 @@ async function seed(messages: string[], target = locator) {
       type: "message",
       id: `message-${index}`,
       parentId: index ? `message-${index - 1}` : null,
-      message: { role: "user", content },
+      message: typeof content === "string" ? { role: "user", content } : content,
     })),
   ]);
   projection = await createSessionRowProjection({ cfg, modelCatalog: [] });
@@ -111,6 +118,9 @@ describe("anonymous published session reader", () => {
       expect(older?.messages[0]).toMatchObject({ content: "Message 5" });
       const first = await readPublicSessionShare(cfg, locator, { offset: older?.olderOffset });
       expect(first?.messages).toHaveLength(5);
+      const preview = await readPublicSessionShare(cfg, locator, { card: true });
+      expect(preview?.messages[0]).toMatchObject({ content: "Message 0" });
+      expect(preview?.totalMessages).toBe(205);
       expect(first?.olderOffset).toBeUndefined();
     });
   });
@@ -126,6 +136,36 @@ describe("anonymous published session reader", () => {
       const oldest = await readPublicSessionShare(cfg, locator, { offset: 2 });
       expect(oldest?.messages).toMatchObject([{ content: "Oldest" }]);
       expect(oldest?.olderOffset).toBeUndefined();
+      const preview = await readPublicSessionShare(cfg, locator, { card: true });
+      expect(preview?.messages).toMatchObject([{ content: "Oldest" }]);
+      expect(preview?.totalMessages).toBe(3);
+    });
+  });
+
+  it("finds the first public user request after private and assistant prelude in a long history", async () => {
+    await withPublicTestState(async () => {
+      await seed([
+        { role: "system", content: "Private system prelude" },
+        { role: "user", content: "Private runtime input", provenance: { kind: "internal" } },
+        { role: "assistant", content: "Ready to help" },
+        "Opening public request",
+        ...Array.from({ length: 205 }, (_, index) => `Later request ${index}`),
+      ]);
+      const preview = await readPublicSessionShare(cfg, locator, { card: true });
+      expect(preview?.messages).toMatchObject([{ content: "Opening public request" }]);
+      expect(preview?.totalMessages).toBe(209);
+    });
+  });
+
+  it("keeps opening discovery inside the first hundred source positions", async () => {
+    await withPublicTestState(async () => {
+      await seed([
+        ...Array.from({ length: 100 }, () => ({ role: "assistant", content: "Prelude" })),
+        "Later request outside the opening window",
+      ]);
+      const preview = await readPublicSessionShare(cfg, locator, { card: true });
+      expect(preview?.messages).toEqual([]);
+      expect(preview?.totalMessages).toBe(101);
     });
   });
 
@@ -150,23 +190,134 @@ describe("anonymous published session reader", () => {
     });
   });
 
-  it.each(["revoke", "reset"] as const)(
+  it("reconciles sharing facts invalidated during the history read", async () => {
+    await withPublicTestState(async () => {
+      await seed(["Still published"]);
+      const read = transcriptReaders.readSessionMessagesPageWithStatsAsync;
+      vi.spyOn(transcriptReaders, "readSessionMessagesPageWithStatsAsync").mockImplementationOnce(
+        async (...args) => {
+          const result = await read(...args);
+          sessionChanges.emit({
+            agentId: locator.agentId,
+            sessionKey: locator.sessionKey,
+            factsInvalidated: "category",
+          });
+          expect(
+            currentProjection().sharingTargetState({
+              key: locator.sessionKey,
+              agentId: locator.agentId,
+            }).status,
+          ).toBe("pending");
+          return result;
+        },
+      );
+      expect((await readPublicSessionShare(cfg, locator))?.messages).toMatchObject([
+        { content: "Still published" },
+      ]);
+    });
+  });
+
+  it.for(["metadata", "revoke", "reset"] as const)(
     "rechecks %s after awaited history before releasing content",
-    async (action) => {
+    async (action, { signal }) => {
       await withPublicTestState(async () => {
         await seed(["Must not escape after closure"]);
+        const membershipRead = Promise.withResolvers<void>();
+        const releaseMembership = Promise.withResolvers<void>();
+        const revalidation = Promise.withResolvers<void>();
+        let holdMembership = false;
+        let historyReturned = false;
+        if (action === "metadata") {
+          const createReaders = historyReaders.createSessionHistoryWorkerReaders;
+          vi.spyOn(historyReaders, "createSessionHistoryWorkerReaders").mockImplementation(
+            (...args) => {
+              const readers = createReaders(...args);
+              const readMembership = readers.readMembershipFacts;
+              readers.readMembershipFacts = async (...input) => {
+                const result = await readMembership(...input);
+                if (holdMembership) {
+                  membershipRead.resolve();
+                  await withinTest(releaseMembership.promise, signal);
+                }
+                return result;
+              };
+              return readers;
+            },
+          );
+          const owner = currentProjection();
+          const prepare = owner.withPreparedExactRows.bind(owner);
+          vi.spyOn(owner, "withPreparedExactRows").mockImplementation((...args) => {
+            if (historyReturned) {
+              revalidation.resolve();
+            }
+            return prepare(...args);
+          });
+        }
         const read = transcriptReaders.readSessionMessagesPageWithStatsAsync;
         vi.spyOn(transcriptReaders, "readSessionMessagesPageWithStatsAsync").mockImplementationOnce(
           async (...args) => {
             const result = await read(...args);
-            await patchSessionEntryCore(locator, () =>
-              action === "reset" ? { sessionId: "replacement" } : { publicShare: undefined },
+            holdMembership = action === "metadata";
+            await patchSessionEntryCore(
+              locator,
+              () => {
+                if (action === "metadata") {
+                  return { label: "Updated public example" };
+                }
+                return action === "reset"
+                  ? { sessionId: "replacement" }
+                  : { publicShare: undefined };
+              },
+              { workerGuard: {} },
             );
+            if (holdMembership) {
+              // Complete metadata receipts stay ready; explicit invalidation requires reconciliation.
+              sessionChanges.emit({
+                agentId: locator.agentId,
+                sessionKey: locator.sessionKey,
+                factsInvalidated: "category",
+              });
+              // Hold the real worker result before the projection accepts it.
+              await withinTest(membershipRead.promise, signal);
+              expect(
+                currentProjection().sharingTargetState({
+                  key: locator.sessionKey,
+                  agentId: locator.agentId,
+                }).status,
+              ).toBe("pending");
+            }
+            historyReturned = true;
             return result;
           },
         );
-        expect(await readPublicSessionShare(cfg, locator)).toBeNull();
-        expect(loadSessionEntry(locator)?.publicShare).toBeUndefined();
+        const reading = readPublicSessionShare(cfg, locator);
+        try {
+          if (action === "metadata") {
+            await withinTest(
+              awaitGateBeforeSettlement(
+                revalidation.promise,
+                reading,
+                "Public session read settled before rejoining invalidated membership",
+              ),
+              signal,
+            );
+            releaseMembership.resolve();
+          }
+          const result = await reading;
+          if (action === "metadata") {
+            expect(result).toMatchObject({
+              title: "Updated public example",
+              messages: [{ role: "user", content: "Must not escape after closure" }],
+            });
+            expect(resolveSessionPublicShare(loadSessionEntry(locator))?.id).toBe(locator.shareId);
+          } else {
+            expect(result).toBeNull();
+            expect(loadSessionEntry(locator)?.publicShare).toBeUndefined();
+          }
+        } finally {
+          releaseMembership.resolve();
+          await Promise.allSettled([reading]);
+        }
       });
     },
   );

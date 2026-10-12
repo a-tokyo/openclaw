@@ -3,7 +3,7 @@ import type {
   ArchivedSessionEvictionQuery,
 } from "./disk-budget.types.js";
 import type { SessionEntryMaintenancePlan } from "./session-accessor.sqlite-lifecycle-types.js";
-import type { SessionMaintenancePreservationSnapshot } from "./store-maintenance-preserve-snapshot.js";
+import type { SessionMaintenancePreservationSnapshot } from "./store-maintenance-preserve-snapshot.types.js";
 
 type DatabaseTarget = { database: { agentId: string; path: string }; env: NodeJS.ProcessEnv };
 type ReaderInput<Input> = Omit<Input, "kind" | "database">;

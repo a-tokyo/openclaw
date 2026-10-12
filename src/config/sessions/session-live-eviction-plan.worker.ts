@@ -9,12 +9,12 @@ import {
 import type { OpenClawAgentDatabase } from "../../state/openclaw-agent-db.js";
 import { sessionDeliveryOrigin } from "../../utils/delivery-context.read.js";
 import type { SessionStateDeletePlan } from "./session-accessor.sqlite-archive-types.js";
+import { planSessionStateDeleteIfUnreferenced } from "./session-accessor.sqlite-delete-snapshot.js";
 import { readSessionEntryStore } from "./session-accessor.sqlite-entry-inventory.js";
 import {
   collectProjectedReferencedSessionIds,
   collectSessionStateIdsForEntry,
   hasColdSessionTranscript,
-  planSessionStateDeleteIfUnreferenced,
   readSessionGenerationIdsForKeys,
 } from "./session-accessor.sqlite-lifecycle-state.js";
 import type { SessionEntryMaintenancePlan } from "./session-accessor.sqlite-lifecycle-types.js";
@@ -25,8 +25,8 @@ import type {
   LiveEvictionPlanInput,
 } from "./session-history-eviction-worker.types.js";
 import { foldedSessionKeyAliasCandidates, normalizeStoreSessionKey } from "./store-entry.js";
+import { isRecentSessionMaintenanceEntry } from "./store-maintenance-activity.js";
 import { resolveSessionMaintenancePreserveKeys } from "./store-maintenance-preserve-snapshot.js";
-import { isRecentSessionMaintenanceEntry } from "./store-maintenance.js";
 import type { SessionEntry } from "./types.js";
 
 type LiveEvictionDatabase = Pick<OpenClawAgentDatabase, "agentId" | "db" | "path">;

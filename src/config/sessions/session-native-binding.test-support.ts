@@ -1,9 +1,9 @@
 import type { MockInstance } from "vitest";
 import type { AgentHarnessV2 } from "../../agents/harness/types.js";
-import type { SubagentRunsDurableBasis } from "../../agents/subagents/registry/subagent-registry-read.types.js";
 import { createPluginRuntimeMock } from "../../plugin-sdk/test-helpers/plugin-runtime-mock.js";
 import {
   createPluginStateKeyedStore,
+  createPluginStateKeyedStoreV2,
   createPluginStateSyncKeyedStore,
 } from "../../plugin-state/plugin-state-store.js";
 import type { PluginStateSyncKeyedStore } from "../../plugin-state/plugin-state-store.types.js";
@@ -29,9 +29,9 @@ import {
   rewindSessionToMessage,
   switchSessionBranch,
 } from "./session-accessor.sqlite-message-cut.js";
-import { replaceTranscriptEventsSync } from "./session-accessor.sqlite-transcript-write.js";
+import { replaceTranscriptEventsSync } from "./session-accessor.sqlite-transcript-write.test-support.js";
 
-type NativeBindingTestApi = {
+export type NativeBindingTestApi = {
   createNativeBindingDeletionFixture(
     this: void,
     runtime: PluginRuntime,
@@ -113,17 +113,12 @@ async function createFixture(
       openSyncKeyedStore: <Value>(options: Parameters<typeof createPluginStateSyncKeyedStore>[1]) =>
         createPluginStateSyncKeyedStore<Value>(kind, { ...options, env }),
       openKeyedStore: <Value>(options: Parameters<typeof createPluginStateKeyedStore>[1]) => {
-        const store = createPluginStateKeyedStore<Value>(kind, { ...options, env });
-        // A released SDK adapter forwards the public contract without the host's private branding.
-        return mode === "worker"
-          ? store
-          : {
-              ...store,
-              withCurrent: (authority: Parameters<NonNullable<typeof store.withCurrent>>[0]) => ({
-                ...store.withCurrent(authority),
-              }),
-            };
+        return createPluginStateKeyedStore<Value>(kind, { ...options, env });
       },
+      openKeyedStoreV2: <Value>(
+        options: Parameters<typeof createPluginStateKeyedStoreV2>[1],
+        authority: Parameters<typeof createPluginStateKeyedStoreV2>[2] = { assertCurrent() {} },
+      ) => createPluginStateKeyedStoreV2<Value>(kind, { ...options, env }, authority),
     },
   });
   const { createNativeBindingDeletionFixture } =
@@ -135,6 +130,20 @@ async function createFixture(
   const registry = createEmptyPluginRegistry();
   registry.plugins.push(createPluginRecord({ id: kind }));
   registry.agentHarnesses.push({ pluginId: kind, source: "runtime", harness: native.harness });
+  if (mode === "native") {
+    // A released opaque sibling requires native atomicity before either participant
+    // executes. The official harness keeps its V2 store and typed native participant.
+    registry.agentHarnesses.push({
+      pluginId: "core",
+      source: "runtime",
+      harness: {
+        ...native.harness,
+        async withSessionDeletion(_params, run) {
+          return run({ commit() {}, rollback() {} });
+        },
+      },
+    });
+  }
   markPluginRegistryActive(registry);
   const target = { canonicalKey: scope.sessionKey, storeKeys: [scope.sessionKey] };
   return {
@@ -179,16 +188,13 @@ async function createFixture(
           ? rewindSessionToMessage({ ...scope, entryId })
           : switchSessionBranch({ ...scope, leafEntryId: entryId }),
       ),
-    remove: (
-      options: { archiveTranscript?: boolean; descendantRunBasis?: SubagentRunsDurableBasis } = {},
-    ) =>
+    remove: (options: { archiveTranscript?: boolean } = {}) =>
       withPluginRuntimeRegistryScope(registry, () =>
         deleteSessionEntryLifecycle({
           ...scope,
           target,
           archiveTranscript: options.archiveTranscript ?? false,
           deleteTranscriptWithoutArchive: true,
-          descendantRunBasis: options.descendantRunBasis,
         }),
       ),
   };

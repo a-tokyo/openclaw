@@ -32,10 +32,7 @@ import type {
   OpenClawStateReadResult,
   OpenClawStateReadRequest,
 } from "../../../state/openclaw-state-read.types.js";
-import {
-  rowToSubagentRunRecord,
-  subagentRunRecordVersion,
-} from "./subagent-registry.store.codec.js";
+import { rowToSubagentRunRecord } from "./subagent-registry.store.codec.js";
 import {
   conflictingSubagentRunVersions,
   writeSubagentRunValuesInDatabase,
@@ -57,12 +54,10 @@ export function readSubagentRunsInWorker(
   command: Extract<OpenClawStateReadCommand, { type: "subagents.runs" }>,
 ): Extract<OpenClawStateReadResult, { type: "subagents.runs" }> {
   if (command.scope.kind === "maintenance") {
-    const maintenance = loadSubagentMaintenanceRunsInDatabase({ db });
     return {
       type: command.type,
       projection: "maintenance",
-      runs: maintenance.runs,
-      maintenanceDigest: maintenance.digest,
+      runs: loadSubagentMaintenanceRunsInDatabase({ db }),
     };
   }
   if (command.scope.kind === "descendants") {
@@ -74,8 +69,7 @@ export function readSubagentRunsInWorker(
     return {
       type: command.type,
       runs: descendants.runs,
-      descendantBasis: {
-        digest: descendants.digest,
+      descendants: {
         sessionKeys: descendants.sessionKeys,
         runIds: descendants.runIds,
       },
@@ -129,7 +123,7 @@ export async function streamSubagentRegistryInWorker(
       if (!entry) {
         throw new Error("Canonical subagent restore found an unreadable durable row");
       }
-      batch.push({ entry, version: subagentRunRecordVersion(entry), createdAt: row.created_at });
+      batch.push({ entry, version: subagentRunRowVersion(row), createdAt: row.created_at });
       bytes += size;
       count += 1;
     }

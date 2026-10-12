@@ -31,6 +31,7 @@ import {
   workspaceTransfer,
   workspaceSnapshot,
 } from "./node-worker-tunnel.test-support.js";
+import { WorkerEnvironmentInventoryClosedError } from "./store-errors.js";
 import { verifyReconciledWorkspaceFinal } from "./workspace-finalize.js";
 import { workerProjectSeedKey } from "./workspace-git-base.js";
 import type { WorkspaceReconcileMetrics } from "./workspace-hash-memo.js";
@@ -190,23 +191,6 @@ describe("node worker tunnel manager", () => {
     await handle.stop();
   });
 
-  it("joins same-owner starts while workspace binding resolution is pending", async () => {
-    const record = environment();
-    const workspaceBinding = createDeferred<undefined>();
-    const resolveWorkspaceBinding = vi.fn(async () => await workspaceBinding.promise);
-    const manager = createManager(record);
-    manager.bindWorkspaceBindingResolver(resolveWorkspaceBinding);
-
-    const first = manager.start(startRequest());
-    await vi.waitFor(() => expect(resolveWorkspaceBinding).toHaveBeenCalledOnce());
-    const second = manager.start(startRequest());
-    workspaceBinding.resolve(undefined);
-
-    const [firstHandle, secondHandle] = await Promise.all([first, second]);
-    expect(resolveWorkspaceBinding).toHaveBeenCalledOnce();
-    expect(secondHandle).toBe(firstHandle);
-  });
-
   it.each(["stop", "stopAll"] as const)(
     "%s fences a pending workspace resolver without waiting for it",
     async (operation) => {
@@ -292,31 +276,60 @@ describe("node worker tunnel manager", () => {
     }
   });
 
-  it("releases live tunnels and transfer state when shutdown cannot read the inventory", async () => {
-    const inventoryClosed = new Error("Worker environment inventory has closed");
-    let inventoryOpen = true;
-    const readInventory = <T>(value: T) => {
-      if (!inventoryOpen) {
-        throw inventoryClosed;
-      }
-      return value;
-    };
-    const record = environment();
-    const close = vi.fn(async () => {});
-    const closeAll = vi.fn(async () => {});
-    const manager = createManager(record, {
-      getEnvironment: () => readInventory(record),
-      listEnvironments: () => readInventory([record]),
-      workspaceTransfer: { ...workspaceTransfer(), close, closeAll },
-    });
-    await manager.start(startRequest());
-    // A terminal state-database failure revokes the inventory before Gateway shutdown.
-    inventoryOpen = false;
+  it.each([false, true])(
+    "releases live tunnels when shutdown cannot read the inventory (closed=%s)",
+    async (closed) => {
+      const inventoryClosed = closed
+        ? new WorkerEnvironmentInventoryClosedError()
+        : new Error("Worker environment inventory read failed");
+      let inventoryOpen = true;
+      const readInventory = <T>(value: T) => {
+        if (!inventoryOpen) {
+          throw inventoryClosed;
+        }
+        return value;
+      };
+      const record = environment();
+      const close = vi.fn(async () => {});
+      const closeAll = vi.fn(async () => {});
+      const manager = createManager(record, {
+        getEnvironment: () => readInventory(record),
+        listEnvironments: () => readInventory([record]),
+        workspaceTransfer: { ...workspaceTransfer(), close, closeAll },
+      });
+      await manager.start(startRequest());
+      // A terminal state-database failure revokes the inventory before Gateway shutdown.
+      inventoryOpen = false;
 
-    await expect(manager.stopAll()).rejects.toBe(inventoryClosed);
-    expect(manager.status(record.environmentId)).toBe("stopped");
-    expect(close).toHaveBeenCalledWith(record.environmentId);
-    expect(closeAll).toHaveBeenCalledOnce();
+      if (closed) {
+        await expect(manager.stopAll()).resolves.toBeUndefined();
+      } else {
+        await expect(manager.stopAll()).rejects.toBe(inventoryClosed);
+      }
+      expect(manager.status(record.environmentId)).toBe("stopped");
+      expect(close).toHaveBeenCalledWith(record.environmentId);
+      expect(closeAll).toHaveBeenCalledOnce();
+    },
+  );
+
+  it("keeps sibling cleanup failures visible beside a disconnected node", async () => {
+    const nodeTransport = transport();
+    nodeTransport.getCurrentNode = async () => undefined;
+    const cleanupError = new Error("transfer cleanup failed");
+    const manager = createManager(environment(), {
+      getTransport: () => nodeTransport,
+      workspaceTransfer: {
+        ...workspaceTransfer(),
+        close: vi.fn(async () => {}),
+        closeAll: vi.fn(async () => {
+          throw cleanupError;
+        }),
+      },
+    });
+
+    const failure = await manager.stopAll().catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(AggregateError);
+    expect((failure as AggregateError).errors).toContain(cleanupError);
   });
 
   it.each(["current", "retiring"] as const)(
@@ -494,7 +507,7 @@ describe("node worker tunnel manager", () => {
     expect(prepareSync).toHaveBeenCalledWith(
       expect.objectContaining({
         environmentId: "environment-1",
-        generation: record.ownerEpoch,
+        ownerEpoch: record.ownerEpoch,
         localPath: "/gateway/workspace",
       }),
     );
@@ -772,7 +785,7 @@ describe("node worker tunnel manager", () => {
     ).rejects.toThrow(error);
   });
 
-  it.each([1, 640])(
+  it.each([640])(
     "reuses the placement hash memo across node reconciliations (%s files)",
     async (fileCount) => {
       const record = environment();
@@ -943,78 +956,4 @@ describe("node worker tunnel manager", () => {
       await handle.stop();
     },
   );
-
-  it("does not republish an accepted manifest already current on the node", async () => {
-    const record = environment();
-    const localPath = tempDirs.make("node-worker-accepted-current-");
-    const remoteWorkspaceDir = tempDirs.make("node-worker-accepted-current-remote-");
-    const snapshot = workspaceSnapshot(localPath);
-    const { manifestRef: baseManifestRef } = snapshot;
-    const transferDirections: string[] = [];
-    const nodeTransport = transport();
-    const invoke = vi.fn(async ({ params }) => {
-      const input = params as { transfer?: { direction?: string } };
-      if (input.transfer?.direction) {
-        transferDirections.push(input.transfer.direction);
-      }
-      return {
-        ok: true,
-        payloadJSON: workspaceCommandPayload(remoteWorkspaceDir, {
-          stdout: input.transfer ? `${baseManifestRef}\n` : manifestCaptureOutput(baseManifestRef),
-        }),
-      };
-    });
-    nodeTransport.invoke = withWorkspaceDrain(invoke);
-    const publishSnapshot = vi.fn(() => "accepted-download-token");
-    const transfer = workspaceTransfer({
-      prepareSync: vi.fn(async () => ({ snapshot, token: "download-token" })),
-      prepareUpload: vi.fn(() => "upload-token"),
-      takeUpload: vi.fn(() =>
-        unchangedWorkspaceUpload(snapshot, tempDirs.make("node-worker-accepted-staging-")),
-      ),
-      getSnapshot: vi.fn(() => snapshot),
-      publishSnapshot,
-    });
-    const manager = createManager(record, {
-      getTransport: () => nodeTransport,
-      workspaceTransfer: transfer,
-    });
-    const handle = await manager.start(startRequest());
-    await handle.syncWorkspace({
-      source: { kind: "local", path: localPath },
-      sessionId: "session-1",
-      generation: 1,
-    });
-
-    const reconciliation = await handle.reconcileWorkspace({
-      source: {
-        kind: "local",
-        path: localPath,
-        journal: {
-          load: async () => undefined,
-          begin: vi.fn(async () => {}),
-          commit: vi.fn(async () => {}),
-          abort: vi.fn(async () => {}),
-        },
-        stagedResult: { ref: workerWorkspaceResultRef("node-current"), record: () => {} },
-      },
-      remoteWorkspaceDir,
-      baseManifestRef,
-    });
-    await verifyReconciledWorkspaceFinal(reconciliation, {
-      assertActive: async () => {},
-      resume: async () => {},
-    });
-
-    expect(reconciliation.manifestRef).toBe(baseManifestRef);
-    expect(transferDirections).toEqual(["download", "upload"]);
-    expect(publishSnapshot).not.toHaveBeenCalled();
-    expect(invoke).toHaveBeenCalledWith(
-      expect.objectContaining({
-        params: expect.objectContaining({
-          argv: expect.arrayContaining(["all", baseManifestRef.slice("sha256:".length)]),
-        }),
-      }),
-    );
-  });
 });

@@ -1,10 +1,11 @@
-import { getRuntimeConfig } from "../config/config.js";
+import { createConfigIO } from "../config/io.factory.js";
 import type { GatewayScheduler } from "../infra/gateway-scheduler.js";
 import { purgeExpiredSecretStoreEntries } from "../secrets/store/secret-store.js";
 import {
   createGitHubOAuthLifecycle,
   installActiveGitHubOAuthLifecycle,
 } from "./github-oauth-lifecycle.js";
+import { startGitHubPublicationDiscovery } from "./github-publication-discovery.js";
 import { createModelAccountConnectService } from "./model-account-connect.js";
 import {
   broadcastChatMetadataChanged,
@@ -14,6 +15,7 @@ import { attachSessionChangeEventLifetime } from "./server-methods/session-chang
 import type { GatewayRequestContext } from "./server-methods/types.js";
 import type { GatewaySidecarStopOwner } from "./server-sidecar-owners.js";
 import { startIncognitoSessionLifetime } from "./session-incognito-lifetime.js";
+import { getSessionRowProjection } from "./session-row-projection-access.js";
 
 type GatewayChatMetadataLifecycle = Awaited<ReturnType<typeof createGatewayChatMetadataLifecycle>>;
 
@@ -55,12 +57,18 @@ export async function attachInitialGatewayLifetimeSidecars(params: {
   const githubOAuth = createGitHubOAuthLifecycle({
     scheduler: params.scheduler,
     getConfig: params.gatewayRequestContext.getRuntimeConfig,
-    getPersistedConfig: () => getRuntimeConfig({ pin: false }),
+    getPersistedConfig: () => createConfigIO().loadConfigAsync(),
     warn: params.logWarning,
   });
   params.gatewayRequestContext.githubOAuthService = githubOAuth;
   const uninstallGitHubOAuth = installActiveGitHubOAuthLifecycle(githubOAuth);
   if (!params.minimalTestGateway) {
+    params.publishSidecars(
+      startGitHubPublicationDiscovery({
+        scheduler: params.scheduler,
+        projection: getSessionRowProjection(params.gatewayRequestContext),
+      }),
+    );
     githubOAuth.start();
   }
   params.publishSidecars({

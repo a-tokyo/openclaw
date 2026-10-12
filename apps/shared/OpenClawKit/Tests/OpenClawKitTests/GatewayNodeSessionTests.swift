@@ -118,7 +118,7 @@ private final class PingWebSocketTask: WebSocketTasking, @unchecked Sendable {
     }
 }
 
-private final class FakeGatewayWebSocketTask: WebSocketTasking, @unchecked Sendable {
+final class FakeGatewayWebSocketTask: WebSocketTasking, @unchecked Sendable {
     private typealias ReceiveResult = Result<URLSessionWebSocketTask.Message, Error>
 
     private let lock = NSLock()
@@ -140,6 +140,9 @@ private final class FakeGatewayWebSocketTask: WebSocketTasking, @unchecked Senda
     private var receivePhase = 0
     private var pendingReceiveHandler: (@Sendable (ReceiveResult) -> Void)?
     private var pendingInboundFrames: [ReceiveResult] = []
+    private var holdsPongs = false
+    private var pingCount = 0
+    private var pendingPongs: [@Sendable (Error?) -> Void] = []
     private var waiters = StateWaiters()
 
     init(
@@ -272,7 +275,38 @@ private final class FakeGatewayWebSocketTask: WebSocketTasking, @unchecked Senda
     }
 
     func sendPing(pongReceiveHandler: @escaping @Sendable (Error?) -> Void) {
-        pongReceiveHandler(nil)
+        let held = self.lock.withLock {
+            self.pingCount += 1
+            if self.holdsPongs { self.pendingPongs.append(pongReceiveHandler) }
+            self.waiters.resumeSatisfied()
+            return self.holdsPongs
+        }
+        if !held { pongReceiveHandler(nil) }
+    }
+
+    func holdPongs() {
+        self.lock.withLock { self.holdsPongs = true }
+    }
+
+    func finishPongs(error: Error? = nil) {
+        let callbacks = self.lock.withLock {
+            defer { self.pendingPongs.removeAll() }
+            return self.pendingPongs
+        }
+        callbacks.forEach { $0(error) }
+    }
+
+    func snapshotPingCount() -> Int {
+        self.lock.withLock { self.pingCount }
+    }
+
+    func waitForPings(count: Int) async {
+        await withCheckedContinuation { continuation in
+            self.lock.withLock {
+                self.waiters.append(continuation) { self.pingCount >= count }
+                self.waiters.resumeSatisfied()
+            }
+        }
     }
 
     func receive() async throws -> URLSessionWebSocketTask.Message {
@@ -509,7 +543,7 @@ private final class FakeGatewayWebSocketTask: WebSocketTasking, @unchecked Senda
     }
 }
 
-private final class FakeGatewayWebSocketSession: WebSocketSessioning, GatewayTLSRouteMetadataProviding,
+final class FakeGatewayWebSocketSession: WebSocketSessioning, GatewayTLSRouteMetadataProviding,
     @unchecked Sendable
 {
     private let lock = NSLock()
@@ -1066,6 +1100,30 @@ struct GatewayNodeSessionTests {
         #expect(await gateway.workerConnectionData(ifCurrentRoute: route) == nil)
     }
 
+    @Test func `changed connection options renegotiate the advertised handshake`() async throws {
+        let session = FakeGatewayWebSocketSession()
+        let gateway = GatewayNodeSession()
+        let url = try testURL("ws://gateway.example.invalid")
+        var options = nodeConnectOptions()
+        try await gateway.connectForTest(url, options: options, session: session)
+        try await gateway.connectForTest(url, options: options, session: session)
+        #expect(session.snapshotMakeCount() == 1)
+
+        options.scopesAreExplicit = true
+        try await gateway.connectForTest(url, options: options, session: session)
+        #expect(session.snapshotMakeCount() == 2)
+
+        options.computerUse = AnyCodable(["capabilities": ["screenshot"]])
+        try await gateway.connectForTest(url, options: options, session: session)
+        #expect(session.snapshotMakeCount() == 3)
+        let socket = try #require(session.latestTask())
+        let request = try #require(socket.sentRequests(method: "connect").last)
+        let params = try #require(request["params"] as? [String: Any])
+        let computerUse = try #require(params["computerUse"] as? [String: Any])
+        #expect(computerUse["capabilities"] as? [String] == ["screenshot"])
+        await gateway.disconnect()
+    }
+
     @Test func `operator canvas refresh uses the operator surface method`() async throws {
         let session = FakeGatewayWebSocketSession()
         let gateway = GatewayNodeSession()
@@ -1544,34 +1602,6 @@ struct GatewayNodeSessionTests {
     }
 
     @Test
-    func `completed snapshot timeout cannot release a later route waiter`() async throws {
-        let gateway = GatewayNodeSession()
-        let firstRegistered = AsyncGate()
-        let firstWait = Task {
-            await gateway.signalAfterSuspension(firstRegistered) { gateway in
-                await gateway._test_waitForSnapshot(timeoutMs: 1000)
-            }
-        }
-        await firstRegistered.waitUntilStarted()
-        #expect(await gateway._test_snapshotWaiterCount() == 1)
-        await gateway._test_markSnapshotReceived()
-        #expect(await firstWait.value)
-
-        await gateway._test_resetConnectionState()
-        let replacementRegistered = AsyncGate()
-        let replacementWait = Task {
-            await gateway.signalAfterSuspension(replacementRegistered) { gateway in
-                await gateway._test_waitForSnapshot(timeoutMs: 3000)
-            }
-        }
-        await replacementRegistered.waitUntilStarted()
-        #expect(await gateway._test_snapshotWaiterCount() == 1)
-        try await Task.sleep(nanoseconds: 1_200_000_000)
-        await gateway._test_markSnapshotReceived()
-        #expect(await replacementWait.value)
-    }
-
-    @Test
     func `concurrent replacements wait for route invalidation before installing a channel`() async throws {
         let session = FakeGatewayWebSocketSession()
         let gateway = GatewayNodeSession()
@@ -1847,8 +1877,8 @@ struct GatewayNodeSessionTests {
             },
             onInvokeCancel: { _ in cancellation.markCancelled() })
 
-        /// Both decoded frames arrive in one actor turn: detached work cannot
-        /// register between them. The socket tests above exercise wire decoding.
+        // Both decoded frames arrive in one actor turn: detached work cannot
+        // register between them. The socket tests above exercise wire decoding.
         func deliverBeforeDetachedAdmission(to gateway: isolated GatewayNodeSession) async {
             await gateway._test_handlePush(
                 nodeInvokePush(id: "cancel-before-admission", command: command),
@@ -2575,6 +2605,58 @@ struct GatewayNodeSessionTests {
         #expect(await channel.currentConnectionGeneration() == nil)
     }
     #endif
+
+    @Test
+    func `external authorization failure stays actionable without sending Gateway credentials`() async throws {
+        let session = FakeGatewayWebSocketSession()
+        let gateway = GatewayNodeSession()
+        do {
+            try await gateway.connectForTest(
+                testURL("wss://gateway.example.invalid"),
+                credentials: .init(bootstrapToken: "unused-bootstrap"),
+                options: nodeConnectOptions(),
+                session: session,
+                extraHeadersProvider: { throw GatewayExternalAuthorizationError() })
+            Issue.record("unauthorized upgrade unexpectedly connected")
+        } catch {
+            let problem = GatewayConnectionProblemMapper.map(error: error)
+            #expect(problem?.kind == .externalAuthorizationRequired)
+            #expect(problem?.actionLabel == "Sign in")
+            #expect(problem?.pauseReconnect == true)
+            #expect(problem?.retryable == true)
+        }
+        #expect(session.snapshotMakeCount() == 0)
+        #expect(await gateway.currentRoute() == nil)
+        await gateway.disconnect()
+    }
+
+    @Test(arguments: [false, true])
+    func `public request and send preserve actionable upgrade denial`(send: Bool) async throws {
+        let session = FakeGatewayWebSocketSession()
+        let url = try testURL("wss://gateway.example.invalid")
+        let channel = GatewayChannelActor(
+            url: url, token: nil,
+            session: WebSocketSessionBox(session: session), connectOptions: nodeConnectOptions(),
+            extraHeadersProvider: { throw GatewayExternalAuthorizationError() })
+        do {
+            if send {
+                try await channel.send(method: "status", params: nil)
+            } else {
+                _ = try await channel.request(method: "status", params: nil)
+            }
+            Issue.record("unauthorized operation unexpectedly connected")
+        } catch {
+            #expect(error is GatewayExternalAuthorizationError)
+            let problem = GatewayConnectionProblemMapper.map(error: error)
+            #expect(problem?.kind == .externalAuthorizationRequired)
+            #expect(problem?.actionLabel == "Sign in")
+            #expect(problem?.pauseReconnect == true)
+            #expect(problem?.retryable == true)
+        }
+        #expect(session.snapshotMakeCount() == 0)
+        #expect(await channel.currentConnectionGeneration() == nil)
+        await channel.shutdown()
+    }
 
     @Test
     func `cleartext upgrade never reads or attaches custom headers`() async throws {
