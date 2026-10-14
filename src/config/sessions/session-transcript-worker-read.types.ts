@@ -9,7 +9,6 @@ import type { UserTurnTranscriptAdmissionReceipt } from "../../sessions/user-tur
 import type { OpenClawRegisteredAgentDatabase } from "../../state/openclaw-agent-db-contract.js";
 import type { VoiceSessionLookup } from "../../talk/client-voice-session-store.js";
 import type { ArchivedSessionEvictionQuery } from "./disk-budget.types.js";
-export type { LiveInput } from "./session-history-eviction-worker.types.js";
 import type {
   SessionTranscriptRawDeltaLimits,
   SessionTranscriptVisibleMessageDeltaLimits,
@@ -36,6 +35,8 @@ import type { SessionTranscriptAnchorSelection } from "./session-transcript-anch
 import type { SessionTranscriptAnchorEntry } from "./session-transcript-anchor-read.types.js";
 import type { SessionTranscriptSearchParams } from "./session-transcript-search.types.js";
 import type { TranscriptEntryAnchor } from "./transcript-entry-anchor.js";
+
+export type { LiveInput } from "./session-history-eviction-worker.types.js";
 
 export type SessionEntryCurrentWorkerInput = Omit<SessionEntryReadWorkerInput, "kind"> & {
   kind: "session-entry-current";

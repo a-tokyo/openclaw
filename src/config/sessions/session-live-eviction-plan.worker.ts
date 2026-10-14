@@ -1,6 +1,5 @@
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
 import { uniqueStrings } from "@openclaw/normalization-core/string-normalization";
-import { sql } from "kysely";
 import { executeSqliteQuerySync, sqliteStringSet } from "../../infra/kysely-sync.js";
 import {
   parseAgentSessionKey,
@@ -70,16 +69,6 @@ function emptyLiveEntryPlan(): SessionEntryMaintenancePlan {
     pruned: 0,
     capped: 0,
   };
-}
-
-/** Activity order matches `getSessionMaintenanceActivityAt` without loading prompt payloads. */
-function liveNodeActivityAtSql() {
-  return /* kysely-allow-raw: activity timestamp is not a stored column. */ sql<number>`CASE WHEN json_valid(entry_json) THEN MAX(
-    COALESCE(json_extract(entry_json, '$.lastInteractionAt'), 0),
-    COALESCE(json_extract(entry_json, '$.lastActivityAt'), 0),
-    COALESCE(json_extract(entry_json, '$.sessionStartedAt'), 0),
-    "updated_at"
-  ) ELSE "updated_at" END`;
 }
 
 function isLocalEvictionFenceIdentity(identity: string, unprotect: ReadonlySet<string>): boolean {
@@ -247,35 +236,29 @@ function isCapacityEligibleLiveNode(params: {
   return isDurableConversationSessionKey(key, entry);
 }
 
-/** Oldest eligible live node, paging metadata instead of the full catalog. */
+/** Oldest eligible live node, paging stored updated_at instead of the full catalog. */
 function readOldestCapacityEligibleLiveNode(params: {
   database: LiveEvictionDatabase;
   preserveKeys: ReadonlySet<string>;
   preserveRecentMs: number | null;
 }): { entry: SessionEntry; key: string } | undefined {
   const db = getSessionKysely(params.database.db);
-  // Alias the activity expression so the page cursor can filter it. SQLite
-  // does not allow that alias in the same SELECT's WHERE.
-  const candidates = db
-    .selectFrom("session_nodes")
-    .select(["session_key", "entry_json", liveNodeActivityAtSql().as("activity_at")])
-    .where("archived_at", "is", null)
-    .as("live_candidates");
   let cursor: { activityAt: number; sessionKey: string } | undefined;
   for (;;) {
     let query = db
-      .selectFrom(candidates)
-      .selectAll()
-      .orderBy("activity_at", "asc")
+      .selectFrom("session_nodes")
+      .select(["session_key", "entry_json", "updated_at"])
+      .where("archived_at", "is", null)
+      .orderBy("updated_at", "asc")
       .orderBy("session_key", "asc")
       .limit(LIVE_VICTIM_PAGE_SIZE);
     if (cursor) {
       const after = cursor;
       query = query.where((eb) =>
         eb.or([
-          eb("activity_at", ">", after.activityAt),
+          eb("updated_at", ">", after.activityAt),
           eb.and([
-            eb("activity_at", "=", after.activityAt),
+            eb("updated_at", "=", after.activityAt),
             eb("session_key", ">", after.sessionKey),
           ]),
         ]),
@@ -283,7 +266,7 @@ function readOldestCapacityEligibleLiveNode(params: {
     }
     const rows = executeSqliteQuerySync(params.database.db, query).rows;
     for (const row of rows) {
-      const activity = row.activity_at;
+      const activity = row.updated_at;
       cursor = {
         activityAt: Number.isFinite(activity) ? activity : 0,
         sessionKey: row.session_key,
