@@ -1,7 +1,8 @@
 import fs from "node:fs";
 import path from "node:path";
 import { DatabaseSync, StatementSync } from "node:sqlite";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { Worker } from "node:worker_threads";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import { executeSqliteQuerySync } from "../infra/kysely-sync.js";
 import {
@@ -79,6 +80,158 @@ function session(
 }
 
 describe("TranscriptsStore", () => {
+  it("reuses list pages without worker requests and observes another store's writes", async () => {
+    const { store } = createStore();
+    const writer = createStore().store;
+    const target = { ...session(), title: "Initial title" };
+    await writer.writeSession(target);
+    const options = { limit: 50, projection: "public" } as const;
+    const initial = await store.listReadEntries(options);
+    expect(initial.entries).toMatchObject([{ title: "Initial title", utteranceCount: 0 }]);
+    initial.entries[0]!.title = "Caller mutation";
+
+    const requests = vi.spyOn(Worker.prototype, "postMessage");
+    const sql = observeMainThreadSql();
+    try {
+      expect((await createStore().store.listReadEntries(options)).entries).toMatchObject([
+        { title: "Initial title", utteranceCount: 0 },
+      ]);
+      expect(requests).not.toHaveBeenCalled();
+      sql.expectIdle();
+
+      await writer.writeSession({ ...target, title: "Updated title" });
+      expect((await store.listReadEntries(options)).entries).toMatchObject([
+        { title: "Updated title", utteranceCount: 0 },
+      ]);
+      await writer.appendUtteranceForSession(target, { text: "New speech", final: true });
+      expect((await store.listReadEntries(options)).entries).toMatchObject([
+        { title: "Updated title", utteranceCount: 1 },
+      ]);
+      expect((await store.listReadEntries({ ...options, query: "absent" })).entries).toEqual([]);
+      expect((await store.listReadEntries(options)).entries).toHaveLength(1);
+      sql.expectIdle();
+    } finally {
+      requests.mockRestore();
+      sql.restore();
+    }
+  });
+
+  it.each(["empty", "speech", "summary", "export", "pending export", "rewritten"] as const)(
+    "discards only unchanged empty failed admissions (%s)",
+    async (state) => {
+      const { store, stateDir } = createStore();
+      const target = { ...session("abandoned"), stoppedAt: "2026-07-01T10:00:01.000Z" };
+      await store.writeSession(target);
+      const expectedInputRevision = await store.readSummaryInputRevision(target);
+      if (expectedInputRevision === undefined) {
+        throw new Error("Expected admitted transcript");
+      }
+      if (state === "speech") {
+        await store.appendUtteranceForSession(target, { text: "Retained speech", final: true });
+      } else if (state === "summary") {
+        await store.writeSummary(summarizeTranscripts({ session: target, utterances: [] }), target);
+      } else if (state === "export") {
+        await store.materializeSessionArtifacts(target, "all");
+      } else if (state === "pending export") {
+        // Model an interrupted export before it has recorded its final artifact hashes.
+        runOpenClawStateWriteTransaction(
+          ({ db }) => {
+            executeSqliteQuerySync(
+              db,
+              meetingTranscriptDb(db)
+                .updateTable("meeting_transcript_sessions")
+                .set({ export_pending_json: '["metadata.json"]' })
+                .where("session_id", "=", target.sessionId)
+                .where("started_at", "=", target.startedAt),
+            );
+          },
+          { env: { ...process.env, OPENCLAW_STATE_DIR: stateDir } },
+          { operationLabel: "test.transcripts.pending-export" },
+        );
+      } else if (state === "rewritten") {
+        await store.writeSession({ ...target, title: "Updated by another owner" });
+      }
+      const saved = await store.readSession(target.sessionId);
+      await store.deleteEmptySessionCandidate(target, {
+        expectedInputRevision,
+        assertCurrent: () => undefined,
+      });
+      expect(await store.readSession(target.sessionId)).toEqual(
+        state === "empty" ? undefined : saved,
+      );
+      if (state === "speech") {
+        expect(await store.readUtterancesForSession(target)).toMatchObject([
+          { text: "Retained speech" },
+        ]);
+      } else if (state === "summary") {
+        expect((await store.readSummary(target)).summary).toBeDefined();
+      } else if (state === "export") {
+        expect(fs.existsSync(path.join(store.sessionDir(target), "metadata.json"))).toBe(true);
+      }
+    },
+  );
+
+  it("keeps selector and overview columns aligned on insert, replacement, and removal", async () => {
+    const { store } = createStore();
+    const target = {
+      ...session(),
+      source: {
+        providerId: "manual-transcript",
+        accountId: "account",
+        guildId: "guild",
+        channelId: "channel",
+        meetingUrl: "https://example.test/meeting",
+        threadTs: "thread",
+        fileId: "file",
+      },
+      metadata: { agentId: "agent" },
+    };
+    const database = () =>
+      openOpenClawStateDatabase({
+        env: { ...process.env, OPENCLAW_STATE_DIR: suiteStateDir },
+      }).db;
+    const readColumns = () =>
+      database()
+        .prepare(
+          `SELECT source_account_id, source_guild_id, source_channel_id, source_meeting_url,
+                  source_thread_ts, source_file_id, metadata_agent_id
+             FROM meeting_transcript_sessions WHERE session_id = ? AND started_at = ?`,
+        )
+        .get(target.sessionId, target.startedAt);
+    await store.writeSession(target);
+    expect(readColumns()).toEqual({
+      source_account_id: "account",
+      source_guild_id: "guild",
+      source_channel_id: "channel",
+      source_meeting_url: "https://example.test/meeting",
+      source_thread_ts: "thread",
+      source_file_id: "file",
+      metadata_agent_id: "agent",
+    });
+    await store.writeSession({
+      ...target,
+      source: { providerId: "manual-transcript", accountId: "replacement" },
+      metadata: {},
+    });
+    expect(readColumns()).toEqual({
+      source_account_id: "replacement",
+      source_guild_id: null,
+      source_channel_id: null,
+      source_meeting_url: null,
+      source_thread_ts: null,
+      source_file_id: null,
+      metadata_agent_id: null,
+    });
+    const summary = summarizeTranscripts({ session: target, utterances: [] });
+    await store.writeSummary({ ...summary, overview: "Initial overview" }, target);
+    await store.writeSummary({ ...summary, overview: "Replacement overview" }, target);
+    expect(
+      database()
+        .prepare("SELECT overview FROM meeting_transcript_summaries WHERE session_id = ?")
+        .get(target.sessionId),
+    ).toEqual({ overview: "Replacement overview" });
+  });
+
   it("keeps summary snapshot queries bound to the current session and persisted revision", async () => {
     const { store } = createStore();
     const first = session("summary-first");
@@ -463,7 +616,10 @@ describe("TranscriptsStore", () => {
     const lower = session("capital", "2026-07-01T11:00:00.000Z");
     await store.writeSession(lower);
     await store.materializeSessionArtifacts(lower, "metadata");
-    await expect(store.writeSession(upper)).resolves.toBeUndefined();
+    await expect(store.writeSession(upper)).resolves.toMatchObject({
+      inserted: true,
+      inputRevision: expect.any(String),
+    });
 
     if (fs.existsSync(store.sessionDir(upper))) {
       await expect(store.materializeSessionArtifacts(lower, "metadata")).resolves.toMatchObject({
@@ -510,7 +666,10 @@ describe("TranscriptsStore", () => {
     if (fs.existsSync(path.join(store.sessionDir(lower), "transcript.jsonl"))) {
       await expect(store.writeSession(lower)).rejects.toThrow("run openclaw doctor --fix");
     } else {
-      await expect(store.writeSession(lower)).resolves.toBeUndefined();
+      await expect(store.writeSession(lower)).resolves.toMatchObject({
+        inserted: true,
+        inputRevision: expect.any(String),
+      });
     }
   });
 
@@ -561,7 +720,7 @@ describe("TranscriptsStore", () => {
 
     await expect(
       store.writeSession({ ...target, stoppedAt: "2026-07-01T11:00:00.000Z" }),
-    ).resolves.toBeUndefined();
+    ).resolves.toMatchObject({ inserted: false, inputRevision: expect.any(String) });
     await expect(store.readSession(target.sessionId)).resolves.toMatchObject({
       stoppedAt: "2026-07-01T11:00:00.000Z",
     });

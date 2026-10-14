@@ -62,6 +62,51 @@ function selectionScope(selected: SubagentRunReadSelection) {
   };
 }
 
+/** Merge only indexed scope members; live rows veto moved durable ownership. */
+export function mergeSubagentRunReadScope(
+  inMemoryRuns: Map<string, SubagentRunRecord>,
+  compactCache: SubagentRunsCache<SubagentRunReadRecord>,
+  compact: Map<string, SubagentRunReadRecord>,
+  readScope: SubagentRunReadScope,
+): Map<string, SubagentRunReadRecord> {
+  if (readScope !== "all") {
+    const live = getSubagentSessionReadLookup(inMemoryRuns);
+    const durable = getSessionListLookup(compactCache, compact);
+    let liveKeys: string[];
+    let persistedKeys: string[];
+    if ("runIds" in readScope) {
+      liveKeys = live.selectRunIds(readScope.runIds);
+      persistedKeys = durable.selectRunIds(readScope.runIds, liveKeys);
+    } else if ("childSessionKeys" in readScope) {
+      const keys = new Set(readScope.childSessionKeys.map((key) => key.trim()).filter(Boolean));
+      liveKeys = live.selectChildren(keys);
+      persistedKeys = durable.selectChildren(keys);
+    } else {
+      liveKeys = live.selectReadScope(readScope.sessionKeys, durable, readScope.descendants);
+      persistedKeys = durable.selectReadScope(
+        readScope.sessionKeys,
+        live,
+        readScope.descendants,
+        liveKeys,
+      );
+    }
+    const snapshot = new Map<string, SubagentRunReadRecord>();
+    for (const key of new Set([...persistedKeys, ...liveKeys])) {
+      const liveEntry = inMemoryRuns.get(key);
+      const entry = liveEntry ? projectSubagentRunForSessionList(liveEntry) : compact.get(key);
+      if (entry) {
+        snapshot.set(key, entry);
+      }
+    }
+    return snapshot;
+  }
+  const snapshot = new Map(compact);
+  for (const [runId, entry] of inMemoryRuns) {
+    snapshot.set(runId, projectSubagentRunForSessionList(entry));
+  }
+  return snapshot;
+}
+
 /** Prepare worker payloads; authority and publications are merged in the caller's consuming frame. */
 export async function prepareSubagentRunReadSnapshot<S extends SubagentRunReadSelection>(params: {
   inMemoryRuns: Map<string, SubagentRunRecord>;
@@ -86,56 +131,20 @@ export async function prepareSubagentRunReadSnapshot<S extends SubagentRunReadSe
       assertSubagentReadContext(context);
     }
   };
-  const withLiveFacts = (compact: Map<string, SubagentRunReadRecord>) => {
-    if (readScope !== "all") {
-      const live = getSubagentSessionReadLookup(inMemoryRuns);
-      const durable = getSessionListLookup(compactCache, compact);
-      let liveKeys: string[];
-      let persistedKeys: string[];
-      if ("runIds" in readScope) {
-        liveKeys = live.selectRunIds(readScope.runIds);
-        persistedKeys = durable.selectRunIds(readScope.runIds, liveKeys);
-      } else if ("childSessionKeys" in readScope) {
-        const keys = new Set(readScope.childSessionKeys.map((key) => key.trim()).filter(Boolean));
-        liveKeys = live.selectChildren(keys);
-        persistedKeys = durable.selectChildren(keys);
-      } else {
-        liveKeys = live.selectReadScope(readScope.sessionKeys, durable, readScope.descendants);
-        persistedKeys = durable.selectReadScope(
-          readScope.sessionKeys,
-          live,
-          readScope.descendants,
-          liveKeys,
-        );
-      }
-      const snapshot = new Map<string, SubagentRunReadRecord>();
-      for (const key of new Set([...persistedKeys, ...liveKeys])) {
-        const liveEntry = inMemoryRuns.get(key);
-        const entry = liveEntry ? projectSubagentRunForSessionList(liveEntry) : compact.get(key);
-        if (entry) {
-          snapshot.set(key, entry);
-        }
-      }
-      return snapshot;
-    }
-    const snapshot = new Map(compact);
-    for (const [runId, entry] of inMemoryRuns) {
-      snapshot.set(runId, projectSubagentRunForSessionList(entry));
-    }
-    return snapshot;
-  };
+  const withLiveFacts = (compact: Map<string, SubagentRunReadRecord>) =>
+    mergeSubagentRunReadScope(inMemoryRuns, compactCache, compact, readScope);
   const compact = context
     ? await prepareSubagentRunsCache(compactCache, readCompactSubagentRuns)
     : new Map<string, SubagentRunReadRecord>();
   const selected = select(withLiveFacts(compact));
   const scope = selectionScope(selected);
-  // Keep durable payloads separate: a live-only row may disappear before consumption.
+  // Committed resident rows already carry their full payload; publications supply later changes.
   let persisted = context ? acceptedFullSnapshot(fullCache, context) : undefined;
   if (!persisted) {
     persisted = new Map<string, SubagentRunRecord>();
     if (context) {
       const scopes = [
-        { kind: "ids" as const, runIds: [...scope.runIds] },
+        { kind: "ids" as const, runIds: [...scope.runIds].filter((id) => !inMemoryRuns.has(id)) },
         ...[...scope.sessionKeys].map((sessionKey) => ({ kind: "session" as const, sessionKey })),
       ];
       for (const payloadScope of scopes) {

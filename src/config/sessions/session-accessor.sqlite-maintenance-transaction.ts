@@ -1,3 +1,4 @@
+import { sqlPublicationAnchor } from "../../infra/sql-connection.js";
 import { runWithSqliteBusyTimeout } from "../../infra/sqlite-busy-timeout.js";
 import { withSqlitePostCommitPublications } from "../../infra/sqlite-post-commit.js";
 import { runSqliteDeferredTransactionSync } from "../../infra/sqlite-transaction.js";
@@ -28,6 +29,7 @@ import {
 import type {
   ReclamationDatabaseOptions,
   SessionEntryMaintenanceInput,
+  SessionEntryMaintenancePlan,
   SessionMaintenanceMetadataCommand,
   SessionMaintenanceMetadataResult,
   SessionMaintenanceReadCommand,
@@ -189,7 +191,7 @@ export function readSessionMaintenanceInWorker(
           ageFact: readSessionEntryMaintenanceAgeFact(database.db, input.maintenance),
         };
       }
-      return withSqlitePostCommitPublications(database.db, () =>
+      return withSqlitePostCommitPublications(sqlPublicationAnchor(database.db), () =>
         runSqliteDeferredTransactionSync(
           database.db,
           (): SessionMaintenanceReadResult => {
@@ -293,7 +295,10 @@ export function runSessionMaintenanceMetadataInTransaction(
   callbacks: {
     beforeMutation?: (database: OpenClawAgentDatabase) => void;
     onCommit?: SqliteSessionReclamationCallbacks["onCommit"];
-    beforeCommit?: (database: OpenClawAgentDatabase) => void;
+    beforeCommit?: (
+      database: OpenClawAgentDatabase,
+      maintenance?: SessionEntryMaintenancePlan,
+    ) => void;
     onArchived?: Parameters<typeof applySessionEntryMaintenanceInDatabase>[3];
   },
   prepared?: ReturnType<typeof prepareSessionMaintenanceInWorker>,
@@ -343,7 +348,7 @@ export function runSessionMaintenanceMetadataInTransaction(
         if (maintenance.archived > 0 || maintenance.entryRemovals.length > 0) {
           callbacks.onCommit?.(database);
         }
-        callbacks.beforeCommit?.(database);
+        callbacks.beforeCommit?.(database, maintenance);
         return {
           kind: plan.kind,
           value: maintenance,

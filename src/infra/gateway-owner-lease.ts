@@ -1,7 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { hostname } from "node:os";
 import path from "node:path";
-import type { DatabaseSync } from "node:sqlite";
 import type { RetainedOperation } from "@openclaw/worker-runtime/lifecycle";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import { getAsyncWorkSignal } from "../shared/async-work-scope.js";
@@ -28,7 +27,7 @@ import { captureOpenClawStateReadWorkerContext } from "../state/openclaw-state-w
 import {
   classifyGatewayOwnerProcessNamespace,
   describeGatewayLockHolder,
-  GATEWAY_OWNER_HEARTBEAT_MS,
+  GATEWAY_OWNER_HEARTBEAT_STALE_MS,
   GatewayLockNamespaceError,
   readGatewayLockProcessNamespace,
 } from "./gateway-lock-payload.js";
@@ -39,6 +38,7 @@ import type {
 } from "./gateway-owner-lease.types.js";
 import { captureGatewayStateOwner, type StateDatabaseSchemaLease } from "./gateway-state-owner.js";
 import { resolveDiagnosticProcessEnv } from "./process-env.js";
+import type { EngineConnection } from "./sql-connection.js";
 import { throwSqliteLifecycleErrors } from "./sqlite-lifecycle-errors.js";
 import { retainSnapshotTempDirectory } from "./sqlite-readonly-location-cleanup.js";
 import type { PreparedSqliteReadOnlyLocation } from "./sqlite-readonly-location.types.js";
@@ -209,7 +209,7 @@ export function readGatewayOwnerLease(
     openStateSchemaReadAdmission?: OpenClawStateSchemaReadAdmission;
   } = {},
 ): GatewayOwnerLeaseIdentity | undefined {
-  const operation = ({ db }: { db: DatabaseSync }) =>
+  const operation = ({ db }: { db: EngineConnection }) =>
     readGatewayOwnerLeaseFromDatabase(db, params.port);
   return params.current || params.openStateSchemaReadAdmission
     ? withExistingOpenClawStateDatabaseCurrentReadOnly(
@@ -247,7 +247,7 @@ export function acquireGatewayOwnerLease(params: {
     mode: params.mode,
     supervisor: params.supervisor,
   });
-  const mutateLease = <T>(operation: "acquire" | "release", mutate: (db: DatabaseSync) => T) =>
+  const mutateLease = <T>(operation: "acquire" | "release", mutate: (db: EngineConnection) => T) =>
     withOpenClawStateStartupMigrationCheckpointDatabase(
       (db) =>
         runSqliteImmediateTransactionSync(
@@ -261,7 +261,7 @@ export function acquireGatewayOwnerLease(params: {
             operationLabel: `gateway.owner-lease.${operation}`,
           },
         ),
-      { env, path: databasePath },
+      { env, path: databasePath, sealOnClose: operation === "release" },
     );
   const expiresAt = mutateLease("acquire", (db) => {
     const previous = resolveStoppedGatewayOwnerLease(readGatewayOwnerLeaseFromDatabase(db));
@@ -291,7 +291,10 @@ export function acquireGatewayOwnerLease(params: {
         leaseMs: STARTUP_MIGRATION_LEASE_TTL_MS,
         acquiredAt: expiresAt - STARTUP_MIGRATION_LEASE_TTL_MS,
         expiresAt,
-        heartbeatMs: GATEWAY_OWNER_HEARTBEAT_MS,
+        // Foreign-namespace recovery expires heartbeat evidence before the lease's TTL.
+        heartbeatMs: Math.floor(
+          Math.min(STARTUP_MIGRATION_LEASE_TTL_MS, GATEWAY_OWNER_HEARTBEAT_STALE_MS) / 3,
+        ),
         ...(processOwner.startedAt === null
           ? { processOwner: { identity: processOwner, env: resolveDiagnosticProcessEnv(env) } }
           : {}),

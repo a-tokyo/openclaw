@@ -13,11 +13,11 @@ import {
 } from "../state/github-publication-requester.js";
 import type { SessionRepositoryWorkspaceRecord } from "../state/session-repository-workspaces.types.js";
 import type { PersonalGitHubAction } from "./github-personal-oauth.js";
+import { createRepositoryPersonalPublicationStatus } from "./github-personal-publication-status.js";
 import {
   assertPersonalGitHubPublicationReplay,
   bindPersonalGitHubPublicationSelection,
   preparePersonalRepositoryPublicationStatus as preparePersonalStatus,
-  presentPersonalGitHubPublicationStatus,
   preparePersonalGitHubPublicationSelection,
   type PersonalGitHubSessionActionV2,
   type PreparedRepositoryPublicationStatus,
@@ -27,6 +27,7 @@ import {
   prepareCurrentGitHubPublicationIdentity,
   sameGitHubPublicationWorkspace,
   type PublicationSessionIdentity as SessionIdentity,
+  prepareGitHubPublicationSession,
 } from "./github-publication-availability.js";
 import {
   exactClaimForPlacement,
@@ -56,8 +57,6 @@ import {
 } from "./github-repository-publication-store.js";
 import { prepareRepositoryOwner } from "./github-repository-publication-workspace.js";
 import { matchesRepositoryGitHubPublicationClaim } from "./github-repository-publication.kernel.js";
-import type { RepositoryGitHubPublicationStatusRow } from "./github-repository-publication.kernel.js";
-import { loadGatewaySessionEntryReadOnlyInWorker } from "./session-utils-store-worker.js";
 import { resolvePlacementTurnEnvironment } from "./worker-environments/placement-record.js";
 import type {
   WorkerSessionPlacementStore,
@@ -86,20 +85,7 @@ export function createRepositoryGitHubPublicationCoordinator(params: {
   };
   const instanceId = placements.workspaceResultInstanceId();
   const active = new Map<string, string>();
-  const personalStatus = (
-    row: RepositoryGitHubPublicationStatusRow,
-    action: PersonalGitHubAction,
-    session: SessionIdentity,
-    prepared: PreparedRepositoryPublicationStatus | undefined,
-  ) =>
-    presentPersonalGitHubPublicationStatus(
-      { kind: "repository", row, prepared },
-      action,
-      session,
-      row.execution_id !== null &&
-        row.gateway_instance_id === instanceId &&
-        active.get(row.request_id) === row.execution_id,
-    );
+  const personalStatus = createRepositoryPersonalPublicationStatus(instanceId, active);
   const execute = createRepositoryGitHubPublicationExecution({
     instanceId,
     active,
@@ -184,12 +170,12 @@ export function createRepositoryGitHubPublicationCoordinator(params: {
     if (!input.sessionKey) {
       throw new Error("GitHub publication requires an authoritative session.");
     }
-    const loaded = await loadGatewaySessionEntryReadOnlyInWorker({
+    using selectedSession = await prepareGitHubPublicationSession(input.sessionKey, {
       cfg: getCommittedRuntimeConfig(),
-      key: input.sessionKey,
       agentId: input.agentId,
-      assertActive: params.assertCurrent,
+      assertCurrent: params.assertCurrent,
     });
+    const loaded = selectedSession.loaded;
     requester.assertCurrent();
     if (!loaded.entry?.sessionId) {
       throw new Error("GitHub publication session changed.");
@@ -201,6 +187,8 @@ export function createRepositoryGitHubPublicationCoordinator(params: {
       agentId: input.agentId,
     };
     const currentOwner = await prepareRepositoryOwner(session);
+    using _ = { [Symbol.dispose]: () => currentOwner.release() };
+
     const initial = currentOwner();
     const assertCurrent = () => {
       requester.assertCurrent();
@@ -316,12 +304,12 @@ export function createRepositoryGitHubPublicationCoordinator(params: {
       if (input.selection?.source === "personal") {
         throw new Error("My GitHub publication requires direct personal authorization.");
       }
-      const loaded = await loadGatewaySessionEntryReadOnlyInWorker({
+      using selectedSession = await prepareGitHubPublicationSession(input.sessionKey!, {
         cfg: getCommittedRuntimeConfig(),
-        key: input.sessionKey!,
         agentId: input.agentId,
-        assertActive: params.assertCurrent,
+        assertCurrent: params.assertCurrent,
       });
+      const loaded = selectedSession.loaded;
       const placement = loaded.entry?.sessionId
         ? await placements.getAsync(loaded.entry.sessionId)
         : undefined;
@@ -371,10 +359,11 @@ export function createRepositoryGitHubPublicationCoordinator(params: {
       if (existing) {
         assertPersonalGitHubPublicationReplay(existing, input, selected);
         const prepared = await preparePersonalStatus(existing.request_id);
+        using _ = { [Symbol.dispose]: () => prepared?.release() };
         action.assertCurrent();
-        return personalStatus(existing, action, action, prepared).result;
+        return (await personalStatus(existing, action, action, prepared)).result;
       }
-      const bound = bindPersonalGitHubPublicationSelection(action, selected, {
+      const bound = await bindPersonalGitHubPublicationSelection(action, selected, {
         idempotencyKey: input.idempotencyKey,
         hasRequest: () => Boolean(existing),
       });
@@ -382,6 +371,8 @@ export function createRepositoryGitHubPublicationCoordinator(params: {
         action,
         async (assertReservation) => {
           const currentOwner = await prepareRepositoryOwner(action);
+          using _ = { [Symbol.dispose]: () => currentOwner.release() };
+
           const initial = currentOwner();
           const assertCurrent = () => {
             action.assertCurrent();
@@ -489,8 +480,9 @@ export function createRepositoryGitHubPublicationCoordinator(params: {
         return null;
       }
       const prepared = await preparePersonalStatus(row.request_id);
+      using _ = { [Symbol.dispose]: () => prepared?.release() };
       action.assertCurrent();
-      return personalStatus(row, action, session, prepared);
+      return await personalStatus(row, action, session, prepared);
     },
     async confirmPersonalV2(
       input: SessionGitHubConfirmParams,
@@ -523,7 +515,7 @@ export function createRepositoryGitHubPublicationCoordinator(params: {
       if (!row.checkpoint_ref) {
         throw new Error("GitHub publication has no accepted checkpoint.");
       }
-      bindPersonalGitHubPublicationSelection(action, input);
+      await bindPersonalGitHubPublicationSelection(action, input);
       return await placements.withRepositoryWorkspaceReservation(
         action,
         async (assertReservation) =>

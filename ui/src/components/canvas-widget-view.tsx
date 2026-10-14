@@ -402,7 +402,7 @@ class CanvasWidgetController {
     }
     postWidgetTheme(frame, this.sandboxOrigin);
     frame.contentWindow?.postMessage({ type: "openclaw:widget-chat-host" }, this.sandboxOrigin);
-    // Saved widget documents already use this bridge for unconsumed wheel/touch input.
+    // Saved widget documents use this bridge for unconsumed wheel input.
     frame.contentWindow?.postMessage(
       { type: "openclaw:widget-board-host", nonce: this.scrollNonce },
       this.sandboxOrigin,
@@ -640,8 +640,8 @@ export const CanvasWidgetView = defineSolidBridge<CanvasWidgetViewProps>(
             <Show
               when={read().pending}
               fallback={
+                // Preserve the empty reserved box across the lazy element's upgrade.
                 <div
-                  class="skeleton"
                   role="status"
                   aria-label={t("common.loading")}
                   style={{ "min-height": `${height()}px` }}

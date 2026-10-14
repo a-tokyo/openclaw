@@ -6,7 +6,7 @@ read_when:
   - You need to select a SQLite library for Bun on macOS
 ---
 
-Bun is an explicit opt-in runtime for standalone OpenClaw CLI, Gateway, and managed node host installations. Node remains their primary and recommended runtime. The native macOS app and fresh local Tauri installations on Linux use the OpenClaw Bun fork for their app-managed runtime. This reference covers Bun requirements and compatibility; see [Bun](/install/bun) for standalone installation and opt-in steps, or [Node.js compatibility](/install/node-compatibility) for Node requirements.
+Bun is an explicit opt-in runtime for standalone OpenClaw CLI, Gateway, and managed node host installations. Node remains their primary and recommended runtime. The native macOS app and fresh local Tauri installations on Linux and Windows use the OpenClaw Bun fork for their app-managed runtime. This reference covers Bun requirements and compatibility; see [Bun](/install/bun) for standalone installation and opt-in steps, or [Node.js compatibility](/install/node-compatibility) for Node requirements.
 
 Plugin resolution stays with Bun's native/Jiti loader and `Bun.plugin` on Bun, even when `Module.registerHooks` is available; Node uses `Module.registerHooks`. Windows paths alone do not force native loading: captured source uses the same capability-based selection as other platforms, and retiring a plugin generation removes its native and Jiti cache records. Native SDK aliases return platform-native filenames from `require.resolve()`; Jiti transformation maps retain their own path spelling.
 
@@ -32,8 +32,9 @@ The Linux Tauri app leaves existing Gateway services unchanged on startup and
 updates. Switching to its current bundled Bun requires **Use bundled runtime…**;
 see [explicit runtime selection](/platforms/linux#adopt-the-bundled-runtime).
 macOS Tauri keeps its existing runtime behavior, separate from the native macOS
-app. Windows Tauri retains its existing runtime until a signed fork Windows build
-is available; an unsigned dry-run is not shippable.
+app. Windows Tauri uses the same shared runtime owner when its pin includes a signed
+Windows fork build. Without that entry, local setup reports the missing runtime
+and remote connections remain available; an unsigned dry-run is not shippable.
 
 OpenClaw.app bundles a pinned [OpenClaw Bun fork](https://github.com/openclaw/bun),
 the full matching OpenClaw package, and a signed SQLite library that meets the

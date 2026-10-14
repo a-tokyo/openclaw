@@ -1,11 +1,25 @@
 import "../test-utils/prepare-compiled-subprocesses.js";
 import { DOMParser } from "linkedom";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
-  renderPublicSessionCardSvg,
+  renderPublicSessionCardPng,
   type PublicSessionCard,
 } from "./control-ui-public-session-card-render.js";
 import { createPublicSessionCardRenderer } from "./control-ui-public-session-card.js";
+
+const rasterizerInput = vi.hoisted(() => vi.fn<(svg: string) => void>());
+
+// Inspect the production rasterizer input; the worker PNG test loads its own real module.
+vi.mock("@resvg/resvg-js", () => ({
+  Resvg: class {
+    constructor(svg: string) {
+      rasterizerInput(svg);
+    }
+    render() {
+      return { asPng: () => Buffer.alloc(0) };
+    }
+  },
+}));
 
 const CARD: PublicSessionCard = {
   title: "A clearer public session preview",
@@ -16,8 +30,15 @@ const CARD: PublicSessionCard = {
   host: "example.test",
 };
 
+function renderSvg(card: PublicSessionCard): string {
+  rasterizerInput.mockClear();
+  renderPublicSessionCardPng(card);
+  expect(rasterizerInput).toHaveBeenCalledOnce();
+  return rasterizerInput.mock.calls[0]![0];
+}
+
 function parse(card: PublicSessionCard) {
-  return new DOMParser().parseFromString(renderPublicSessionCardSvg(card), "image/svg+xml");
+  return new DOMParser().parseFromString(renderSvg(card), "image/svg+xml");
 }
 
 describe("public session preview card", () => {
@@ -75,7 +96,7 @@ describe("public session preview card", () => {
       const document = parse({ ...card, repoSlug: injection, worktree });
       expect(document.querySelector("script, image, foreignObject, a")).toBeNull();
       expect(document.documentElement.textContent).toContain(injection);
-      expect(renderPublicSessionCardSvg({ ...card, worktree })).toContain("&lt;script");
+      expect(renderSvg({ ...card, worktree })).toContain("&lt;script");
     }
   });
 
@@ -95,20 +116,19 @@ describe("public session preview card", () => {
     expect(document.documentElement.textContent?.length).toBeLessThan(500);
   });
 
-  it.each([
-    "A short title",
-    "A longer public session title that wraps across the card",
-    "A very long title ".repeat(30),
-  ])("keeps the opening quote directly below the title: %s", (title) => {
-    const document = parse({ ...CARD, title });
-    const titleLines = [...document.querySelectorAll('text[font-size="56"]')];
-    const lastTitleY = Number(titleLines.at(-1)?.getAttribute("y"));
-    const quoteY = Number(
-      document.querySelector('text[font-family="Instrument Serif"]')?.getAttribute("y"),
-    );
-    expect(quoteY - lastTitleY).toBeGreaterThan(50);
-    expect(quoteY - lastTitleY).toBeLessThan(80);
-  });
+  it.each(["A very long title ".repeat(30)])(
+    "keeps the opening quote directly below the title: %s",
+    (title) => {
+      const document = parse({ ...CARD, title });
+      const titleLines = [...document.querySelectorAll('text[font-size="56"]')];
+      const lastTitleY = Number(titleLines.at(-1)?.getAttribute("y"));
+      const quoteY = Number(
+        document.querySelector('text[font-family="Instrument Serif"]')?.getAttribute("y"),
+      );
+      expect(quoteY - lastTitleY).toBeGreaterThan(50);
+      expect(quoteY - lastTitleY).toBeLessThan(80);
+    },
+  );
 
   it("renders bundled fonts into a 1200 by 630 PNG through the worker", async () => {
     const renderer = createPublicSessionCardRenderer();

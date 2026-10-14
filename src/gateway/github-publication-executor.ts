@@ -83,6 +83,7 @@ export async function reconcileGitHubPublication<Row extends PublicationRow>(par
     return undefined;
   }
   let worktreeOwner: Awaited<ReturnType<typeof readLocalGitHubPublicationWorktreeOwner>>;
+  let releaseWorktree: (() => void) | undefined;
   const { assertCurrent, refreshIdentity } = createGitHubPublicationExecutionIdentity({
     row,
     identity: params.identity,
@@ -94,6 +95,7 @@ export async function reconcileGitHubPublication<Row extends PublicationRow>(par
   let url: string | undefined;
   try {
     worktreeOwner = await readLocalGitHubPublicationWorktreeOwner(row);
+    releaseWorktree = worktreeOwner.release;
     const { worktree } = worktreeOwner;
     assertCurrent();
     const target = await prepareGitHubPublicationTarget({
@@ -131,6 +133,8 @@ export async function reconcileGitHubPublication<Row extends PublicationRow>(par
       "GitHub publication is unconfirmed; restore read access to the original target and retry recovery. Recorded effects are retained.",
       { cause: error },
     );
+  } finally {
+    releaseWorktree?.();
   }
   if (!url) {
     return undefined;
@@ -189,6 +193,8 @@ export async function executeGitHubPublication<Row extends PublicationRow>(param
   let worktreeOwner:
     | Awaited<ReturnType<typeof readLocalGitHubPublicationWorktreeOwner>>
     | undefined;
+  using _ = { [Symbol.dispose]: () => worktreeOwner?.release() };
+
   const currentWorktree = () => {
     if (!worktreeOwner) {
       throw new GitHubPublicationRecoveryPendingError(
@@ -276,7 +282,11 @@ export async function executeGitHubPublication<Row extends PublicationRow>(param
     });
     let identity = await refreshIdentity();
     const { pushRepository, repository, branch, baseBranch, pushOwner, githubHost } =
-      await prepareGitHubPublicationTarget({ worktree, identity, assertCurrent: assertAuthority });
+      await prepareGitHubPublicationTarget({
+        worktree,
+        identity,
+        assertCurrent: assertAuthority,
+      });
     if (
       params.target &&
       (params.target.pushRepository !== pushRepository ||
@@ -355,7 +365,9 @@ export async function executeGitHubPublication<Row extends PublicationRow>(param
       cwd: worktree.path,
     });
     const markerPresent = currentMessage.split(/\r?\n/u).includes(marker);
-    const currentTree = await command(["git", "rev-parse", "HEAD^{tree}"], { cwd: worktree.path });
+    const currentTree = await command(["git", "rev-parse", "HEAD^{tree}"], {
+      cwd: worktree.path,
+    });
     if (markerPresent) {
       const markerParent = await command(["git", "rev-parse", "HEAD^"], { cwd: worktree.path });
       if (markerParent !== sourceHeadCommit || currentTree !== workspaceTree) {
@@ -504,7 +516,7 @@ export async function executeGitHubPublication<Row extends PublicationRow>(param
         // The owned open PR already exposes this exact attributed tree. A new request
         // needs a receipt, not a new commit marker or index transaction. First publication
         // and missing contributor credit still use the request-owned recovery marker below.
-        return completePublished(existingPullRequest, headCommit);
+        return await completePublished(existingPullRequest, headCommit);
       }
     }
     const previousBranchHead = headCommit;
@@ -656,7 +668,7 @@ export async function executeGitHubPublication<Row extends PublicationRow>(param
     if (pullRequestPending) {
       await params.recordEffect?.("pull_request", { url: pullRequestUrl });
     }
-    return completePublished(pullRequestUrl, headCommit);
+    return await completePublished(pullRequestUrl, headCommit);
   } catch (error) {
     if (
       isAbortError(error) ||
@@ -708,5 +720,7 @@ export async function executeGitHubPublication<Row extends PublicationRow>(param
       throw error;
     }
     return result;
+  } finally {
+    worktreeOwner?.release();
   }
 }

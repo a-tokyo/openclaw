@@ -22,6 +22,8 @@ import { replaceSessionEntry } from "../config/sessions/session-accessor.sqlite-
 import { rewriteSqliteTranscriptEventRowsInTransaction } from "../config/sessions/session-accessor.sqlite-transcript-store.js";
 import { replaceTranscriptEvents } from "../config/sessions/session-accessor.sqlite-transcript-write.test-support.js";
 import { runWithSessionTranscriptReadFence } from "../config/sessions/session-transcript-read-fence.js";
+import { openNodeSqliteDatabase } from "../infra/node-sqlite.js";
+import { admitSqliteSchema } from "../infra/sqlite-schema-facts.js";
 import * as brokerReply from "../infra/sqlite-worker-broker-reply.js";
 import * as operationAdmission from "../infra/sqlite-worker-operation-admission.js";
 import { appendSessionTranscriptMessageByIdentity } from "../plugin-sdk/session-transcript-runtime.js";
@@ -223,6 +225,41 @@ describe("managed attachment SQLite visibility", () => {
     expect(fs.existsSync(f.originalPath)).toBe(false);
   });
 
+  it.each(["sqlite", "archive"] as const)(
+    "retains media owned by oversized %s history while cleaning other sessions",
+    async (source) => {
+      const oversized = await fixture();
+      const orphan = await fixture("missing");
+      const history = [
+        message(oversized.messageId, null, [
+          oversized.block,
+          { type: "text", text: "x".repeat(8 * 1024 * 1024) },
+        ]),
+      ];
+      await seed(oversized, source === "sqlite" ? history : []);
+      if (source === "archive") {
+        archive(oversized, history);
+      }
+      const original = await readManagedImageRecord(oversized.attachmentId, stateDir);
+      expect(original).not.toBeNull();
+      await insertManagedImageRecord(
+        { ...original!, attachmentId: randomUUID(), messageId: "unverified" },
+        stateDir,
+      );
+      await seed(orphan, [message("different", null, "no attachment")]);
+
+      expect(await cleanupManagedOutgoingMediaRecords({ stateDir })).toEqual({
+        deletedRecordCount: 1,
+        deletedFileCount: 1,
+        retainedCount: 2,
+      });
+      expect(await readManagedImageRecord(oversized.attachmentId, stateDir)).not.toBeNull();
+      expect(fs.existsSync(oversized.originalPath)).toBe(true);
+      expect(await readManagedImageRecord(orphan.attachmentId, stateDir)).toBeNull();
+      expect(fs.existsSync(orphan.originalPath)).toBe(false);
+    },
+  );
+
   it("reads managed attachment membership without validating unrelated payloads", async () => {
     const f = await fixture();
     const marker = "unrelated-managed-download-payload";
@@ -349,7 +386,10 @@ describe("managed attachment SQLite visibility", () => {
       };
       // Match runtime connection admission instead of failing immediately on an
       // unrelated transient lock. The write still commits inside the read snapshot.
-      const writer = new DatabaseSync(database.path, { timeout: OPENCLAW_SQLITE_BUSY_TIMEOUT_MS });
+      const writer = openNodeSqliteDatabase(database.path, {
+        timeout: OPENCLAW_SQLITE_BUSY_TIMEOUT_MS,
+      });
+      admitSqliteSchema(writer);
       const parse = JSON.parse;
       let rewrote = false;
       const spy = vi.spyOn(JSON, "parse").mockImplementation((value, reviver) => {
