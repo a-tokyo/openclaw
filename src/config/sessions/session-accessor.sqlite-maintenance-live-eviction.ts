@@ -92,6 +92,7 @@ export async function reclaimSessionPagesAfterEviction(params: {
 
 /** Plans one oldest idle durable-conversation removal. Discovery reads run in the maintenance worker. */
 export async function readLiveEvictionPlan(params: {
+  activeSessionKey?: string;
   archiveDirectory: string;
   databaseOptions: OpenClawAgentDatabaseOptions;
   preserveRecentMs?: number | null;
@@ -105,6 +106,7 @@ export async function readLiveEvictionPlan(params: {
   try {
     plan = {
       archiveDirectory: params.archiveDirectory,
+      baseKeys: params.activeSessionKey ? [params.activeSessionKey] : [],
       preserveRecentMs: params.preserveRecentMs ?? null,
       skipSessionKeys: [...(params.skipSessionKeys ?? [])],
       snapshot: prepared.capture(),
@@ -135,6 +137,7 @@ export async function readLiveEvictionPlan(params: {
 
 /** Last-resort live-node disk eviction. Historical generations must already be exhausted. */
 export async function reclaimSqliteLiveSessionEntriesToHighWater(params: {
+  activeSessionKey?: string;
   archiveDirectory: string;
   highWaterBytes: number;
   pruneArchivesToHighWater: () => Promise<{
@@ -159,6 +162,7 @@ export async function reclaimSqliteLiveSessionEntriesToHighWater(params: {
   const skipSessionKeys = new Set<string>();
   const databaseOptions = toDatabaseOptions(params.resolved);
   const planParams = {
+    activeSessionKey: params.activeSessionKey,
     archiveDirectory: params.archiveDirectory,
     databaseOptions,
     preserveRecentMs: params.preserveRecentMs,

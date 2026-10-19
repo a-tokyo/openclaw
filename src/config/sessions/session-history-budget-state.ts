@@ -12,6 +12,7 @@ import type { ResolvedSessionMaintenanceConfig } from "./store-maintenance.js";
 const log = createSubsystemLogger("sessions/history-eviction");
 
 export type SessionHistoryDiskBudgetParams = {
+  activeSessionKey?: string;
   agentId?: string;
   env?: NodeJS.ProcessEnv;
   mode: ResolvedSessionMaintenanceConfig["mode"];

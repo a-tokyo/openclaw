@@ -186,6 +186,7 @@ function collectCapacityEligibleLivePreserveKeys(
     ),
   };
   const preserveKeys = resolveSessionMaintenancePreserveKeys({
+    baseKeys: input.baseKeys,
     snapshot,
     store: readIdentityPreserveStore(database, [
       ...snapshot.providerKeys,

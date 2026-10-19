@@ -24,6 +24,8 @@ export type HistoricalValue = { kind: "historical-eviction-candidates" } & (
 
 export type LiveEvictionPlanInput = {
   archiveDirectory: string;
+  /** Operator-protected keys, e.g. `sessions cleanup --active-key`. */
+  baseKeys: readonly string[];
   preserveRecentMs: number | null;
   skipSessionKeys: readonly string[];
   /** Captured on the Gateway thread; provider and admission state is process-local. */

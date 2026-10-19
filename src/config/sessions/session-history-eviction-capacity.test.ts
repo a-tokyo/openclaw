@@ -393,6 +393,43 @@ describe("SQLite live-node disk budget eviction", () => {
     expect(sessionExists("default-budget-thread")).toBe(true);
   });
 
+  it("keeps the operator active key and evicts the next idle thread", async () => {
+    const activeKey = "agent:main:slack:channel:c17:thread:17";
+    const idleKey = "agent:main:slack:channel:c18:thread:18";
+    await replaceSessionEntry(
+      { sessionKey: activeKey, storePath },
+      { sessionId: "active-oldest", updatedAt: 5 },
+    );
+    await appendTranscriptMessage(
+      { sessionId: "active-oldest", sessionKey: activeKey, storePath },
+      { message: { role: "user", content: "active " + "x".repeat(64 * 1024) } },
+    );
+    await replaceSessionEntry(
+      { sessionKey: idleKey, storePath },
+      { sessionId: "idle-newer", updatedAt: 15 },
+    );
+    await appendTranscriptMessage(
+      { sessionId: "idle-newer", sessionKey: idleKey, storePath },
+      { message: { role: "user", content: "idle " + "y".repeat(64 * 1024) } },
+    );
+    settlePhysicalUsage();
+    const before = await measureSessionPhysicalDiskUsage(storePath);
+    const result = await enforceSqliteSessionHistoryDiskBudget({
+      activeSessionKey: "agent:main:slack:channel:C17:thread:17",
+      storePath,
+      mode: "enforce",
+      maintenance: {
+        maxDiskBytes: before.totalBytes - 1,
+        maxDiskBytesExplicit: true,
+        highWaterBytes: Math.max(1, before.totalBytes - 1),
+      },
+    });
+
+    expect(result?.removedEntries).toBe(1);
+    expect(sessionNodeExists(activeKey)).toBe(true);
+    expect(sessionNodeExists(idleKey)).toBe(false);
+  });
+
   it("skips an idle thread whose transcript is cold", async () => {
     const coldKey = "agent:main:slack:channel:c15:thread:15";
     const hotKey = "agent:main:slack:channel:c16:thread:16";
@@ -493,6 +530,7 @@ describe("SQLite live-node disk budget eviction", () => {
     prepared.dispose();
     const live = planLiveEvictionInDatabase(database(), {
       archiveDirectory: path.join(tempDir, "archives"),
+      baseKeys: [],
       preserveRecentMs: null,
       skipSessionKeys: [],
       snapshot,

@@ -437,6 +437,7 @@ export async function runSessionsCleanup(params: {
             owner.assertCurrent();
             const removedSessionKeys = new Set(lifecycleResult.removedSessionKeys);
             const appliedDiskBudget = await enforceSqliteSessionHistoryDiskBudget({
+              activeSessionKey: opts.activeKey,
               agentId: target.agentId,
               storePath: target.storePath,
               mode,

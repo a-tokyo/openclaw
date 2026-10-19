@@ -706,6 +706,7 @@ async function enforceSessionHistoryMaintenanceForDatabase(
   // bounds the store.
   if (usage.totalBytes > highWaterBytes && evictsLiveConversations(params.maintenance)) {
     const live = await reclaimSqliteLiveSessionEntriesToHighWater({
+      activeSessionKey: params.activeSessionKey,
       archiveDirectory,
       highWaterBytes,
       pruneArchivesToHighWater: async () => {
