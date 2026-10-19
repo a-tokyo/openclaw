@@ -13,6 +13,7 @@ import type { SessionEntryCohortRequest } from "./session-entry-read.types.js";
 import type { LiveEvictionPlan, LiveInput } from "./session-history-eviction-worker.types.js";
 import type {
   PreparedSessionTranscriptHydration,
+  SessionCompactionPreparation,
   SessionTranscriptReadSnapshot,
 } from "./session-history-read.types.js";
 import type { SessionTranscriptAnchorEntry } from "./session-transcript-anchor-read.types.js";
@@ -53,6 +54,7 @@ export type SessionTranscriptHydrationWorkerResult =
       kind: "full";
       version: SessionTranscriptReadSnapshot["version"];
       eventCount: number;
+      compaction?: SessionCompactionPreparation;
     }
   | Extract<PreparedSessionTranscriptHydration, { kind: "bounded" }>;
 
@@ -83,6 +85,7 @@ export type SessionTranscriptHydrationWorkerInput = {
   expectedIdentity?: DatabaseFileIdentity;
   afterSeq?: number;
   includeEventJson?: boolean;
+  compaction?: true;
   limits?: { maxBytes: number; maxEvents: number };
   transcript?: SessionEntryCohortRequest["transcript"];
   preparedEntry?: SessionTranscriptAnchorEntry;

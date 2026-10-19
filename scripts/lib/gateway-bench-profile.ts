@@ -3,6 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import type { HeapProfiler, Profiler } from "node:inspector";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import type { WorkerMessageMetric } from "../../src/infra/worker-message-metrics.ts";
 import type { startGatewayBenchDiagnostics } from "./gateway-bench-diagnostics.ts";
 
 export const GATEWAY_PROFILE_CHANNEL = "openclaw-gateway-bench-profile";
@@ -33,12 +34,20 @@ export type GatewayResourceSnapshot = GatewayCpuUsageSnapshot & {
 
 export type GatewayBenchCommand =
   | GatewayProfileCommand
+  | {
+      channel: typeof GATEWAY_PROFILE_CHANNEL;
+      kind: "diagnostics";
+      action: "start" | "stop";
+      captureId?: string;
+    }
   | { channel: typeof GATEWAY_PROFILE_CHANNEL; kind: "cpu-usage"; action: "sample" }
   | {
       channel: typeof GATEWAY_PROFILE_CHANNEL;
       kind: "resource-usage";
       action: "sample";
       initial?: boolean;
+      collectGarbage?: boolean;
+      snapshotPath?: string;
     };
 
 type GatewayProfileReply = {
@@ -48,6 +57,8 @@ type GatewayProfileReply = {
   error?: string;
   cpuUsage?: GatewayCpuUsageSnapshot;
   resources?: GatewayResourceSnapshot;
+  diagnostics?: ReturnType<ReturnType<typeof startGatewayBenchDiagnostics>>;
+  captureId?: string;
 };
 
 export type GatewayCpuUsage = Omit<ReturnType<typeof measureGatewayCpuUsage>, "cpuEnvironment"> &
@@ -58,13 +69,20 @@ export type GatewayCpuProfile = ReturnType<typeof readGatewayCpuProfile>;
 type GatewayProfileArtifacts = {
   diagnosticsPath?: string;
   diagnostics?: ReturnType<ReturnType<typeof startGatewayBenchDiagnostics>>;
+  workerMessages?: WorkerMessageMetric[];
 };
 
 function readProfileArtifacts(profilePath: string): GatewayProfileArtifacts {
   const diagnosticsPath = `${profilePath}.diagnostics.json`;
-  return existsSync(diagnosticsPath)
-    ? { diagnosticsPath, diagnostics: JSON.parse(readFileSync(diagnosticsPath, "utf8")) }
-    : {};
+  const workerMessagesPath = `${profilePath}.worker-messages.json`;
+  return {
+    ...(existsSync(diagnosticsPath)
+      ? { diagnosticsPath, diagnostics: JSON.parse(readFileSync(diagnosticsPath, "utf8")) }
+      : {}),
+    ...(existsSync(workerMessagesPath)
+      ? { workerMessages: JSON.parse(readFileSync(workerMessagesPath, "utf8")) }
+      : {}),
+  };
 }
 
 export async function controlGatewayProfile(
@@ -83,6 +101,28 @@ export async function controlGatewayProfile(
   });
 }
 
+/** Lightweight main-isolate diagnostics, without CPU or allocation sampling. */
+export async function startGatewayDiagnostics(child: ChildProcess, captureId?: string) {
+  await sendGatewayBenchCommand(child, {
+    channel: GATEWAY_PROFILE_CHANNEL,
+    kind: "diagnostics",
+    action: "start",
+    captureId,
+  });
+  return async () => {
+    const reply = await sendGatewayBenchCommand(child, {
+      channel: GATEWAY_PROFILE_CHANNEL,
+      kind: "diagnostics",
+      action: "stop",
+      captureId,
+    });
+    if (!reply.diagnostics) {
+      throw new Error("Gateway did not report diagnostics");
+    }
+    return reply.diagnostics;
+  };
+}
+
 export async function readGatewayCpuUsage(child: ChildProcess): Promise<GatewayCpuUsageSnapshot> {
   const reply = await sendGatewayBenchCommand(child, {
     channel: GATEWAY_PROFILE_CHANNEL,
@@ -98,7 +138,7 @@ export async function readGatewayCpuUsage(child: ChildProcess): Promise<GatewayC
 /** Samples the Gateway itself, not the controller or its descendants. */
 export async function readGatewayResources(
   child: ChildProcess,
-  options: { initial?: boolean } = {},
+  options: { initial?: boolean; collectGarbage?: boolean; snapshotPath?: string } = {},
 ): Promise<GatewayResourceSnapshot> {
   const reply = await sendGatewayBenchCommand(child, {
     channel: GATEWAY_PROFILE_CHANNEL,
@@ -166,7 +206,8 @@ async function sendGatewayBenchCommand(
       if (
         message?.channel !== GATEWAY_PROFILE_CHANNEL ||
         message.kind !== kind ||
-        message.action !== action
+        message.action !== action ||
+        (command.kind === "diagnostics" && message.captureId !== command.captureId)
       ) {
         return;
       }
