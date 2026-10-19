@@ -1,6 +1,6 @@
 // Live-node capacity eviction for the SQLite session disk budget.
 
-import { runExclusiveSessionLifecycleMutation } from "../../sessions/session-lifecycle-admission.js";
+import { runSessionMutation } from "../../sessions/session-controller.lifecycle.js";
 import {
   isIncognitoOpenClawAgentSqlitePath,
   openOpenClawAgentDatabase,
@@ -174,7 +174,8 @@ export async function reclaimSqliteLiveSessionEntriesToHighWater(params: {
     }
     const { identities } = live;
     let removed = false;
-    const published = await runExclusiveSessionLifecycleMutation("history-evict", {
+    const published = await runSessionMutation({
+      diagnosticLabel: "history-evict",
       scope: params.storePath,
       identities,
       run: async () => {

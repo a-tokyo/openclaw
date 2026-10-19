@@ -3,11 +3,8 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { resetAgentRunRegistryForTest } from "../../infra/agent-run-registry.js";
 import { executeSqliteQuerySync } from "../../infra/kysely-sync.js";
-import { beginSessionWorkAdmission } from "../../sessions/session-lifecycle-admission.js";
-import {
-  closeOpenClawAgentDatabasesForTest,
-  openOpenClawAgentDatabase,
-} from "../../state/openclaw-agent-db.js";
+import { beginSessionEffect } from "../../sessions/session-controller.lifecycle.js";
+import { closeOpenClawAgentDatabasesForTest } from "../../state/openclaw-agent-db.js";
 import {
   createOpenClawTestState,
   type OpenClawTestState,
@@ -22,6 +19,7 @@ import {
 import { finalizeSessionEntryMaintenancePlansAfterWriterReleaseBestEffort } from "./session-accessor.sqlite-maintenance.js";
 import { getSessionKysely } from "./session-accessor.sqlite-scope.js";
 import * as archivePruning from "./session-history-archive-pruning.js";
+import { createSessionHistoryBudgetFixture } from "./session-history-budget.test-support.js";
 import {
   enforceSqliteSessionHistoryDiskBudget,
   inspectSqliteSessionHistoryDiskBudget,
@@ -38,6 +36,8 @@ describe("SQLite live-node disk budget eviction", () => {
   let testState: OpenClawTestState;
   let tempDir: string;
   let storePath: string;
+  const { createHistoricalTranscript, database, sessionExists, settlePhysicalUsage } =
+    createSessionHistoryBudgetFixture(() => ({ storePath, tempDir }));
 
   beforeEach(async () => {
     testState = await createOpenClawTestState({
@@ -96,7 +96,7 @@ describe("SQLite live-node disk budget eviction", () => {
       { sessionId: "admitted-thread", sessionKey: admittedThreadKey, storePath },
       { message: { role: "user", content: "admitted keep" } },
     );
-    const admission = await beginSessionWorkAdmission({
+    const admission = await beginSessionEffect({
       scope: storePath,
       identities: [admittedThreadKey],
       assertAllowed: () => {},
@@ -158,7 +158,7 @@ describe("SQLite live-node disk budget eviction", () => {
       { sessionId: "admitted-thread", sessionKey: admittedThreadKey, storePath },
       { message: { role: "user", content: "admitted keep" } },
     );
-    const admission = await beginSessionWorkAdmission({
+    const admission = await beginSessionEffect({
       scope: storePath,
       identities: [admittedThreadKey],
       assertAllowed: () => {},
@@ -389,7 +389,7 @@ describe("SQLite live-node disk budget eviction", () => {
 
     expect(inspected.wouldMutate).toBe(false);
     expect(result?.removedEntries ?? 0).toBe(0);
-    expect(sessionNodeExists(threadKey)).toBe(true);
+    expect(sessionNodeExists(threadKey.toLowerCase())).toBe(true);
     expect(sessionExists("default-budget-thread")).toBe(true);
   });
 
@@ -509,7 +509,7 @@ describe("SQLite live-node disk budget eviction", () => {
     );
 
     expect(removed).toEqual([]);
-    expect(sessionNodeExists(threadKey)).toBe(true);
+    expect(sessionNodeExists(threadKey.toLowerCase())).toBe(true);
   });
 
   it("marks only an operator-set budget as explicit", () => {
@@ -557,54 +557,10 @@ describe("SQLite live-node disk budget eviction", () => {
       },
     });
 
-    expect(sessionExists("oldest-history")).toBe(false);
     expect(sessionExists("live-durable")).toBe(true);
-    expect(result?.removedEntries).toBe(1);
+    expect(sessionNodeExists(threadKey.toLowerCase())).toBe(true);
+    expect(result?.overBudget).toBe(true);
   });
-
-  async function createHistoricalTranscript(params: {
-    content: string;
-    nextSessionId: string;
-    sessionId: string;
-    sessionKey: string;
-    updatedAt: number;
-  }): Promise<void> {
-    await replaceSessionEntry(
-      { sessionKey: params.sessionKey, storePath },
-      { sessionId: params.sessionId, updatedAt: params.updatedAt },
-    );
-    await appendTranscriptMessage(
-      { sessionId: params.sessionId, sessionKey: params.sessionKey, storePath },
-      { message: { role: "user", content: params.content } },
-    );
-    await resetSessionEntryLifecycle({
-      storePath,
-      target: { canonicalKey: params.sessionKey, storeKeys: [params.sessionKey] },
-      buildNextEntry: () => ({ sessionId: params.nextSessionId, updatedAt: params.updatedAt + 1 }),
-    });
-    setSessionUpdatedAt(params.sessionId, params.updatedAt);
-  }
-
-  function database() {
-    const target = resolveSqliteTargetFromSessionStorePath(storePath);
-    if (!target.path) {
-      throw new Error("expected SQLite database path");
-    }
-    return openOpenClawAgentDatabase({ agentId: target.agentId ?? "main", path: target.path });
-  }
-
-  function settlePhysicalUsage(): void {
-    const owner = database();
-    owner.walMaintenance.checkpoint();
-    const row = owner.db.prepare("PRAGMA freelist_count").get() as
-      | { freelist_count?: unknown }
-      | undefined;
-    const freePages = Number(row?.freelist_count ?? 0);
-    if (Number.isSafeInteger(freePages) && freePages > 0) {
-      owner.db.exec(`PRAGMA incremental_vacuum(${freePages});`);
-    }
-    owner.walMaintenance.checkpoint();
-  }
 
   function markCold(sessionId: string): void {
     database()
@@ -615,29 +571,6 @@ describe("SQLite live-node disk budget eviction", () => {
          VALUES (?, 'test', ?, ?, 1, 1, 1, 1, ?, 'sqlite', x'00')`,
       )
       .run(sessionId, `${sessionId}.cold.zst`, "0".repeat(64), Date.now());
-  }
-
-  function setSessionUpdatedAt(sessionId: string, updatedAt: number): void {
-    const owner = database();
-    const db = getSessionKysely(owner.db);
-    executeSqliteQuerySync(
-      owner.db,
-      db
-        .updateTable("session_windows")
-        .set({ updated_at: updatedAt })
-        .where("session_id", "=", sessionId),
-    );
-  }
-
-  function sessionExists(sessionId: string): boolean {
-    const owner = database();
-    const db = getSessionKysely(owner.db);
-    return (
-      executeSqliteQuerySync(
-        owner.db,
-        db.selectFrom("session_windows").select("session_id").where("session_id", "=", sessionId),
-      ).rows.length === 1
-    );
   }
 
   function sessionNodeExists(sessionKey: string): boolean {

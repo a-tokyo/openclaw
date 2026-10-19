@@ -825,7 +825,7 @@ describe("SQLite historical session disk budget", () => {
       { sessionId: "live-history", sessionKey, storePath },
       { message: { role: "user", content: "live keep" } },
     );
-    const admission = await beginSessionWorkAdmission({
+    const admission = await beginSessionEffect({
       scope: storePath,
       identities: ["admitted-history"],
       assertAllowed: () => {},
@@ -871,7 +871,7 @@ describe("SQLite historical session disk budget", () => {
       target: { canonicalKey: sessionKey, storeKeys: [sessionKey] },
       buildNextEntry: () => ({ sessionId: "live-history", updatedAt: 3 }),
     });
-    const admission = await beginSessionWorkAdmission({
+    const admission = await beginSessionEffect({
       scope: storePath,
       identities: ["admitted-history"],
       assertAllowed: () => {},
