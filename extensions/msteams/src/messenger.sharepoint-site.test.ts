@@ -46,7 +46,7 @@ const baseRef: StoredConversationReference = {
 
 function stubTeamSiteDiscovery(groupId: string, siteId: string) {
   const fetchFn = vi.fn(async (url: string) => {
-    const href = String(url);
+    const href = url;
     if (href.includes(`teams/${groupId}/`) && href.includes("membershipType")) {
       return Response.json({ membershipType: "standard" });
     }
@@ -107,7 +107,7 @@ describe("msteams messenger sharepoint site", () => {
       });
 
       expect(getById).toHaveBeenCalledWith("team-a");
-      const fetched = fetchFn.mock.calls.map(([url]) => String(url));
+      const fetched = fetchFn.mock.calls.map(([url]) => url);
       expect(fetched[0]).toContain("aad-group-a");
       expect(fetched[0]).toContain("membershipType");
       expect(fetched[1]).toContain("aad-group-a");

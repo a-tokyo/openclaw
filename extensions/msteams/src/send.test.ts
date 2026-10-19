@@ -156,7 +156,7 @@ function sendFile(options: Partial<Parameters<typeof sendMessageMSTeams>[0]> = {
 
 function stubTeamSiteDiscovery(groupId: string, siteId: string) {
   const fetchFn = vi.fn(async (url: string) => {
-    const href = String(url);
+    const href = url;
     if (href.includes(`teams/${groupId}/`) && href.includes("membershipType")) {
       return Response.json({ membershipType: "standard" });
     }
