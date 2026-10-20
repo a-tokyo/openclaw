@@ -430,6 +430,38 @@ describe("SQLite live-node disk budget eviction", () => {
     expect(sessionNodeExists(idleKey)).toBe(false);
   });
 
+  it("previews and applies no eviction when only the active key is eligible", async () => {
+    const activeKey = "agent:main:slack:channel:c19:thread:19";
+    await replaceSessionEntry(
+      { sessionKey: activeKey, storePath },
+      { sessionId: "active-only", updatedAt: 5 },
+    );
+    await appendTranscriptMessage(
+      { sessionId: "active-only", sessionKey: activeKey, storePath },
+      { message: { role: "user", content: "active " + "x".repeat(64 * 1024) } },
+    );
+    settlePhysicalUsage();
+    const before = await measureSessionPhysicalDiskUsage(storePath);
+    const budget = {
+      activeSessionKey: "agent:main:slack:channel:C19:thread:19",
+      storePath,
+      mode: "enforce" as const,
+      maintenance: {
+        maxDiskBytes: before.totalBytes - 1,
+        maxDiskBytesExplicit: true,
+        highWaterBytes: Math.max(1, before.totalBytes - 1),
+      },
+    };
+
+    await expect(inspectSqliteSessionHistoryDiskBudget(budget)).resolves.toMatchObject({
+      wouldMutate: false,
+    });
+    const result = await enforceSqliteSessionHistoryDiskBudget(budget);
+
+    expect(result?.removedEntries).toBe(0);
+    expect(sessionNodeExists(activeKey)).toBe(true);
+  });
+
   it("skips an idle thread whose transcript is cold", async () => {
     const coldKey = "agent:main:slack:channel:c15:thread:15";
     const hotKey = "agent:main:slack:channel:c16:thread:16";

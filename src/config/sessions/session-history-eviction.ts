@@ -171,6 +171,7 @@ async function inspectSessionHistoryDiskBudget(
     return { diskBudget, wouldMutate: false };
   }
   const preview = await readLiveEvictionPlan({
+    activeSessionKey: params.activeSessionKey,
     archiveDirectory: resolveSqliteTranscriptArchiveDirectory(resolved),
     databaseOptions,
     preserveRecentMs: params.maintenance.preserveRecentMs,
