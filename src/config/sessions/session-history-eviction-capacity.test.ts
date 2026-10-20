@@ -355,7 +355,10 @@ describe("SQLite live-node disk budget eviction", () => {
         highWaterBytes: Math.max(1, before.totalBytes - 1),
       },
     });
+    const after = await measureSessionPhysicalDiskUsage(storePath);
     expect(result?.removedEntries).toBe(1);
+    expect(result?.totalBytesAfter).toBe(after.totalBytes);
+    expect(result?.walBytesAfter).toBe(after.databaseWalBytes);
     expect(sessionNodeExists(oldestKey)).toBe(false);
     expect(sessionNodeExists(newerKey)).toBe(true);
   });

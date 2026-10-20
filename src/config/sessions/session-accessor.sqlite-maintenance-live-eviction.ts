@@ -208,10 +208,11 @@ export async function reclaimSqliteLiveSessionEntriesToHighWater(params: {
     }
     removedEntries += 1;
     emitArchivedTranscriptUpdates(published.archivedTranscripts);
-    if (!(await params.reclaimFreePages())) {
+    const checkpointCompleted = await params.reclaimFreePages();
+    usage = await measureSessionPhysicalDiskUsage(params.storePath);
+    if (!checkpointCompleted) {
       break;
     }
-    usage = await measureSessionPhysicalDiskUsage(params.storePath);
     if (usage.totalBytes > params.highWaterBytes) {
       const repruned = await params.pruneArchivesToHighWater();
       removedFiles += repruned.removedFiles;
