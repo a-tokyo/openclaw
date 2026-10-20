@@ -62,9 +62,7 @@ import {
   toDatabaseOptions,
 } from "./session-accessor.sqlite-scope.js";
 import { withSqliteMutationWorkerLifetime } from "./session-accessor.sqlite-worker-request.js";
-import {
-  pruneAllSessionTranscriptArchivesToHighWater,
-} from "./session-history-archive-pruning.js";
+import { pruneAllSessionTranscriptArchivesToHighWater } from "./session-history-archive-pruning.js";
 import {
   createPhysicalBudgetResult,
   deferPhysicalBudgetForCheckpoint,
