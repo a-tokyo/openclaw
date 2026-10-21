@@ -1,5 +1,8 @@
 /* @vitest-environment jsdom */
+import { expectDefined } from "@openclaw/normalization-core";
 import { describe, expect, it, vi } from "vitest";
+import { createDeferred } from "../../../../test/helpers/promise.ts";
+import { waitForSolid } from "../../test-helpers/solid-settle.ts";
 import type { DraftEnvironment } from "./discovery.ts";
 import { renderPicker } from "./where-chip.test-support.ts";
 
@@ -90,16 +93,42 @@ describe("Where chip", () => {
     },
   );
 
-  it("shows device and cloud skeletons while the catalog loads", () => {
+  it("keeps the trigger and focused search through a delayed first catalog read", async () => {
+    const completion = createDeferred();
     const container = renderPicker(
       true,
       undefined,
       { environments: null, cloudProfiles: [] },
-      { catalogLoading: true },
+      { catalogRead: completion.promise },
     );
-    expect(container.querySelectorAll(".new-session-page__environment-skeletons")).toHaveLength(2);
+    await waitForSolid(() =>
+      expect(container.querySelectorAll(".new-session-page__environment-skeletons")).toHaveLength(
+        2,
+      ),
+    );
     expect(container.querySelector('[data-section="devices"]')).not.toBeNull();
     expect(container.querySelector('[data-section="cloud"]')).not.toBeNull();
+    const trigger = expectDefined(
+      container.querySelector<HTMLButtonElement>("#new-session-where-trigger"),
+      "Where trigger",
+    );
+    expect(trigger.disabled).toBe(false);
+    expect(container.querySelector('[data-action="manage-cloud-workers"]')).toBeNull();
+    const search = expectDefined(
+      container.querySelector<HTMLInputElement>('input[type="search"]'),
+      "environment search",
+    );
+    search.focus();
+    completion.resolve();
+    await waitForSolid(() =>
+      expect(container.querySelectorAll(".new-session-page__environment-skeletons")).toHaveLength(
+        0,
+      ),
+    );
+    expect(container.querySelector("#new-session-where-trigger")).toBe(trigger);
+    expect(container.querySelector('input[type="search"]')).toBe(search);
+    expect(document.activeElement).toBe(search);
+    expect(container.querySelector('[role="alert"]')).toBeNull();
   });
 
   it.each([
@@ -189,13 +218,20 @@ describe("Where chip", () => {
   it("keeps explicit destinations selectable while Auto is enabled", () => {
     const onSelectDevice = vi.fn();
     const onSelectCloudProfile = vi.fn();
+    const onApplyCloudDefaults = vi.fn();
     const onEnvironmentQueryInput = vi.fn();
     const onConnectMachine = vi.fn();
     const container = renderPicker(
       true,
       undefined,
       { autoDevice: true },
-      { onSelectDevice, onSelectCloudProfile, onEnvironmentQueryInput, onConnectMachine },
+      {
+        onSelectDevice,
+        onSelectCloudProfile,
+        onApplyCloudDefaults,
+        onEnvironmentQueryInput,
+        onConnectMachine,
+      },
     );
     const destinations = container.querySelectorAll<HTMLButtonElement>(
       '.new-session-page__environment-list [data-value]:not([data-value="auto-device"])',
@@ -207,7 +243,8 @@ describe("Where chip", () => {
       destination.click();
     }
     expect(onSelectDevice).toHaveBeenCalledTimes(4);
-    expect(onSelectCloudProfile).toHaveBeenCalledExactlyOnceWith("aws", true);
+    expect(onApplyCloudDefaults).toHaveBeenCalledExactlyOnceWith("aws");
+    expect(onSelectCloudProfile).toHaveBeenCalledExactlyOnceWith("aws");
 
     expect(capacityCaption(option(container, "device:runner"))).toBe("1 of 2 session slots in use");
 

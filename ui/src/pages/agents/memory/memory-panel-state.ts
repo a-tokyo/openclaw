@@ -1,6 +1,6 @@
 import { asOptionalObjectRecord } from "@openclaw/normalization-core/record-coerce";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
-import { createStore, onSettled } from "solid-js";
+import { createMemo, createStore, onSettled } from "solid-js";
 import type { ApplicationContext, ApplicationGateway } from "../../../app/context.ts";
 import { hasOperatorReadAccess } from "../../../app/operator-access.ts";
 import {
@@ -10,16 +10,17 @@ import {
 import { t } from "../../../i18n/index.ts";
 import { registerDreamingEnglish } from "../../../i18n/locales/en-dreaming.ts";
 import { currentConfigObject } from "../../../lib/config/config-state-model.ts";
-import { formatUiError } from "../../../lib/format-error.ts";
 import { formatTimeMs } from "../../../lib/format.ts";
 import { GatewayPageBinding, type GatewayPageChange } from "../../../lib/gateway-page-binding.ts";
 import { pathDisplayName } from "../../../lib/path-display.ts";
 import { isPluginEnabledInConfigSnapshot } from "../../../lib/plugin-activation.ts";
-import { projectOwner, projectSource } from "../../../lib/reactive/projection.ts";
+import { projectOwner, projectMutableSource } from "../../../lib/reactive/projection.ts";
 import {
   canCallDreamingMethod,
   copyDreamingArchivePath,
   createDreamingState,
+  createDreamingViewState,
+  DREAM_PHRASE_KEYS,
   loadDreamingResource,
   resolveConfiguredDreaming,
   runDreamDiaryAction,
@@ -27,13 +28,17 @@ import {
   type DreamDiaryActionMethod,
   type DreamingResourceKey,
   type DreamingState,
+  type DreamingViewState,
   type WikiPagePreview,
 } from "./dreaming.ts";
 import type { DreamingToggleConfirmationProps } from "./toggle-confirmation.tsx";
-import type { DreamingViewState, WikiPreviewState } from "./view-types.ts";
-import { createDreamingViewState, DREAM_PHRASE_KEYS, type DreamingProps } from "./view.tsx";
 
 registerDreamingEnglish();
+
+type WikiPreviewRequest = {
+  page: WikiPagePreview;
+  source: { read: WikiPagePreview | Promise<WikiPagePreview> };
+};
 
 type DreamingTaskScope = {
   gateway: ApplicationGateway;
@@ -65,9 +70,12 @@ export function createAgentMemory(
   let active = false;
   let publish = () => {};
   let dreaming = createDreamingState();
-  let toggleConfirmLoading = false;
+  let toggleRequest:
+    | (ReturnType<typeof Promise.withResolvers<void>> & { pending: boolean })
+    | undefined;
   let pendingEnabled: boolean | null = null;
-  let wikiPreview: WikiPreviewState | null = null;
+  let wikiPreview: WikiPreviewRequest | null = null;
+  let pendingWikiRead: { request: WikiPreviewRequest } | null = null;
   const [viewState, setViewState] = createStore(createDreamingViewState());
   function updateViewState(update: (draft: DreamingViewState) => void) {
     const now = Date.now();
@@ -112,13 +120,13 @@ export function createAgentMemory(
       }
       dreaming.dreamDiaryActionLoading = false;
       dreaming.dreamingModeSaving = false;
-      toggleConfirmLoading = false;
+      retireToggle();
     },
     onSnapshot: applyGatewaySnapshot,
     ensureInitialData: ({ snapshot }) => {
       if (selectedAgentId && hasOperatorReadAccess(snapshot.hello?.auth ?? null)) {
         void loadResources();
-        if (wikiPreview?.loading) {
+        if (wikiPreview && pendingWikiRead?.request === wikiPreview) {
           void loadWikiPreview(wikiPreview);
         }
       }
@@ -145,7 +153,8 @@ export function createAgentMemory(
 
   function resetTransientState() {
     wikiPreview = null;
-    toggleConfirmLoading = false;
+    pendingWikiRead = null;
+    retireToggle();
     pendingEnabled = null;
   }
 
@@ -272,7 +281,7 @@ export function createAgentMemory(
     if (
       !canCallDreamingMethod(dreaming, "config.patch", "operator.admin") ||
       dreaming.dreamingModeSaving ||
-      toggleConfirmLoading ||
+      toggleRequest?.pending ||
       pendingEnabled !== null
     ) {
       return;
@@ -283,63 +292,75 @@ export function createAgentMemory(
   }
 
   function cancelToggle() {
-    if (toggleConfirmLoading) {
+    if (toggleRequest?.pending) {
       return;
     }
     pendingEnabled = null;
+    retireToggle();
     dreaming.dreamingStatusError = null;
     notify();
   }
 
-  async function confirmToggle() {
+  function retireToggle() {
+    // A retired transport may never settle; release its pending presentation now.
+    toggleRequest?.resolve();
+    toggleRequest = undefined;
+  }
+
+  function confirmToggle(): Promise<void> | undefined {
     const enabled = pendingEnabled;
     if (
       enabled == null ||
-      toggleConfirmLoading ||
+      toggleRequest?.pending ||
       !canCallDreamingMethod(dreaming, "config.patch", "operator.admin")
     ) {
-      return;
+      return undefined;
     }
-    toggleConfirmLoading = true;
-    dreaming.dreamingStatusError = null;
     const scope = captureTaskScope();
-    const runtimeConfig = context.runtimeConfig;
     if (!scope) {
-      toggleConfirmLoading = false;
+      return undefined;
+    }
+    const request = { ...Promise.withResolvers<void>(), pending: true };
+    toggleRequest = request;
+    dreaming.dreamingStatusError = null;
+    // The dialog can disappear before it consumes a terminal rejection.
+    void request.promise.catch(() => undefined);
+    void updateToggle(scope, enabled)
+      .then(request.resolve, request.reject)
+      .finally(() => {
+        if (toggleRequest === request) {
+          request.pending = false;
+          notify();
+        }
+      });
+    return request.promise;
+  }
+
+  async function updateToggle(scope: DreamingTaskScope, enabled: boolean) {
+    const runtimeConfig = context.runtimeConfig;
+    const canDispatch = () =>
+      isTaskScopeCurrent(scope) &&
+      context.runtimeConfig === runtimeConfig &&
+      canCallDreamingMethod(scope.state, "config.patch", "operator.admin");
+    const updated = await runDreamingTask(
+      (dreamingState) => updateDreamingEnabled(dreamingState, runtimeConfig, enabled, canDispatch),
+      scope,
+    );
+    if (!isTaskScopeCurrent(scope) || context.runtimeConfig !== runtimeConfig) {
       return;
     }
-    try {
-      const canDispatch = () =>
-        isTaskScopeCurrent(scope) &&
-        context.runtimeConfig === runtimeConfig &&
-        canCallDreamingMethod(scope.state, "config.patch", "operator.admin");
-      const updated = await runDreamingTask(
-        (dreamingState) =>
-          updateDreamingEnabled(dreamingState, runtimeConfig, enabled, canDispatch),
-        scope,
-      );
-      if (!isTaskScopeCurrent(scope) || context.runtimeConfig !== runtimeConfig) {
-        return;
-      }
-      if (!updated) {
-        dreaming.dreamingStatusError ??= t("dreaming.toggleConfirmation.failed");
-        return;
-      }
-      await runtimeConfig.refresh();
-      if (!isTaskScopeCurrent(scope) || context.runtimeConfig !== runtimeConfig) {
-        return;
-      }
-      await runDreamingTask((current) => loadDreamingResource(current, "dreamingStatus"), scope);
-      if (!isTaskScopeCurrent(scope)) {
-        return;
-      }
-      pendingEnabled = null;
-    } finally {
-      if (isTaskScopeCurrent(scope)) {
-        toggleConfirmLoading = false;
-        notify();
-      }
+    if (!updated) {
+      throw new Error(dreaming.dreamingStatusError ?? t("dreaming.toggleConfirmation.failed"));
     }
+    await runtimeConfig.refresh();
+    if (!isTaskScopeCurrent(scope) || context.runtimeConfig !== runtimeConfig) {
+      return;
+    }
+    await runDreamingTask((current) => loadDreamingResource(current, "dreamingStatus"), scope);
+    if (!isTaskScopeCurrent(scope)) {
+      return;
+    }
+    pendingEnabled = null;
   }
 
   async function openWikiPage(lookup: string): Promise<WikiPagePreview | null> {
@@ -440,9 +461,17 @@ export function createAgentMemory(
         onOpenWikiPage: openWikiPreview,
         onCloseWikiPreview: () => {
           wikiPreview = null;
+          pendingWikiRead = null;
           notify();
         },
-        wikiPreview: wikiPreview ? { ...wikiPreview, request: wikiPreview } : null,
+        wikiPreview: wikiPreview
+          ? {
+              request: wikiPreview,
+              page: wikiPreview.page,
+              readKey: wikiPreview.source,
+              readPage: wikiPage,
+            }
+          : null,
         onBackfillDiary: () => void runDiaryAction("doctor.memory.backfillDreamDiary"),
         onCopyDreamingArchivePath: () => void runDreamingTask(copyDreamingArchivePath),
         onDedupeDreamDiary: () =>
@@ -460,15 +489,14 @@ export function createAgentMemory(
             message: t("dreaming.actions.confirmRepairDescription"),
             confirmLabel: t("dreaming.scene.repairCache"),
           }),
-      } satisfies Omit<DreamingProps, "viewState" | "onViewStateChange">,
+      },
       toggle: {
         open: pendingEnabled !== null,
         enabling: pendingEnabled === true,
-        loading: toggleConfirmLoading,
         disabled: !canUpdateConfig,
-        onConfirm: () => void confirmToggle(),
-        onCancel: () => cancelToggle(),
-        hasError: Boolean(dreaming.dreamingStatusError),
+        onConfirm: confirmToggle,
+        onCancel: cancelToggle,
+        completion: toggleRequest?.pending ? undefined : toggleRequest?.promise,
       } satisfies DreamingToggleConfirmationProps,
     };
   }
@@ -478,56 +506,60 @@ export function createAgentMemory(
     if (!scope || !scope.state.connected) {
       return Promise.resolve();
     }
-    const request: WikiPreviewState = {
-      page: { title: pathDisplayName(lookup), path: lookup, content: "" },
-      loading: true,
-      error: null,
-    };
+    const page = { title: pathDisplayName(lookup), path: lookup, content: "" };
+    const request: WikiPreviewRequest = { page, source: { read: page } };
     wikiPreview = request;
-    notify();
     return loadWikiPreview(request);
   }
 
-  async function loadWikiPreview(request: WikiPreviewState) {
+  async function loadWikiPreview(request: WikiPreviewRequest) {
     const scope = captureTaskScope();
     if (!scope) {
       return;
     }
-    const lookup = request.page.path;
+    const issued = Promise.withResolvers<WikiPagePreview>();
+    const operation = { request };
+    pendingWikiRead = operation;
+    request.source = { read: issued.promise };
+    // A closed/retired preview can lose its last reader before the request fails.
+    void issued.promise.catch(() => undefined);
+    notify();
+    const isCurrent = () =>
+      wikiPreview === request && pendingWikiRead === operation && isTaskScopeCurrent(scope);
     try {
-      const page = await openWikiPage(lookup);
-      if (wikiPreview !== request || !isTaskScopeCurrent(scope)) {
+      const page = await openWikiPage(request.page.path);
+      if (!isCurrent()) {
+        // Keep the displayed read pending until reconnect replaces it.
         return;
       }
       if (page) {
         request.page = page;
+        issued.resolve(page);
       } else {
-        request.error = t("dreaming.wiki.pageNotFound", { lookup });
+        issued.reject(new Error(t("dreaming.wiki.pageNotFound", { lookup: request.page.path })));
       }
     } catch (error) {
-      if (wikiPreview === request && isTaskScopeCurrent(scope)) {
-        request.error = formatUiError(error);
+      if (isCurrent()) {
+        issued.reject(error);
       }
     } finally {
-      if (wikiPreview === request && isTaskScopeCurrent(scope)) {
-        request.loading = false;
+      if (isCurrent()) {
+        pendingWikiRead = null;
         notify();
       }
     }
   }
-  const projection = projectSource(context, {
-    read,
-    subscribe: (_source, listener) => {
-      publish = listener;
-      return () => {
-        publish = () => {};
-      };
-    },
-    equality: "revision",
+  const projection = projectMutableSource(context, read);
+  const wikiSource = createMemo(() => {
+    projection.revision();
+    return wikiPreview?.source ?? null;
   });
+  const wikiPage: () => WikiPagePreview | null = createMemo(() => wikiSource()?.read ?? null);
+  publish = projection.publish;
   onSettled(() => {
     const agentTarget = getInitialAgentTarget();
     const syncAgent = () => setAgentId(agentTarget.read() ?? "");
+    // Agent receipts invalidate prior requests and replace their resource state synchronously.
     const stopAgent = agentTarget.subscribe(syncAgent);
     syncAgent();
     active = true;

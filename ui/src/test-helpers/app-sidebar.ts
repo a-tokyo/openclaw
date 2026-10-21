@@ -38,7 +38,7 @@ import {
   createApplicationContextProvider,
   hiddenScopeUpgradeCapability,
 } from "./application-context.ts";
-import { gatewayHelloForMethods, SESSION_MUTATION_TEST_METHODS } from "./gateway-methods.ts";
+import { sidebarGatewayHello } from "./gateway-methods.ts";
 import { waitForSolid } from "./solid-settle.ts";
 
 // mock-isolation: Keep attention health RPCs out of sidebar call-order assertions; sidebar-attention.test.ts owns its rendering.
@@ -89,7 +89,7 @@ export function createGatewayHarness(client: GatewayBrowserClient) {
     phase: "connected",
     offlineStable: false,
     canvasPluginSurfaceUrl: null,
-    hello: gatewayHelloForMethods([...SESSION_MUTATION_TEST_METHODS, "openclaw.chat"]),
+    hello: sidebarGatewayHello(),
     assistantAgentId: "main",
     sessionKey: "agent:main:main",
     lastError: null,
@@ -628,7 +628,7 @@ export async function mountSidebarContext(
   const owner = getAppSidebarOwner(element)!;
   await Promise.all([
     import("../components/app-sidebar-session-narration.ts"),
-    owner.preloadCatalogRenderer(),
+    owner.catalogRendererImport.load(),
     owner.sidebarMenus.preloadMenuRenderer(),
   ]);
   await sidebar.updateComplete;

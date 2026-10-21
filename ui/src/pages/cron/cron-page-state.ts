@@ -1,6 +1,6 @@
 import { createSignal, onSettled } from "solid-js";
 import { cronRunEntryMatchesLink } from "../../../../src/cron/run-link.js";
-import type { CronJob, CronRunLogEntry, CronScratchGetResult } from "../../api/types.ts";
+import type { CronJob, CronRunLogEntry } from "../../api/types.ts";
 import type { ApplicationContext } from "../../app/context.ts";
 import { hasOperatorReadAccess, readGatewayOperatorAccess } from "../../app/operator-access.ts";
 import { showConfirmDialog } from "../../components/confirm-dialog.ts";
@@ -25,12 +25,7 @@ import {
   updateCronJobsFilter,
   validateCronForm,
 } from "../../lib/cron/index.ts";
-import {
-  loadCronRuns,
-  loadCronRunsForJob,
-  loadMoreCronRuns,
-  updateCronRunsFilter,
-} from "../../lib/cron/runs.ts";
+import { loadCronRuns, loadCronRunsForJob, updateCronRunsFilter } from "../../lib/cron/runs.ts";
 import type { CronFormState, CronState } from "../../lib/cron/types.ts";
 import { formatUiError } from "../../lib/format-error.ts";
 import { isGatewayAvailable } from "../../lib/gateway-availability.ts";
@@ -42,7 +37,7 @@ import {
   subscribeModelCatalogCache,
 } from "../../lib/model-catalog-store.ts";
 import { registerEnglishCatalog, t } from "../../lib/reactive/i18n.ts";
-import { projectOwner, projectSource } from "../../lib/reactive/projection.ts";
+import { projectOwner, projectMutableSource } from "../../lib/reactive/projection.ts";
 import { useVisiblePoll } from "../../lib/reactive/visible-poll.ts";
 import {
   createDeliveryConversations,
@@ -53,9 +48,11 @@ import { createCronEventEditor } from "./event-editor.ts";
 import { resolveCronEventPatch, validateCronEventSelection } from "./event-source.ts";
 import { createCronRouteSelection, resolveCronRouteData } from "./route-model.ts";
 import { createCronRunTranscript } from "./run-transcript.tsx";
-import type { CronDetailTab, CronListTab, CronProps } from "./view-types.ts";
 
 registerEnglishCatalog(registerCronEnglish);
+
+type CronListTab = "tasks" | "activity";
+type CronDetailTab = "settings" | "history";
 
 /** Owns page presentation; cron admission and mutation chains remain synchronous. */
 export function createCronPage(context: () => ApplicationContext, host: () => HTMLElement) {
@@ -65,23 +62,12 @@ export function createCronPage(context: () => ApplicationContext, host: () => HT
   const [modelSuggestionsError, setModelSuggestionsError] = createSignal<string | null>(null);
   const [listTab, setListTab] = createSignal<CronListTab>("tasks");
   const [detailTab, setDetailTab] = createSignal<CronDetailTab>("settings");
-  const [heartbeatScratch, setHeartbeatScratch] = createSignal("");
   let active = false;
   const cleanups: Array<() => void> = [];
   const gateway = createGatewayConnectionLifecycle({ client: null, phase: "stopped" });
   let boundContext: ApplicationContext | null = null;
   let gatewayAvailable = false;
-  let notify: (() => void) | undefined;
-  const projection = projectSource(null, {
-    read: () => cron,
-    subscribe: (_source, listener) => {
-      notify = listener;
-      return () => {
-        notify = undefined;
-      };
-    },
-    equality: "revision",
-  });
+  const projection = projectMutableSource(null, () => cron);
   const agents = projectOwner(context().agents, (source) => source.state);
   const channels = projectOwner(context().channels, (source) => source.state);
   const runtimeConfig = projectOwner(context().runtimeConfig, (source) => source.state);
@@ -116,7 +102,6 @@ export function createCronPage(context: () => ApplicationContext, host: () => HT
     isCurrentConnection: (scope) => gateway.isCurrent(scope),
     notify: publish,
   });
-  let heartbeatScratchRequest = 0;
   const safetyRefresh = useVisiblePoll(600_000, () => ensureInitialData(true));
   const observeAgentScope = watchAgentScope((scopeId, intentChanged) => {
     if (!intentChanged) {
@@ -177,13 +162,11 @@ export function createCronPage(context: () => ApplicationContext, host: () => HT
         cron.client = snapshot.client;
         cron.connected = snapshot.phase === "connected";
         runTranscript.reconnect();
-        heartbeatScratchRequest += 1;
         if (!cron.cronEditingJob && !cron.cronCreateOpen) {
           routeSelection.requested = false;
         }
       }
       if (snapshot.phase === "connected" && !readGatewayOperatorAccess(snapshot).canAdmin) {
-        clearHeartbeatScratch();
         deliveryDirectory.clear();
       }
       if (snapshot.phase === "connected" && !hasOperatorReadAccess(snapshot.hello?.auth ?? null)) {
@@ -234,7 +217,6 @@ export function createCronPage(context: () => ApplicationContext, host: () => HT
       gateway.dispose();
       stopModelSuggestions?.();
       modelSuggestionsRequest = null;
-      heartbeatScratchRequest += 1;
       invalidateCronRefresh(cron);
     };
   });
@@ -248,7 +230,7 @@ export function createCronPage(context: () => ApplicationContext, host: () => HT
     }
     preparePanel();
     eventSource.sync();
-    notify?.();
+    projection.publish();
     // The state writer owns route admission; its DOM requests follow this publication's commit.
     onSettled(() => {
       if (active) {
@@ -261,7 +243,6 @@ export function createCronPage(context: () => ApplicationContext, host: () => HT
     stopModelSuggestions?.();
     stopModelSuggestions = undefined;
     runTranscript.close();
-    clearHeartbeatScratch();
     eventSource.reset();
     invalidateCronRefresh(cron);
     const connected = snapshot.phase === "connected";
@@ -497,7 +478,6 @@ export function createCronPage(context: () => ApplicationContext, host: () => HT
   }
 
   function selectJob(job: CronJob, runId: string | null = null) {
-    clearHeartbeatScratch();
     routeSelection.select(job.id, runId);
     pendingRunScroll = Boolean(runId);
     if (runId) {
@@ -505,54 +485,12 @@ export function createCronPage(context: () => ApplicationContext, host: () => HT
     }
     cron.cronCreateOpen = false;
     startCronEdit(cron, job);
-    void runCronTask(async (cronState) => {
-      // Claim the run pane before awaiting to retire the previous job's history.
-      await loadCronRunsForJob(cronState, job.id, runId);
-    });
+    // Claim the run pane before awaiting to retire the previous job's history.
+    void runCronTask((cronState) => loadCronRunsForJob(cronState, job.id, runId));
     deliveryDirectory.openEditor();
-    if (job.payload?.kind === "heartbeat") {
-      void loadHeartbeatScratch(cron, job.id, heartbeatScratchRequest);
-    }
-  }
-
-  function clearHeartbeatScratch() {
-    heartbeatScratchRequest += 1;
-    setHeartbeatScratch("");
-  }
-
-  async function loadHeartbeatScratch(cronState: CronState, jobId: string, requestId: number) {
-    const client = cronState.client;
-    if (!canManageCron() || !client || !cronState.connected) {
-      return;
-    }
-    const connectionScope = gateway.capture();
-    if (!connectionScope) {
-      return;
-    }
-    // Revalidate scratch access, connection, and selection after the request.
-    const isCurrent = () =>
-      cron === cronState &&
-      heartbeatScratchRequest === requestId &&
-      gateway.isCurrent(connectionScope) &&
-      canManageCron() &&
-      cronState.cronEditingJob?.id === jobId &&
-      cronState.cronForm.payloadKind === "heartbeat";
-    try {
-      const result = await client.request<CronScratchGetResult>("cron.scratch.get", { id: jobId });
-      if (isCurrent()) {
-        setHeartbeatScratch(result.scratch?.content ?? "");
-        publishCronState(cronState);
-      }
-    } catch (error) {
-      if (isCurrent()) {
-        cronState.cronError = formatUiError(error);
-        publishCronState(cronState);
-      }
-    }
   }
 
   function resetEditor(createOpen: boolean) {
-    clearHeartbeatScratch();
     routeSelection.target = null;
     // Retire discovery before resetting its editor's form.
     eventSource.reset();
@@ -577,7 +515,6 @@ export function createCronPage(context: () => ApplicationContext, host: () => HT
     if (!canManageCron()) {
       return;
     }
-    clearHeartbeatScratch();
     routeSelection.target = null;
     // A clone is a prefilled create: the editor submits cron.add, not update.
     startCronClone(cron, job);
@@ -647,9 +584,7 @@ export function createCronPage(context: () => ApplicationContext, host: () => HT
   function closePanel() {
     resetEditor(false);
     publishCronState();
-    void runCronTask(async (cronState) => {
-      await loadCronRunsForJob(cronState, null);
-    });
+    void runCronTask((cronState) => loadCronRunsForJob(cronState, null));
   }
 
   function submitForm(runNow = false) {
@@ -680,7 +615,7 @@ export function createCronPage(context: () => ApplicationContext, host: () => HT
       if (editing) {
         return;
       }
-      if (runNow && result.jobId) {
+      if (runNow) {
         // Explicit create-and-run intent survives navigation while saving.
         await runCronJob(cronState, result.jobId, "force");
       }
@@ -706,7 +641,7 @@ export function createCronPage(context: () => ApplicationContext, host: () => HT
     onOpenCreate: openCreate,
     onClosePanel: closePanel,
     onClone: cloneJob,
-    onToggle: (job, enabled) => {
+    onToggle: (job: CronJob, enabled: boolean) => {
       const scope = gateway.capture();
       const editorGeneration = deliveryDirectory.generation;
       runCronAdminTask(async (cronState) => {
@@ -714,7 +649,7 @@ export function createCronPage(context: () => ApplicationContext, host: () => HT
         deliveryDirectory.reconcileRoute(cronState, scope, editorGeneration);
       });
     },
-    onRun: (job, mode) =>
+    onRun: (job: CronJob, mode?: "force" | "due") =>
       runCronAdminTask((cronState) => runCronJob(cronState, job.id, mode ?? "force")),
     onRemove: removeJob,
     onLoadMoreJobs: () =>
@@ -730,8 +665,9 @@ export function createCronPage(context: () => ApplicationContext, host: () => HT
         cronJobsSortBy: "nextRunAtMs",
         cronJobsSortDir: "asc",
       }),
-    onLoadMoreRuns: () => void runCronTask((cronState) => loadMoreCronRuns(cronState)),
-    onRunsFiltersChange: (patch) =>
+    onLoadMoreRuns: () =>
+      void runCronTask((cronState) => loadCronRuns(cronState, { append: true })),
+    onRunsFiltersChange: (patch: Parameters<typeof updateCronRunsFilter>[1]) =>
       void runCronTask(async (cronState) => {
         updateCronRunsFilter(cronState, patch);
         if (patch.cronRunsRunId !== undefined && cronState.cronEditingJob) {
@@ -739,8 +675,9 @@ export function createCronPage(context: () => ApplicationContext, host: () => HT
         }
         await loadCronRuns(cronState);
       }),
-    onViewRunTranscript: (entry, trigger) => void runTranscript.open(entry, trigger),
-  } satisfies Pick<CronProps, Extract<keyof CronProps, `on${string}`>>;
+    onViewRunTranscript: (entry: CronRunLogEntry, trigger: HTMLButtonElement) =>
+      void runTranscript.open(entry, trigger),
+  };
   return {
     context,
     inventories: { agents, channels, runtimeConfig },
@@ -750,7 +687,6 @@ export function createCronPage(context: () => ApplicationContext, host: () => HT
     modelSuggestionsError,
     listTab,
     detailTab,
-    heartbeatScratch,
     actions,
     runTranscript,
     deliveryDirectory,

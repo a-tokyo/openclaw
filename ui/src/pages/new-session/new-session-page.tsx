@@ -1,5 +1,5 @@
 import { createMemo, Errored, lazy, Loading, onCleanup, onSettled, Show } from "solid-js";
-import type { SolidRouteProps } from "../../app-route-types.ts";
+import type { SolidRouteProps } from "../../app-route-types.tsx";
 import { createGatewayControlUiReloadOptions } from "../../app/gateway-control-ui-reload.ts";
 import { reloadAfterRenderErrorOnce } from "../../app/stale-chunk-reload.ts";
 import { ImageLightbox } from "../../components/image-lightbox.tsx";
@@ -22,14 +22,14 @@ import { chatStartupStatusLabel } from "../chat/chat-run-startup.ts";
 import { ChatPermissionPicker } from "../chat/components/chat-permission-picker.tsx";
 import { installChatComposerPickerDismissal } from "../chat/components/chat-picker-overlay.ts";
 import { ComposerDictationStatus } from "../chat/components/chat-voice-activity.tsx";
+import { DirectDictationView } from "../chat/components/direct-dictation-view.tsx";
 import { CatalogBar } from "./catalog-target-view.tsx";
 import * as catalog from "./catalog-target.ts";
-import { NewSessionDictationView } from "./composer-dictation-view.tsx";
 import { NewSessionComposerTextareaContext } from "./composer-textarea-context.ts";
 import { NewSessionComposer } from "./composer.tsx";
 import { ConnectMachineDialog } from "./connect-machine-dialog-view.tsx";
 import { isWorktreeNameValid } from "./create-params.ts";
-import { DraftError, NewSessionBody } from "./draft-body.solid.tsx";
+import { DraftError, NewSessionBody, preloadNewSessionSubmission } from "./draft-body.solid.tsx";
 import type { DraftSubmissionFlow } from "./draft-submission-flow.ts";
 import { createNewSessionTitle } from "./draft-title.ts";
 import { DraftWelcome } from "./draft-welcome.tsx";
@@ -48,6 +48,10 @@ registerNewSessionSetupEnglish();
 const CreationComposer = lazy(() => import("./creation-composer-render.tsx"), {
   export: "CreationComposer",
 });
+const preloadSubmissionViews = () => {
+  preloadNewSessionSubmission();
+  void CreationComposer.preload().catch(() => undefined);
+};
 
 export function NewSessionRoute(props: SolidRouteProps<NewSessionRouteData>) {
   // Instant-thread handoff parks and restores this exact registered host across route roots.
@@ -148,10 +152,11 @@ function DraftBlock(props: {
     <ComposerDictationStatus readDictation={() => props.page().dictation.dictation} />
   );
   const voiceControl = (
-    <NewSessionDictationView
+    <DirectDictationView
       control={props.page().dictation}
       ownerKey={props.page().routeOwnerKey()}
       inputDeviceId={props.page().context?.theme.settings.realtimeTalkInputDeviceId}
+      idleLabel={t("newSession.dictate")}
       renderRevision={props.revision()}
     />
   );
@@ -324,6 +329,11 @@ function renderPageContent(host: PageHost) {
         true,
       ),
       listen(document.defaultView!, "beforeunload", owner.flushDraft),
+      // Submit mounts the deferred preview and composer; fetch them on first
+      // intent so the page never flashes their loading fallbacks.
+      ...(["pointerdown", "keydown"] as const).map((type) =>
+        listen(host, type, preloadSubmissionViews, { capture: true, once: true }),
+      ),
     ];
     return () => stops.forEach((stop) => stop());
   });

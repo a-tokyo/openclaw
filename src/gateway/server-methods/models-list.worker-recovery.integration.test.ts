@@ -152,7 +152,6 @@ it("model reads recover a failed shared-worker publication and retain the failed
       },
       agents: catalogAgents(state, {
         skipBootstrap: true,
-        heartbeat: { every: "0m" },
         model: { primary: `${provider}/original` },
         modelPolicy: { allow: providers.map((id) => `${id}/*`) },
       }),
@@ -207,14 +206,14 @@ it("model reads recover a failed shared-worker publication and retain the failed
       const initialRequests = requests;
       expect((await list()).models).toEqual(initial.models);
       expect(requests).toBe(initialRequests);
-      const renewalFailed = createDeferred<Error>();
+      const renewalFailed = createDeferred();
       const recoveryFailed = createDeferred<Error>();
       releasePublication = registerPreparedModelRuntimePublicationListener((event) => {
         if (event.phase === "failed") {
-          renewalFailed.resolve(event.error);
+          renewalFailed.resolve();
           recoveryFailed.resolve(event.error);
         } else if (event.phase === "catalog-failed") {
-          renewalFailed.resolve(event.error);
+          renewalFailed.resolve();
         }
       });
       // The shipped SDK renewal entry point still owns background expiry; Gateway reads stay passive.
@@ -227,15 +226,15 @@ it("model reads recover a failed shared-worker publication and retain the failed
       });
       expect(renewing?.pendingProviders).toContain(provider);
       expect((await list()).models).toEqual(initial.models);
-      await withinTest(
-        Promise.race([
-          renewal,
-          renewalFailed.promise.then((error) => {
-            throw error;
-          }),
-        ]),
-        signal,
-      );
+      expect(
+        await withinTest(
+          Promise.race([
+            renewal.then(() => "request"),
+            renewalFailed.promise.then(() => "failure"),
+          ]),
+          signal,
+        ),
+      ).toBe("request");
       const readAuth = (snapshot: NonNullable<ReturnType<typeof readSnapshot>>) => {
         const auth = getPreparedModelFullCatalogAuth(snapshot.readFullModelCatalog!()!)!;
         return { ...auth, authStore: { profiles: auth.authStore.profiles } };

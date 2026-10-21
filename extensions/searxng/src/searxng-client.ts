@@ -54,28 +54,6 @@ function normalizeSearxngResult(value: unknown): SearxngResult | null {
   };
 }
 
-function buildSearxngSearchUrl(params: {
-  baseUrl: string;
-  query: string;
-  categories?: string;
-  language?: string;
-}): string {
-  const url = new URL(params.baseUrl);
-  const basePathname = url.pathname.replace(/\/+$/u, "");
-  const pathname = basePathname.endsWith("/search") ? basePathname : `${basePathname}/search`;
-  url.pathname = pathname;
-  url.search = "";
-  url.searchParams.set("q", params.query);
-  url.searchParams.set("format", "json");
-  if (params.categories) {
-    url.searchParams.set("categories", params.categories);
-  }
-  if (params.language) {
-    url.searchParams.set("language", params.language);
-  }
-  return url.toString();
-}
-
 function shouldRetryEmptyCategorySearchWithGeneral(categories: string | undefined): boolean {
   if (!categories) {
     return false;
@@ -152,57 +130,6 @@ function parseSearxngResponseText(text: string, count: number): SearxngResult[] 
   return results;
 }
 
-async function fetchSearxngResults(params: {
-  baseUrl: string;
-  query: string;
-  categories?: string;
-  language?: string;
-  timeoutSeconds: number;
-  count: number;
-  endpointMode: SearxngEndpointMode;
-  signal?: AbortSignal;
-}): Promise<SearxngResult[]> {
-  const url = buildSearxngSearchUrl({
-    baseUrl: params.baseUrl,
-    query: params.query,
-    categories: params.categories,
-    language: params.language,
-  });
-
-  const withEndpoint =
-    params.endpointMode === "selfHosted"
-      ? withSelfHostedWebSearchEndpoint
-      : withTrustedWebSearchEndpoint;
-  return await withEndpoint(
-    {
-      url,
-      timeoutSeconds: params.timeoutSeconds,
-      signal: params.signal,
-      init: {
-        method: "GET",
-        headers: {
-          Accept: "application/json",
-        },
-      },
-    },
-    async (response) => {
-      if (!response.ok) {
-        const detail = (await readResponseText(response, { maxBytes: 64_000 })).text;
-        throw new ProviderHttpError(
-          `SearXNG search error (${response.status}): ${detail || response.statusText}`,
-          { status: response.status },
-        );
-      }
-
-      const body = await readResponseText(response, { maxBytes: MAX_RESPONSE_BYTES });
-      if (body.truncated) {
-        throw new Error(`SearXNG response incomplete after ${body.bytesRead} bytes.`);
-      }
-      return parseSearxngResponseText(body.text, params.count);
-    },
-  );
-}
-
 export async function runSearxngSearch(params: {
   config?: OpenClawConfig;
   query: string;
@@ -249,23 +176,61 @@ export async function runSearxngSearch(params: {
   }
 
   const startedAt = Date.now();
-  const request = {
-    baseUrl,
-    query: params.query,
-    categories,
-    language,
-    timeoutSeconds,
-    count,
-    endpointMode,
-    signal: params.signal,
+  const query = params.query;
+  const signal = params.signal;
+  const fetchSearxngResults = async (
+    searchCategories: string | undefined,
+  ): Promise<SearxngResult[]> => {
+    const url = new URL(baseUrl);
+    const basePathname = url.pathname.replace(/\/+$/u, "");
+    url.pathname = basePathname.endsWith("/search") ? basePathname : `${basePathname}/search`;
+    url.search = "";
+    url.searchParams.set("q", query);
+    url.searchParams.set("format", "json");
+    if (searchCategories) {
+      url.searchParams.set("categories", searchCategories);
+    }
+    if (language) {
+      url.searchParams.set("language", language);
+    }
+
+    const withEndpoint =
+      endpointMode === "selfHosted"
+        ? withSelfHostedWebSearchEndpoint
+        : withTrustedWebSearchEndpoint;
+    return await withEndpoint(
+      {
+        url: url.toString(),
+        timeoutSeconds,
+        signal,
+        init: {
+          method: "GET",
+          headers: {
+            Accept: "application/json",
+          },
+        },
+      },
+      async (response) => {
+        if (!response.ok) {
+          const detail = (await readResponseText(response, { maxBytes: 64_000 })).text;
+          throw new ProviderHttpError(
+            `SearXNG search error (${response.status}): ${detail || response.statusText}`,
+            { status: response.status },
+          );
+        }
+
+        const body = await readResponseText(response, { maxBytes: MAX_RESPONSE_BYTES });
+        if (body.truncated) {
+          throw new Error(`SearXNG response incomplete after ${body.bytesRead} bytes.`);
+        }
+        return parseSearxngResponseText(body.text, count);
+      },
+    );
   };
-  let results = await fetchSearxngResults(request);
+  let results = await fetchSearxngResults(categories);
   params.signal?.throwIfAborted();
   if (results.length === 0 && shouldRetryEmptyCategorySearchWithGeneral(categories)) {
-    results = await fetchSearxngResults({
-      ...request,
-      categories: "general",
-    });
+    results = await fetchSearxngResults("general");
     params.signal?.throwIfAborted();
   }
 

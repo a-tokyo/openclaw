@@ -96,20 +96,10 @@ export async function withPreparedEmbeddedRunToolAuthority<T, Attempt extends To
 }
 
 async function withPreparedEmbeddedRunToolAuthorityOwned<T, Attempt extends ToolAuthorityAttempt>(
-  internal: Pick<
-    EmbeddedRunAttemptInternalParams,
-    | "admittedRunContext"
-    | "replyOperation"
-    | "sessionPersistence"
-    | "trigger"
-    | "bindWatchdogAttempt"
-  >,
+  internal: Parameters<typeof withPreparedEmbeddedRunToolAuthority>[0],
   attempt: Attempt,
   narrow: ReplyToolAuthorityNarrow | undefined,
-  run: (
-    prepared: Attempt &
-      Pick<AgentHarnessAttemptParamsV2, "replyOperation" | "toolAuthorityFingerprint">,
-  ) => Promise<T>,
+  run: Parameters<typeof withPreparedEmbeddedRunToolAuthority<T, Attempt>>[3],
 ): Promise<T> {
   const admitted = internal.admittedRunContext;
   const instance = admitted.operationalRunInstance;
@@ -132,30 +122,34 @@ async function withPreparedEmbeddedRunToolAuthorityOwned<T, Attempt extends Tool
       : undefined;
   const assertHostActive = attempt.hostCapabilities?.assertActive;
   const operatorAuthority = readAdmittedRunOperatorAuthority(admitted);
-  const input: ReplyToolAuthorityInput = {
-    originatingChannel: attempt.messageChannel,
-    toolsAllow: attempt.toolsAllow,
-    disableTools: attempt.disableTools,
-    operatorAuthority,
-    run: {
-      ...attempt,
-      model: attempt.modelId,
-      runtimePolicySessionKey: attempt.sandboxSessionKey,
-      traceAuthorized: false,
-      spawnedBy: attempt.spawnedBy ?? undefined,
-      senderId: attempt.senderId ?? undefined,
-      senderName: attempt.senderName ?? undefined,
-      senderUsername: attempt.senderUsername ?? undefined,
-      senderE164: attempt.senderE164 ?? undefined,
-      groupId: attempt.groupId ?? undefined,
-      groupChannel: attempt.groupChannel ?? undefined,
-      groupSpace: attempt.groupSpace ?? undefined,
-    },
-  };
   let live = true;
   // Preserve the complete admitted snapshot, but bind its hash and projection
   // only after hooks or native ownership have selected the actual model.
-  const direct = operation ? undefined : prepareReplyToolAuthority(input, narrow);
+  const direct = operation
+    ? undefined
+    : prepareReplyToolAuthority(
+        {
+          originatingChannel: attempt.messageChannel,
+          toolsAllow: attempt.toolsAllow,
+          disableTools: attempt.disableTools,
+          operatorAuthority,
+          run: {
+            ...attempt,
+            model: attempt.modelId,
+            runtimePolicySessionKey: attempt.sandboxSessionKey,
+            traceAuthorized: false,
+            spawnedBy: attempt.spawnedBy ?? undefined,
+            senderId: attempt.senderId ?? undefined,
+            senderName: attempt.senderName ?? undefined,
+            senderUsername: attempt.senderUsername ?? undefined,
+            senderE164: attempt.senderE164 ?? undefined,
+            groupId: attempt.groupId ?? undefined,
+            groupChannel: attempt.groupChannel ?? undefined,
+            groupSpace: attempt.groupSpace ?? undefined,
+          },
+        },
+        narrow,
+      );
   let fingerprint: string | undefined;
   let releaseAttemptSnapshot: (() => void) | undefined;
   try {
@@ -209,7 +203,7 @@ async function withPreparedEmbeddedRunToolAuthorityOwned<T, Attempt extends Tool
   }
   const assertReplyActive = () => {
     assertActive();
-    input.operatorAuthority?.assertCurrent();
+    operatorAuthority?.assertCurrent();
     if (
       operation &&
       (operation.toolAuthorityRoute?.provider !== route.provider ||
@@ -242,7 +236,7 @@ async function withPreparedEmbeddedRunToolAuthorityOwned<T, Attempt extends Tool
         const questionAuthority = sessionKey
           ? createAgentQuestionAnswerAuthority({
               sessionKey,
-              requesterProfileId: input.operatorAuthority?.profileId,
+              requesterProfileId: operatorAuthority?.profileId,
               fingerprint,
               prepareCaller: async (caller) =>
                 prepareReplyToolAuthorityCallerRead(

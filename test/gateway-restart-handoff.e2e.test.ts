@@ -103,7 +103,6 @@ it.skipIf(process.platform !== "linux")(
               defaults: {
                 maxConcurrent: 12,
                 timeoutSeconds: 3600,
-                heartbeat: { every: "0m" },
                 model: { primary: modelRef },
                 models: {
                   [modelRef]: {
@@ -184,7 +183,7 @@ it.skipIf(process.platform !== "linux")(
               role: "operator",
               scopes: ["operator.admin", "operator.read", "operator.write"],
               deviceIdentity: loadOrCreateDeviceIdentity({
-                path: gateway.state.path("client-device.sqlite"),
+                path: gateway.state.path("client-device", "client", "credentials.sqlite"),
               }),
               onEvent: ({ event, payload }) => {
                 if (

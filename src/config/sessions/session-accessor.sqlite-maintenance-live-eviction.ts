@@ -53,7 +53,6 @@ export async function reclaimSessionPagesAfterEviction(params: {
   onIncomplete: (pruning: {
     usage: SessionPhysicalDiskUsage;
     removedFiles: number;
-    completed: false;
     checkpointIncomplete: number;
     checkpoint: SqliteSessionArchivePruningDiagnostics["checkpoint"];
   }) => void;
@@ -82,7 +81,6 @@ export async function reclaimSessionPagesAfterEviction(params: {
     params.onIncomplete({
       usage: await measureSessionPhysicalDiskUsage(params.budget.storePath),
       removedFiles: 0,
-      completed: false,
       checkpointIncomplete: pageDiagnostics.checkpointIncomplete ?? 1,
       checkpoint: pageDiagnostics.checkpoint,
     });

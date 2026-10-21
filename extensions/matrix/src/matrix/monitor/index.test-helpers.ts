@@ -111,10 +111,7 @@ const hoisted = vi.hoisted(() => {
   const disposeMonitorEvents = vi.fn(() => {
     callOrder.push("dispose-monitor-events");
   });
-  const acquireSharedMatrixClientImpl = async (params: { startClient?: boolean }) => {
-    if (params.startClient !== false) {
-      throw new Error("Matrix monitor must acquire its lease before startup");
-    }
+  const acquireSharedMatrixClientImpl = async () => {
     callOrder.push("prepare-client");
     return lease;
   };
@@ -299,12 +296,6 @@ vi.mock("../client.js", () => ({
 
 vi.mock("../config-update.js", () => ({
   updateMatrixAccountConfig: vi.fn((cfg: unknown) => cfg),
-}));
-
-vi.mock("../device-health.js", () => ({
-  summarizeMatrixDeviceHealth: vi.fn(() => ({
-    staleOpenClawDevices: [],
-  })),
 }));
 
 vi.mock("../profile.js", () => ({

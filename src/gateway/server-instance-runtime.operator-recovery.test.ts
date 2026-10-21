@@ -227,15 +227,20 @@ describe("typed restart recovery operator admission", () => {
             expect(skipped).toEqual([]);
             expect(outcome).toEqual({
               started: denied ? 0 : 1,
-              settled: 0,
-              failed: denied ? 1 : 0,
+              settled: denied ? 1 : 0,
+              failed: 0,
               skipped: 0,
             });
             expect(startTurn).toHaveBeenCalledTimes(denied ? 1 : attempt + 1);
             const retained = loadSessionEntry(target);
             expect(retained?.restartRecoveryOperatorSource).toEqual(source);
             expect(retained?.restartRecoveryDeliverySourceRunId).toBe(target.sourceRunId);
-            expect(retained?.mainRestartRecovery?.tombstone).toBeUndefined();
+            if (denied) {
+              expect(retained?.mainRestartRecovery?.tombstone?.reason).toContain("operator");
+              expect(retained?.status).toBe("failed");
+            } else {
+              expect(retained?.mainRestartRecovery?.tombstone).toBeUndefined();
+            }
           } finally {
             runtime.close();
             finish.resolve();
@@ -486,11 +491,12 @@ describe("typed restart recovery operator admission", () => {
   it.each([
     "registration replaced",
     "registration aborted",
+    "caller admission revoked",
     "lifecycle rotated",
     "Gateway closed",
     "Gateway context replaced",
   ] as const)("refuses retained operator work after its exact %s", async (boundary) => {
-    await withRecovery(async ({ target, context, entry }) => {
+    await withRecovery(async ({ target, context, entry, profileId }) => {
       let activeContext = context;
       const registration = registerRecovery(target);
       using runtime = createRuntime(() => activeContext);
@@ -498,8 +504,10 @@ describe("typed restart recovery operator admission", () => {
       const finish = createDeferred();
       let admissionCurrent = true;
       let executionStarted = false;
+      let cancellationCurrent: (() => void) | undefined;
       let releaseTurn: (() => void) | undefined;
-      startTurn.mockImplementation(async ({ principal, io }) => {
+      startTurn.mockImplementation(async ({ principal, io, assertCancellationCurrent }) => {
+        cancellationCurrent = assertCancellationCurrent;
         const currentPrincipal = expectDefined(principal, "typed recovery principal");
         const runId = target.recoveryRunId;
         io.emitStartOwner?.(runId, registration.entry);
@@ -517,13 +525,13 @@ describe("typed restart recovery operator admission", () => {
       const options = {
         restartRecoveryOperatorTarget: target,
         expectFinal: true,
+        assertAdmissionCurrent: () => {
+          if (!admissionCurrent) {
+            throw new Error("Recovery admission ended after execution started");
+          }
+        },
         ...(boundary === "registration replaced"
           ? {
-              assertAdmissionCurrent: () => {
-                if (!admissionCurrent) {
-                  throw new Error("Recovery admission ended after execution started");
-                }
-              },
               onExecutionStarted: () => {
                 executionStarted = true;
               },
@@ -580,6 +588,14 @@ describe("typed restart recovery operator admission", () => {
           );
         } else if (boundary === "registration aborted") {
           registration.controller.abort(new Error("Recovery aborted"));
+          const assertCancellation = expectDefined(cancellationCurrent, "cancellation authority");
+          expect(assertCancellation).not.toThrow();
+          setUserProfileRole(profileId, "changed-role");
+          expect(assertCancellation).toThrow();
+        } else if (boundary === "caller admission revoked") {
+          admissionCurrent = false;
+          registration.controller.abort(new Error("Recovery caller revoked"));
+          expect(expectDefined(cancellationCurrent, "cancellation authority")).toThrow();
         } else if (boundary === "lifecycle rotated") {
           rotateAgentEventLifecycleGeneration();
         } else if (boundary === "Gateway closed") {
@@ -592,6 +608,9 @@ describe("typed restart recovery operator admission", () => {
           // Once refusal is observed, putting the same old row back cannot revive tools.
           rpcSourceTesting.set(target.recoveryRunId, registration.entry);
           expect(authority.assertCurrent).toThrow();
+          admissionCurrent = true;
+          registration.controller.abort(new Error("Replaced recovery aborted"));
+          expect(expectDefined(cancellationCurrent, "cancellation authority")).toThrow();
         }
       } finally {
         finish.resolve();

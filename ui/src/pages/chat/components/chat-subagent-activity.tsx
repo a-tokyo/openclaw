@@ -1,12 +1,15 @@
 import { For, Show } from "solid-js";
 import { currentThemeBranding } from "../../../app/theme-branding.ts";
-import "../../../components/elapsed-time.tsx";
+import { ElapsedTime } from "../../../components/elapsed-time.tsx";
 import { Icon } from "../../../components/solid/icon.tsx";
 import { ThemeBrandIcon } from "../../../components/theme-brand-icon.tsx";
+import { registerChatSessionEnglish } from "../../../i18n/locales/en-chat-session.ts";
 import { fnv1aUtf16 } from "../../../lib/fnv1a.ts";
-import { t } from "../../../lib/reactive/i18n.ts";
-import type { ChatSubagentActivity } from "../chat-subagent-wait.ts";
+import { registerEnglishCatalog, t } from "../../../lib/reactive/i18n.ts";
 import "./chat-subagent-activity.css";
+import type { ChatSubagentActivity } from "../chat-subagent-wait.ts";
+
+registerEnglishCatalog(registerChatSessionEnglish);
 
 export type SubagentActivityProps = {
   rows: readonly ChatSubagentActivity[];
@@ -90,10 +93,7 @@ function SubagentActivityRow(props: SubagentActivityProps & { row: ChatSubagentA
         <span class="chat-subagent-activity__elapsed-compact" aria-hidden="true">
           <Show when={props.row.status !== "queued" && props.row.session.startedAt}>
             {(startedAt) => (
-              <openclaw-elapsed-time
-                prop:startMs={startedAt()}
-                prop:endMs={props.row.session.endedAt ?? null}
-              />
+              <ElapsedTime startMs={startedAt()} endMs={props.row.session.endedAt ?? null} />
             )}
           </Show>
         </span>
@@ -165,7 +165,7 @@ export function SubagentActivity(props: SubagentActivityProps) {
             aria-live="off"
           >
             <span class="sr-only">{t("chat.turnElapsed")}: </span>
-            <openclaw-elapsed-time prop:startMs={props.turnStartedAt} />
+            <ElapsedTime startMs={props.turnStartedAt} />
           </span>
         </Show>
       </div>

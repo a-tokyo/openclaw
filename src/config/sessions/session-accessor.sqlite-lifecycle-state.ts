@@ -27,6 +27,7 @@ import type {
   SessionEntryLifecycleUpsert,
   SessionLifecycleArchivedTranscript,
 } from "./session-accessor.sqlite-contract.js";
+import { conversationPublication } from "./session-accessor.sqlite-conversation-publication.js";
 import {
   planSessionStateDeleteIfUnreferenced,
   readSessionStateDeleteSnapshot,
@@ -619,6 +620,7 @@ function deleteSqliteSessionStateRows(database: OpenClawAgentDatabase, sessionId
     ),
   );
   retireSqliteDatabaseWriteScopes(database.db, [sqliteSessionIdWriteScope(sessionId)]);
+  conversationPublication.stageRows(database, { removedWindows: [sessionId] });
 }
 
 export function deletePlannedLifecycleArtifactEntries(

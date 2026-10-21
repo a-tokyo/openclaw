@@ -35,7 +35,7 @@ const MODEL_SETUP_DOCS_URL = "https://docs.openclaw.ai/concepts/model-providers"
 type AuthOption = NonNullable<SystemAgentSetupDetectResult["authOptions"]>[number];
 
 function EmptyState(props: ModelSetupViewProps & { result: SystemAgentSetupDetectResult }) {
-  const installs = createMemo(() => props.result.recommendedInstalls ?? []);
+  const installs = () => props.result.recommendedInstalls ?? [];
   const visible = () => {
     props.revision?.();
     return (
@@ -53,15 +53,15 @@ function EmptyState(props: ModelSetupViewProps & { result: SystemAgentSetupDetec
         </div>
         <p class="muted">{t("modelSetup.empty.intro")}</p>
         <div class="model-setup__recommendations">
-          <For each={installs()}>
+          <For each={installs()} keyed={(install) => install.id}>
             {(install) => (
-              <div class="model-setup__recommendation" data-recommended-install={install.id}>
-                {renderProviderIcon(props, install, "model-setup__icon--recommendation")}
+              <div class="model-setup__recommendation" data-recommended-install={install().id}>
+                {renderProviderIcon(props, install(), "model-setup__icon--recommendation")}
                 <div class="model-setup__row-main">
-                  <strong>{install.label}</strong>
-                  <div class="muted">{install.hint}</div>
-                  <a href={install.website} target="_blank" rel="noopener">
-                    {install.website}
+                  <strong>{install().label}</strong>
+                  <div class="muted">{install().hint}</div>
+                  <a href={install().website} target="_blank" rel="noopener">
+                    {install().website}
                   </a>
                 </div>
               </div>
@@ -147,7 +147,9 @@ function SignIn(props: ModelSetupViewProps & { result: SystemAgentSetupDetectRes
           <p>{t("modelSetup.signIn.description")}</p>
         </div>
         <div class="model-setup__rows">
-          <For each={featured()}>{(option) => <SetupActionRow view={props} option={option} />}</For>
+          <For each={featured()} keyed={(option) => option.id}>
+            {(option) => <SetupActionRow view={props} option={option()} />}
+          </For>
         </div>
         <Show when={more().length > 0}>
           <details
@@ -157,7 +159,9 @@ function SignIn(props: ModelSetupViewProps & { result: SystemAgentSetupDetectRes
           >
             <summary>{t("modelSetup.signIn.more")}</summary>
             <div class="model-setup__rows">
-              <For each={more()}>{(option) => <SetupActionRow view={props} option={option} />}</For>
+              <For each={more()} keyed={(option) => option.id}>
+                {(option) => <SetupActionRow view={props} option={option()} />}
+              </For>
             </div>
           </details>
         </Show>
@@ -176,7 +180,9 @@ function Prepare(props: ModelSetupViewProps & { result: SystemAgentSetupDetectRe
         </div>
         <p class="muted">{t("modelSetup.prepare.intro")}</p>
         <div class="model-setup__rows">
-          <For each={options()}>{(option) => <SetupActionRow view={props} option={option} />}</For>
+          <For each={options()} keyed={(option) => option.id}>
+            {(option) => <SetupActionRow view={props} option={option()} />}
+          </For>
         </div>
       </section>
     </Show>
@@ -309,11 +315,10 @@ function renderSetupAccessWarning(canAdmin: boolean) {
 }
 
 function Ready(props: ModelSetupViewProps & { result: SystemAgentSetupDetectResult }) {
-  const verify = createMemo(() =>
+  const verify = () =>
     props.verify.phase === "ok" && props.verify.modelTarget === "utility"
       ? { phase: "idle" as const }
-      : props.verify,
-  );
+      : props.verify;
   return (
     <>
       <Show when={!props.embedded && props.result.configuredModel}>
@@ -337,10 +342,8 @@ function Ready(props: ModelSetupViewProps & { result: SystemAgentSetupDetectResu
 }
 
 function ModelSetupBody(props: ModelSetupViewProps) {
-  const ready = createMemo(() => (props.page.phase === "ready" ? props.page.result : undefined));
-  const error = createMemo(() =>
-    props.page.phase === "detect-error" ? props.page.message : undefined,
-  );
+  const ready = () => (props.page.phase === "ready" ? props.page.result : undefined);
+  const error = () => (props.page.phase === "detect-error" ? props.page.message : undefined);
   return (
     <Switch>
       <Match when={ready()}>
