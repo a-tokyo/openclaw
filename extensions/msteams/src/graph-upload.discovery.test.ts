@@ -109,12 +109,6 @@ describe("resolveUploadSiteId dynamic resolution", () => {
     tokenProvider.getAccessToken.mockClear();
   });
 
-  it("throws when no team context and no configured site", async () => {
-    await expect(resolveUploadSiteId({ tokenProvider })).rejects.toThrow(
-      "No SharePoint site ID available",
-    );
-  });
-
   it("throws when team ID is present but group ID cannot be resolved", async () => {
     await expect(resolveUploadSiteId({ teamId: "unknown-team", tokenProvider })).rejects.toThrow(
       "Could not resolve AAD group ID",

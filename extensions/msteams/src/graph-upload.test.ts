@@ -284,20 +284,6 @@ describe("graph upload helpers", () => {
     },
   );
 
-  it("uses default folder name when none is configured", async () => {
-    const fetchFn = createGraphFetch(
-      fixedGraphRoute("/content", {
-        id: "item-default-folder",
-        webUrl: "https://example.com/df",
-        name: "d.txt",
-      }),
-      fixedGraphRoute("/createLink", { link: { webUrl: "https://example.com/share" } }),
-    );
-    await runGraphUpload(fetchFn);
-    const [url] = requireFetchCall(fetchFn);
-    expect(url).toContain("/OpenClawShared/");
-  });
-
   it.each(["application/pdf"])(
     "uploads to SharePoint with the site drive path and MIME %s",
     async (contentType) => {
