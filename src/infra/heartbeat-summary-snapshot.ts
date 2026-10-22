@@ -5,7 +5,7 @@ import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { tryResolveCronJobEffectiveAgentId } from "../cron/agent-id.js";
 import type { CronJob } from "../cron/types.js";
 
-export type HeartbeatSummary = {
+type HeartbeatSummary = {
   enabled: boolean;
   every: string;
   everyMs: number | null;

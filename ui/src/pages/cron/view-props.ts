@@ -1,4 +1,4 @@
-import { hasCronFormErrors } from "../../lib/cron/index.ts";
+import { hasCronFormErrors } from "../../lib/cron/form.ts";
 import { getCronRunsViewState } from "../../lib/cron/runs.ts";
 import type { createCronPage } from "./cron-page-state.ts";
 import { validateCronEventSelection } from "./event-source.ts";
@@ -30,6 +30,7 @@ export function buildCronViewProps(page: ReturnType<typeof createCronPage>) {
   return {
     ...page.actions,
     gateway: page.context().gateway,
+    getActionRetired: page.getActionRetired,
     onRunMount: page.registerRun,
     loading: page.cron().cronLoading,
     /** True once a cron.list response has completed (initial load finished). */
@@ -40,6 +41,7 @@ export function buildCronViewProps(page: ReturnType<typeof createCronPage>) {
     connected: page.cron().connected,
     status: page.cron().cronStatus,
     jobs: page.cron().cronJobs,
+    reads: page.reads,
     jobsLoadingMore: page.cron().cronJobsLoadingMore,
     jobsTotal: page.cron().cronJobsTotal,
     jobsHasMore: page.cron().cronJobsHasMore,
@@ -54,11 +56,8 @@ export function buildCronViewProps(page: ReturnType<typeof createCronPage>) {
     createOpen: page.cron().cronCreateOpen,
     listTab: page.listTab(),
     detailTab: page.detailTab(),
-    error:
-      page.cron().cronError ??
-      page.cron().cronRunsError ??
-      page.deliveryDirectory.error ??
-      page.modelSuggestionsError(),
+    error: page.cron().cronError ?? page.cron().cronRunsError ?? page.deliveryDirectory.error,
+    notice: page.cron().cronNotice,
     busy: page.cron().cronBusy,
     form: page.cron().cronForm,
     channels: channels.channelsSnapshot?.channelMeta?.length

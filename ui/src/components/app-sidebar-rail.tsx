@@ -19,7 +19,7 @@ import {
 } from "../app/native-window-drag.ts";
 import { KEYBOARD_SHORTCUT_COMBOS } from "../lib/keyboard-shortcut-contract.ts";
 import { handleContextMenuEvent } from "../lib/keyboard-shortcuts.ts";
-import { shouldHandleNavigationClick } from "../lib/navigation-click.ts";
+import { handleNavigationClick } from "../lib/navigation-click.ts";
 import { projectOnlinePresenceViewers, presenceViewerLabel } from "../lib/presence-users.ts";
 import { elementRef } from "../lib/reactive/element-ref.ts";
 import { t } from "../lib/reactive/i18n.ts";
@@ -40,11 +40,8 @@ import { restoreSnapshotSession } from "./sidebar-snapshot-model.ts";
 import { Icon } from "./solid/icon.tsx";
 import { ShortcutHint } from "./solid/kbd.tsx";
 import { renderNewSessionLink as NewSessionLink } from "./solid/new-session-link.tsx";
-import {
-  SessionGlyph,
-  renderSessionUnreadBadge,
-  renderSessionOwnerAvatar,
-} from "./solid/session-presentation.tsx";
+import { SessionOwnerAvatar } from "./solid/session-owner-chip.tsx";
+import { SessionGlyph, renderSessionUnreadBadge } from "./solid/session-presentation.tsx";
 
 type SidebarZone = ReturnType<AppSidebarRenderHost["reconciledSidebarZone"]>;
 type RailPinTouchPress = {
@@ -272,7 +269,7 @@ function renderRailPin(
             </Show>
           }
         >
-          {(user) => renderSessionOwnerAvatar(user())}
+          {(user) => <SessionOwnerAvatar owner={user()} />}
         </Show>
       </a>
     ) : entry.type === "route" ? (
@@ -308,12 +305,9 @@ function renderRailPin(
             href={host.sidebarSessionHref(row())}
             aria-label={label()}
             aria-current={row().active ? "page" : undefined}
-            onClick={(event) => {
-              if (shouldHandleNavigationClick(event)) {
-                event.preventDefault();
-                host.selectSession(row().key, undefined, row());
-              }
-            }}
+            onClick={(event) =>
+              handleNavigationClick(event, () => host.selectSession(row().key, undefined, row()))
+            }
           >
             <RailSessionGlyph session={row()} label={label()} />
           </a>
