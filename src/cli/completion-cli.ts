@@ -201,10 +201,12 @@ function generateZshArgs(cmd: Command): string {
         opt.required || opt.optional
           ? `${opt.optional ? "::" : ":"}${opt.attributeName()}:${choices ? `(${choices})` : ""}`
           : "";
+      // `=` permits long-option values both after an equals sign and in the next word.
+      const optionSpec = (flag: string) => (argument && flag.startsWith("--") ? `${flag}=` : flag);
       if (alternate) {
-        return `"${visibility}(${name} ${alternate})"{${name},${alternate}}"[${desc}]${argument}"`;
+        return `"${visibility}(${name} ${alternate})"{${optionSpec(name)},${optionSpec(alternate)}}"[${desc}]${argument}"`;
       }
-      return `"${visibility}${name}[${desc}]${argument}"`;
+      return `"${visibility}${optionSpec(name)}[${desc}]${argument}"`;
     })
     .join(" \\\n    ");
 }
@@ -373,7 +375,11 @@ Register-ArgumentCompleter -Native -CommandName ${rootCmd} -ScriptBlock {
     }
 
     for ($i = 1; $i -lt $commandElements.Count; $i++) {
-        $element = $commandElements[$i].Extent.Text
+        $element = if ($commandElements[$i] -is [System.Management.Automation.Language.StringConstantExpressionAst]) {
+            $commandElements[$i].Value
+        } else {
+            $commandElements[$i].Extent.Text
+        }
         if ($i -eq $commandElements.Count - 1 -and $wordToComplete -ne "") { break }
         if ($element -like "-*") {
             $flag = ($element -split '=', 2)[0]

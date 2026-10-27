@@ -31,7 +31,6 @@ import type { CronFormState, CronState } from "./types.ts";
 export { createInitialCronState, loadCronStatus } from "./state.ts";
 export { loadCronScopeStats } from "./scope.ts";
 export { loadCronJobsPage } from "./jobs-full.ts";
-export { resolveConfiguredCronModelSuggestions } from "./model-suggestions.ts";
 
 const CRON_CHANNEL_LAST = "last";
 
@@ -426,7 +425,7 @@ async function updateCronJobDefinition(
 
 // Mutations reload the list and scheduler status so both canonical views stay current.
 async function reloadCronJobsSnapshot(state: CronState) {
-  await loadCronJobsPage(state, { tableFilters: true });
+  await loadCronJobsPage(state, { tableFilters: true, refresh: true });
   await loadCronStatus(state);
 }
 

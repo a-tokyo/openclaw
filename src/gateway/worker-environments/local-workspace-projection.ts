@@ -1,3 +1,4 @@
+import { timeWorktreePreparationPhase } from "../../agents/worktrees/preparation-timing.js";
 import {
   captureWorktreeRegistryReadGuard,
   prepareWorktreeRegistryGuard,
@@ -20,6 +21,7 @@ import { executeExistingOpenClawStateRead } from "../../state/openclaw-state-db-
 import { projectionOperations } from "./local-workspace-state.js";
 import { withLocalWorkspaceStore, type LocalWorkspaceStore } from "./local-workspace-store.js";
 import type { LocalWorkspaceOwner } from "./local-workspace-types.js";
+import { OVERSIZED_WORKSPACE_FILE_ERROR_PREFIX } from "./workspace-manifest-comparison.js";
 import { isLocalWorkspaceBaseRefreshRef } from "./workspace-result-inventory.js";
 
 type LocalWorkspaceCustody = {
@@ -30,6 +32,65 @@ type LocalWorkspaceCustody = {
   assertCurrent: () => void;
   workerAuthority: WorktreeWorkerAuthority;
 };
+
+const pendingCheckpoints = new Map<string, Promise<void>>();
+
+async function joinLocalWorkspaceCheckpoint(
+  params: {
+    worktree: ManagedWorktreeRecord;
+    env?: NodeJS.ProcessEnv;
+    assertCurrent?: () => void;
+    workerAuthority?: WorktreeWorkerAuthority;
+  },
+  session: readonly [string, string, string, string | null] | undefined,
+  run: (beginCapture: () => void) => Promise<void>,
+) {
+  const context = captureWorktreeRunEndContext(params.env ?? process.env);
+  params.assertCurrent?.();
+  params.workerAuthority?.assertCurrent?.();
+  const { worktree } = params;
+  const key = JSON.stringify([
+    context.admission.coordinationKey,
+    worktree.id,
+    worktree.path,
+    worktree.repoRoot,
+    worktree.ownerKind,
+    worktree.ownerId,
+    worktree.branch,
+    worktree.snapshotRef,
+    worktree.removedAt,
+    session,
+  ]);
+  let pending = pendingCheckpoints.get(key);
+  if (!pending) {
+    const forget = () => {
+      if (pendingCheckpoints.get(key) === pending) {
+        pendingCheckpoints.delete(key);
+      }
+    };
+    // Join only while waiting for custody/quiescence. A filesystem write after
+    // capture starts has no database revision and needs its own checkpoint.
+    pending = run(forget).finally(forget);
+    pendingCheckpoints.set(key, pending);
+  }
+  await pending;
+  context.admission.assertCurrent();
+  params.assertCurrent?.();
+  params.workerAuthority?.assertCurrent?.();
+}
+
+/** Checkpoint callers keep their own session authority while sharing queued capture. */
+export function checkpointLocalWorkspace(owner: LocalWorkspaceOwner): Promise<void> {
+  return joinLocalWorkspaceCheckpoint(
+    owner,
+    [owner.agentId, owner.sessionKey, owner.sessionId, owner.lifecycleRevision],
+    (beginCapture) =>
+      withLocalWorkspaceProjection(owner, (state) => {
+        beginCapture();
+        return state.synchronize("canonical");
+      }),
+  );
+}
 
 /** Publication and lifecycle callers retain their own authority while joining local settlement. */
 export async function withSettledLocalWorkspace<T>(
@@ -43,6 +104,14 @@ export async function withSettledLocalWorkspace<T>(
     finishRestore?: boolean;
   },
   operation: (custody?: LocalWorkspaceCustody) => Promise<T>,
+): Promise<T> {
+  return await settleLocalWorkspace(params, operation);
+}
+
+async function settleLocalWorkspace<T>(
+  params: Parameters<typeof withSettledLocalWorkspace>[0],
+  operation: (custody?: LocalWorkspaceCustody) => Promise<T>,
+  beginCapture?: () => void,
 ): Promise<T> {
   const context = captureWorktreeRunEndContext(params.env ?? process.env);
   const env = { ...(params.env ?? process.env), ...context.environment };
@@ -125,6 +194,7 @@ export async function withSettledLocalWorkspace<T>(
         },
       };
       return await runLocalWorkspaceProjection(owner, store, async (state, quiescence) => {
+        beginCapture?.();
         if (params.finishRestore) {
           await state.finishRestore();
         } else if (params.restoreSnapshot) {
@@ -142,12 +212,12 @@ export async function withSettledLocalWorkspace<T>(
           }
           await quiescence?.retire();
         }
-        owner.assertCurrent();
+        const current = state.current();
         return await operation(
-          state.current().baseline_ref
+          current.baseline_ref
             ? {
                 worktreeId: worktree.id,
-                projectionPath: state.current().projection_path,
+                projectionPath: current.projection_path,
                 prepareArchive: state.prepareArchive,
                 canonicalPaths: state.canonicalPaths,
                 assertCurrent: state.current,
@@ -162,6 +232,23 @@ export async function withSettledLocalWorkspace<T>(
       });
     },
   );
+}
+
+/** File readers need a fresh checkpoint, not a lease-bearing custody callback. */
+export async function checkpointLocalWorkspacePath(params: {
+  cwd: string;
+  assertCurrent?: () => void;
+}): Promise<void> {
+  const context = captureWorktreeRunEndContext(process.env);
+  const env = { ...process.env, ...context.environment };
+  const worktree = await readLiveRegistryWorktreeByPath(context, params.cwd);
+  params.assertCurrent?.();
+  if (worktree) {
+    const checkpoint = { worktree, env, assertCurrent: params.assertCurrent };
+    await joinLocalWorkspaceCheckpoint(checkpoint, undefined, (beginCapture) =>
+      settleLocalWorkspace(checkpoint, async () => {}, beginCapture),
+    );
+  }
 }
 
 export async function withSettledLocalWorkspacePath<T>(
@@ -213,10 +300,6 @@ async function runLocalWorkspaceProjection<T>(
   const workerAuthority: WorktreeWorkerAuthority = {
     ...store.workerAuthority,
     predicates: owner.workerAuthority?.predicates ?? store.workerAuthority.predicates,
-    assertCurrent: () => {
-      store.workerAuthority.assertCurrent?.();
-      owner.workerAuthority?.assertCurrent?.();
-    },
   };
   let previous = store.get();
   // A reset may recover its prior result; another session incarnation cannot adopt it.
@@ -242,26 +325,37 @@ async function runLocalWorkspaceProjection<T>(
     await import("../../agents/sandbox/local-workspace-quiescence.js");
   const quiescence =
     previous && !options.provision
-      ? await quiesceLocalWorkspace({
-          env: owner.env,
-          workspaceDir: previous.projection_path,
-          retained: parseLocalWorkspacePausedRuntimes(previous.paused_runtimes_json),
-          persist: (runtimes) =>
-            operations.rememberPaused(runtimes.length ? JSON.stringify(runtimes) : null),
-          assertCurrent,
-        })
+      ? await timeWorktreePreparationPhase("runtimeQuiesce", () =>
+          quiesceLocalWorkspace({
+            env: owner.env,
+            workspaceDir: previous.projection_path,
+            retained: parseLocalWorkspacePausedRuntimes(previous.paused_runtimes_json),
+            persist: (runtimes) =>
+              operations.rememberPaused(runtimes.length ? JSON.stringify(runtimes) : null),
+            assertCurrent,
+          }),
+        )
       : undefined;
   try {
     return await run(operations, quiescence);
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith(OVERSIZED_WORKSPACE_FILE_ERROR_PREFIX)) {
+      const { describeLocalWorkspaceRecovery } = await import("./local-workspace-recovery.js");
+      throw await describeLocalWorkspaceRecovery(error, owner, operations);
+    }
+    throw error;
   } finally {
-    // Only acknowledged journal changes allow the frozen guest to resume.
-    const retained = store.get();
+    // Retirement finished cleanup before removal could invalidate the old binding.
+    // Otherwise, only acknowledged journal changes allow the frozen guest to resume.
+    const retained = quiescence?.retired ? undefined : store.get();
     if (
       retained &&
       !retained.journal_json &&
       !(retained.pending_target && isLocalWorkspaceBaseRefreshRef(retained.pending_ref))
     ) {
-      await quiescence?.resume();
+      if (quiescence) {
+        await timeWorktreePreparationPhase("runtimeResume", () => quiescence.resume());
+      }
     }
   }
 }
@@ -405,8 +499,8 @@ export async function resolveLocalWorkspaceOwner(params: {
       throw new Error("Local sandbox managed workspace owner changed");
     }
     const assertSessionCurrent = () => {
-      assertActive();
       if (!metadata) {
+        assertActive();
         if (!retained?.isCurrent()) {
           throw new Error("Local sandbox workspace authority changed");
         }

@@ -10,13 +10,13 @@ import { sessionDeliveryOrigin } from "../../utils/delivery-context.read.js";
 import type { SessionStateDeletePlan } from "./session-accessor.sqlite-archive-types.js";
 import { planSessionStateDeleteIfUnreferenced } from "./session-accessor.sqlite-delete-snapshot.js";
 import { readSessionEntryStore } from "./session-accessor.sqlite-entry-inventory.js";
+import { hasColdSessionTranscript } from "./session-accessor.sqlite-lifecycle-state.js";
+import type { SessionEntryMaintenancePlan } from "./session-accessor.sqlite-lifecycle-types.js";
 import {
   collectProjectedReferencedSessionIds,
   collectSessionStateIdsForEntry,
-  hasColdSessionTranscript,
   readSessionGenerationIdsForKeys,
-} from "./session-accessor.sqlite-lifecycle-state.js";
-import type { SessionEntryMaintenancePlan } from "./session-accessor.sqlite-lifecycle-types.js";
+} from "./session-accessor.sqlite-references.js";
 import { getSessionKysely } from "./session-accessor.sqlite-scope.js";
 import { parseSessionEntryJson as parseSessionEntryRow } from "./session-accessor.sqlite-status.js";
 import type {

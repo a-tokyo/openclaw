@@ -29,12 +29,13 @@ import {
   restorePaneStagedAttachments,
 } from "./chat-pane-attachment-handoff.ts";
 import { registerChatPane } from "./chat-pane-elements.ts";
-import { createSessionCapabilityFixture, createTestChatPane } from "./chat-pane.test-support.ts";
+import { createTestChatPane } from "./chat-pane.test-support.ts";
 import { enqueueChatMessage } from "./chat-queue.ts";
 import {
   captureChatCommandComposerRecovery,
   settleChatCommandComposer,
 } from "./chat-send-composer.ts";
+import { createSessionCapabilityFixture } from "./chat-session-capability.test-support.ts";
 import { createChatState } from "./chat-state-controller.ts";
 import type { ChatPageHost } from "./chat-state-host.ts";
 import type { ChatAttachmentControlsProps } from "./components/chat-attachment-controls.types.ts";
@@ -42,10 +43,8 @@ import { createChatAttachmentInputHandle } from "./components/chat-attachment-in
 import { ChatAttachmentInputs } from "./components/chat-attachment-inputs.tsx";
 import { AttachmentPreview } from "./components/chat-attachments.tsx";
 import { reviewPrivateComposerDraft } from "./components/private-composer-recovery-dialog.tsx";
-import {
-  CHAT_COMPOSER_DRAFT_STORAGE_ERROR,
-  loadChatComposerState,
-} from "./composer-draft-storage.ts";
+import { loadChatComposerState } from "./composer-draft-storage.ts";
+import { CHAT_COMPOSER_DRAFT_STORAGE_ERROR } from "./composer-persistence-feedback.ts";
 import { ChatComposerPersistence } from "./composer-persistence.ts";
 import {
   activeQueuedMessageEdit,

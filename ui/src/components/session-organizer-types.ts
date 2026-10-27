@@ -19,6 +19,7 @@ export interface SessionOrganizerDependencies {
   readonly sidebarEntries: readonly string[];
   readonly onUpdateSidebarEntries?: (entries: string[]) => void;
   sessionsGrouping: SidebarSessionsGrouping;
+  effectiveSessionsGrouping(): SidebarSessionsGrouping;
   sessionsShowCron: boolean;
   sessionsShowPreview: boolean;
   sessionsShowSystem: boolean;
@@ -32,6 +33,7 @@ export interface SessionOrganizerDependencies {
   pruneSidebarSessionEntry(key: string): void;
   reconciledSidebarZone(): {
     sidebarEntries: readonly string[];
+    sessionRows: ReadonlyMap<string, SidebarRecentSession>;
   };
   selectSession(sessionKey: string): void;
   sidebarSessionStatusFilter(): SidebarSessionStatusFilter;

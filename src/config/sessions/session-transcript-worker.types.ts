@@ -292,7 +292,6 @@ export type SessionHistoryWorkerInput =
       kind: "prewarm";
       database: { agentId: string; path: string };
       env: NodeJS.ProcessEnv;
-      history: boolean;
     }
   | SessionHistoricalEvictionCandidatesWorkerInput
   | SessionArchivedEvictionCandidatesWorkerInput
@@ -566,7 +565,7 @@ export type SessionHistoryWorkerDatabase = SessionTranscriptInventoryReaders &
     readAnchors: CancellableSessionHistoryReader<"transcript-anchors", "facts">;
     readConversations: SessionHistoryReader<"conversation-rows", "rows">;
     readConversationBindings: SessionHistoryReader<"conversation-bindings", "snapshot">;
-    prewarm: (input: { env: NodeJS.ProcessEnv; history: boolean }) => Promise<void>;
+    prewarm: (input: { env: NodeJS.ProcessEnv }) => Promise<void>;
     readPendingArchives: CancellableSessionHistoryReader<"session-pending-archives", "pending">;
     readLifecycleArtifactPlan: CancellableSessionHistoryReader<"lifecycle-artifact-plan">;
     findTranscriptEvent: (

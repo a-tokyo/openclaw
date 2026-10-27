@@ -7,12 +7,48 @@ import { runOpenClawStateWriteTransaction } from "../../state/openclaw-state-db.
 import { assertOpenClawStateLeasesWorkerOwnedInTransaction } from "../../state/openclaw-state-lease-worker.js";
 import type { OpenClawStateLeaseIdentity } from "../../state/openclaw-state-lease.types.js";
 import type { WorkerOperationContext } from "../../state/worker-operation-registry.js";
+import type { LocalWorkspacePreparation } from "./local-workspace-cas.js";
 import {
-  mutateLocalWorkspaceProjection,
-  type LocalWorkspaceMutation,
-} from "./local-workspace-store.kernel.js";
+  beginLocalWorkspaceSweepInDatabase,
+  deleteLocalWorkspaceSweepBatchInDatabase,
+  prepareLocalWorkspaceContentInDatabase,
+  pruneLocalWorkspaceLegacyBatchInDatabase,
+  type LocalWorkspaceSweepCandidates,
+} from "./local-workspace-cas.kernel.js";
+import { mutateLocalWorkspaceProjection } from "./local-workspace-store.kernel.js";
+import type { LocalWorkspaceMutation } from "./local-workspace-store.types.js";
 
 export const localWorkspaceOperations = {
+  "localWorkspace.prepare": (
+    input: { preparation: Uint8Array },
+    { open }: WorkerOperationContext,
+  ) => {
+    // SAFETY: Only the workspace read/scan owner produces these bounded preparation batches.
+    const preparation = deserialize(inflateRawSync(input.preparation)) as LocalWorkspacePreparation;
+    return runOpenClawStateWriteTransaction(
+      ({ db }) => {
+        prepareLocalWorkspaceContentInDatabase(db, preparation);
+      },
+      { database: open() },
+    );
+  },
+  "localWorkspace.pruneLegacy": (input: { id: string }, { open }: WorkerOperationContext) =>
+    runOpenClawStateWriteTransaction(
+      ({ db }) => pruneLocalWorkspaceLegacyBatchInDatabase(db, input.id),
+      { database: open() },
+    ),
+  "localWorkspace.beginSweep": (_input: Record<string, never>, { open }: WorkerOperationContext) =>
+    runOpenClawStateWriteTransaction(({ db }) => beginLocalWorkspaceSweepInDatabase(db), {
+      database: open(),
+    }),
+  "localWorkspace.sweepBatch": (
+    input: { epoch: number; batch: LocalWorkspaceSweepCandidates },
+    { open }: WorkerOperationContext,
+  ) =>
+    runOpenClawStateWriteTransaction(
+      ({ db }) => deleteLocalWorkspaceSweepBatchInDatabase(db, input.epoch, input.batch),
+      { database: open() },
+    ),
   "localWorkspace.mutate": (
     input: {
       id: string;
@@ -29,11 +65,11 @@ export const localWorkspaceOperations = {
     ) {
       throw new Error("Local workspace mutation requires reconciliation custody");
     }
-    // The host owns this internal wire shape. Decode before entering the transaction;
+    // The workspace owner prepares this wire shape. Decode before entering the transaction;
     // current leases and registry predicates still gate the actual commit below.
     const mutation: LocalWorkspaceMutation =
       input.mutation instanceof Uint8Array
-        ? (deserialize(inflateRawSync(input.mutation)) as LocalWorkspaceMutation) // SAFETY: The host serialized a LocalWorkspaceMutation.
+        ? (deserialize(inflateRawSync(input.mutation)) as LocalWorkspaceMutation) // SAFETY: The workspace owner serialized a LocalWorkspaceMutation.
         : input.mutation;
     return runOpenClawStateWriteTransaction(
       ({ db }) => {

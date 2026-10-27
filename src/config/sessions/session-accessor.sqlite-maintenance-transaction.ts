@@ -81,12 +81,13 @@ export function prepareSessionMaintenanceInWorker(
       { databaseLabel: database.path, operationLabel: "session.maintenance.plan.read" },
     );
     return {
+      requiresWrite: prepared.requiresWrite,
       apply(
         current: OpenClawAgentDatabase,
         onArchived?: Parameters<typeof applySessionEntryMaintenanceInDatabase>[3],
       ) {
         claim.assertCurrent();
-        return prepared(current, onArchived);
+        return prepared.apply(current, onArchived);
       },
       release: claim.release,
     };
@@ -187,6 +188,15 @@ export function runSessionMaintenanceMetadataInTransaction(
     return { kind: plan.kind, value: true };
   }
   try {
+    if (plan.kind === "maintenance-plan" && prepared?.requiresWrite === false) {
+      const database = openOpenClawAgentDatabase(plan.databaseOptions);
+      return {
+        kind: plan.kind,
+        value: prepared.apply(database),
+        nextAt: readSessionEntryMaintenanceNextAgeAt(database, plan.input.maintenance),
+        ageFact: readSessionEntryMaintenanceAgeFact(database.db, plan.input.maintenance),
+      };
+    }
     return runOpenClawAgentWriteTransaction(
       (database) => {
         callbacks.beforeMutation?.(database);
