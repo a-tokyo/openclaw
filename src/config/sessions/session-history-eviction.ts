@@ -44,10 +44,9 @@ import type {
 import { emitArchivedTranscriptUpdates } from "./session-accessor.sqlite-events.js";
 import type { SqliteSessionReclamationPlan } from "./session-accessor.sqlite-lifecycle-types.js";
 import {
-  evictsLiveConversations,
-  readLiveEvictionPlan,
   reclaimSessionPagesAfterEviction,
   reclaimSqliteLiveSessionEntriesToHighWater,
+  wouldEvictLiveConversations,
 } from "./session-accessor.sqlite-maintenance-live-eviction.js";
 import { refreshSqliteSessionPlannerStatisticsBestEffort } from "./session-accessor.sqlite-maintenance.js";
 import { readSqliteSessionArchivePruning } from "./session-accessor.sqlite-page-reclamation.js";
@@ -167,24 +166,17 @@ async function inspectSessionHistoryDiskBudget(
     limit: 1,
     preserveRecentMs: params.maintenance.preserveRecentMs,
   });
-  if (candidates.length > 0 || archivedCandidates.candidates.length > 0) {
-    return { diskBudget, wouldMutate: true };
-  }
-  if (!evictsLiveConversations(params.maintenance)) {
-    return { diskBudget, wouldMutate: false };
-  }
-  if (usage.totalBytes - usage.databaseWalBytes <= highWaterBytes) {
-    return { diskBudget, wouldMutate: false };
-  }
-  const preview = await readLiveEvictionPlan({
-    activeSessionKey: params.activeSessionKey,
-    archiveDirectory: resolveSqliteTranscriptArchiveDirectory(resolved),
-    databaseOptions,
-    preserveRecentMs: params.maintenance.preserveRecentMs,
-    readMode: params.reclamationMode,
-    storePath: params.storePath,
-  });
-  return { diskBudget, wouldMutate: preview.plan.entryRemovals.length > 0 };
+  const wouldMutate =
+    candidates.length > 0 ||
+    archivedCandidates.candidates.length > 0 ||
+    (await wouldEvictLiveConversations({
+      archiveDirectory: resolveSqliteTranscriptArchiveDirectory(resolved),
+      budget: params,
+      databaseOptions,
+      highWaterBytes,
+      usage,
+    }));
+  return { diskBudget, wouldMutate };
 }
 
 /** Session ids owned by live runs or work admissions, without durable-reference protection. */
@@ -739,24 +731,16 @@ async function enforceSessionHistoryMaintenanceForDatabase(
       }
     }
   }
-  // Historical generations and cap-archived sessions first. Idle durable live
-  // nodes are last-resort capacity victims so an explicit maxDiskBytes still
-  // bounds the store.
-  if (usage.totalBytes > highWaterBytes && evictsLiveConversations(params.maintenance)) {
+  // Idle durable live nodes are last-resort victims after history and cap archives.
+  if (usage.totalBytes > highWaterBytes) {
     const live = await reclaimSqliteLiveSessionEntriesToHighWater({
-      activeSessionKey: params.activeSessionKey,
       archiveDirectory,
+      budget: params,
       highWaterBytes,
-      pruneArchivesToHighWater: async () => {
-        pruning = await pruneArchives("after-eviction");
-        return pruning;
-      },
-      readMode: params.reclamationMode,
+      pruneArchivesToHighWater: async () => (pruning = await pruneArchives("after-eviction")),
       reclaimFreePages: reclaimPagesAfterEviction,
       resolved,
-      storePath: params.storePath,
       usage,
-      preserveRecentMs: params.maintenance.preserveRecentMs,
     });
     removedEntries += live.removedEntries;
     removedFiles += live.removedFiles;

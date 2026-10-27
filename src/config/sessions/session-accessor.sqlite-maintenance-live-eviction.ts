@@ -133,22 +133,45 @@ export async function readLiveEvictionPlan(params: {
   });
 }
 
+/** Dry-run counterpart of the live tier: whether it would remove a conversation now. */
+export async function wouldEvictLiveConversations(params: {
+  archiveDirectory: string;
+  budget: SessionHistoryDiskBudgetParams;
+  databaseOptions: OpenClawAgentDatabaseOptions;
+  highWaterBytes: number;
+  usage: SessionPhysicalDiskUsage;
+}): Promise<boolean> {
+  const { budget, usage } = params;
+  if (
+    !evictsLiveConversations(budget.maintenance) ||
+    usage.totalBytes - usage.databaseWalBytes <= params.highWaterBytes
+  ) {
+    return false;
+  }
+  const preview = await readLiveEvictionPlan({
+    activeSessionKey: budget.activeSessionKey,
+    archiveDirectory: params.archiveDirectory,
+    databaseOptions: params.databaseOptions,
+    preserveRecentMs: budget.maintenance.preserveRecentMs,
+    readMode: budget.reclamationMode,
+    storePath: budget.storePath,
+  });
+  return preview.plan.entryRemovals.length > 0;
+}
+
 /** Last-resort live-node disk eviction. Historical generations must already be exhausted. */
 export async function reclaimSqliteLiveSessionEntriesToHighWater(params: {
-  activeSessionKey?: string;
   archiveDirectory: string;
+  budget: SessionHistoryDiskBudgetParams;
   highWaterBytes: number;
   pruneArchivesToHighWater: () => Promise<{
     removedFiles: number;
     usage: SessionPhysicalDiskUsage;
     checkpointIncomplete?: number;
   }>;
-  readMode?: LiveEvictionReadMode;
   reclaimFreePages: () => Promise<boolean>;
   resolved: Pick<ResolvedSqliteReadScope, "agentId" | "env" | "path">;
-  storePath: string;
   usage: SessionPhysicalDiskUsage;
-  preserveRecentMs?: number | null;
 }): Promise<{
   removedEntries: number;
   removedFiles: number;
@@ -159,16 +182,17 @@ export async function reclaimSqliteLiveSessionEntriesToHighWater(params: {
   let removedFiles = 0;
   const skipSessionKeys = new Set<string>();
   const databaseOptions = toDatabaseOptions(params.resolved);
+  const { budget } = params;
   const planParams = {
-    activeSessionKey: params.activeSessionKey,
+    activeSessionKey: budget.activeSessionKey,
     archiveDirectory: params.archiveDirectory,
     databaseOptions,
-    preserveRecentMs: params.preserveRecentMs,
-    readMode: params.readMode,
+    preserveRecentMs: budget.maintenance.preserveRecentMs,
+    readMode: budget.reclamationMode,
     skipSessionKeys,
-    storePath: params.storePath,
+    storePath: budget.storePath,
   };
-  while (usage.totalBytes > params.highWaterBytes) {
+  while (usage.totalBytes > params.highWaterBytes && evictsLiveConversations(budget.maintenance)) {
     const live = await readLiveEvictionPlan(planParams);
     const victim = live.plan.entryRemovals[0];
     if (!victim) {
@@ -178,7 +202,7 @@ export async function reclaimSqliteLiveSessionEntriesToHighWater(params: {
     let removed = false;
     const published = await runSessionMutation({
       diagnosticLabel: "history-evict",
-      scope: params.storePath,
+      scope: budget.storePath,
       identities,
       run: async () => {
         const fenced = await readLiveEvictionPlan({
@@ -201,13 +225,13 @@ export async function reclaimSqliteLiveSessionEntriesToHighWater(params: {
     });
     skipSessionKeys.add(victim.sessionKey);
     if (!published || !removed) {
-      usage = await measureSessionPhysicalDiskUsage(params.storePath);
+      usage = await measureSessionPhysicalDiskUsage(budget.storePath);
       continue;
     }
     removedEntries += 1;
     emitArchivedTranscriptUpdates(published.archivedTranscripts);
     const checkpointCompleted = await params.reclaimFreePages();
-    usage = await measureSessionPhysicalDiskUsage(params.storePath);
+    usage = await measureSessionPhysicalDiskUsage(budget.storePath);
     if (!checkpointCompleted) {
       break;
     }
