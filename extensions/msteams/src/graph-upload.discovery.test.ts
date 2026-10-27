@@ -147,7 +147,7 @@ describe("resolveUploadSiteId dynamic resolution", () => {
         fixedGraphRoute("membershipType", { membershipType }),
         fixedGraphRoute("/filesFolder", { parentReference: { driveId: "b!channel-drive" } }),
         fixedGraphRoute("/drives/", {
-          sharepointIds: {
+          sharePointIds: {
             siteId: "site-collection-id",
             siteUrl: "https://contoso.sharepoint.com/sites/team-private",
             webId: "web-id",
@@ -175,7 +175,7 @@ describe("resolveUploadSiteId dynamic resolution", () => {
     const fetchFn = createGraphFetch(
       fixedGraphRoute("membershipType", { membershipType: "private" }),
       fixedGraphRoute("/filesFolder", { parentReference: { driveId: "b!incomplete" } }),
-      fixedGraphRoute("/drives/", { sharepointIds: { siteId: "site-collection-id" } }),
+      fixedGraphRoute("/drives/", { sharePointIds: { siteId: "site-collection-id" } }),
     );
 
     stubGraphFetch(fetchFn);

@@ -244,14 +244,15 @@ async function resolveChannelSiteId(
   if (!driveId) {
     throw new Error("Graph returned no drive for the channel files folder");
   }
+  // Drive resources spell it sharePointIds; driveItems use sharepointIds.
   const drive = await requestSharePointJson<{
-    sharepointIds?: { siteId?: string; siteUrl?: string; webId?: string };
+    sharePointIds?: { siteId?: string; siteUrl?: string; webId?: string };
   }>(params, {
-    url: `${GRAPH_ROOT}/drives/${encodeURIComponent(driveId)}?$select=sharepointIds`,
+    url: `${GRAPH_ROOT}/drives/${encodeURIComponent(driveId)}?$select=sharePointIds`,
     label: "msteams.graph-upload.resolveChannelDriveSite",
     error: "Resolve channel drive site failed",
   });
-  const ids = drive.sharepointIds;
+  const ids = drive.sharePointIds;
   const hostname = ids?.siteUrl ? URL.parse(ids.siteUrl)?.hostname : undefined;
   if (!hostname || !ids?.siteId || !ids.webId) {
     throw new Error("Graph returned incomplete SharePoint IDs for the channel drive");
