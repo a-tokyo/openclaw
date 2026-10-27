@@ -136,7 +136,7 @@ describe("resolveUploadSiteId dynamic resolution", () => {
       getTeamDetails,
     });
 
-    expect(result).toBe("site-discovered");
+    expect(result).toEqual({ siteId: "site-discovered", memberScoped: false });
     expect(getTeamDetails).toHaveBeenCalledWith("19:team-cold@thread.skype");
   });
 
@@ -163,7 +163,10 @@ describe("resolveUploadSiteId dynamic resolution", () => {
         getTeamDetails: async () => ({ aadGroupId: `group-${membershipType}` }),
       });
 
-      expect(result).toBe("contoso.sharepoint.com,site-collection-id,web-id");
+      expect(result).toEqual({
+        siteId: "contoso.sharepoint.com,site-collection-id,web-id",
+        memberScoped: true,
+      });
       expect(requireFetchCall(fetchFn, 1)[0]).toBe(
         `https://graph.microsoft.com/v1.0/teams/group-${membershipType}/channels/19%3A${membershipType}%40thread.tacv2/filesFolder`,
       );
@@ -282,7 +285,7 @@ describe("resolveUploadSiteId dynamic resolution", () => {
       getTeamDetails,
     });
 
-    expect(result).toBe("explicit-site");
+    expect(result).toEqual({ siteId: "explicit-site", memberScoped: false });
     expect(getTeamDetails).not.toHaveBeenCalled();
     expect(fetchFn).not.toHaveBeenCalled();
   });

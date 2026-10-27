@@ -123,7 +123,7 @@ describe("msteams messenger sharepoint site", () => {
     graphUploadMockState.resolveUploadSiteId.mockImplementation(async (params) => {
       const explicit = params.configuredSiteId?.trim();
       if (explicit) {
-        return explicit;
+        return { siteId: explicit, memberScoped: false };
       }
       throw new Error("No SharePoint site ID available for file upload.");
     });
@@ -208,7 +208,7 @@ describe("msteams messenger sharepoint site", () => {
         throw new Error("missing teamId");
       }
       await params.getTeamDetails?.(teamId);
-      return "resolved-site";
+      return { siteId: "resolved-site", memberScoped: false };
     });
     graphUploadMockState.uploadAndShareSharePoint.mockResolvedValue({
       itemId: "item-cold",
@@ -264,7 +264,7 @@ describe("msteams messenger sharepoint site", () => {
     regionalClientState.getById.mockClear();
     graphUploadMockState.resolveUploadSiteId.mockImplementation(async (params) => {
       await params.getTeamDetails?.(params.teamId);
-      return "resolved-site";
+      return { siteId: "resolved-site", memberScoped: false };
     });
     graphUploadMockState.uploadAndShareSharePoint.mockResolvedValue({
       itemId: "item-regional",

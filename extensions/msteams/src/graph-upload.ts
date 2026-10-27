@@ -27,6 +27,12 @@ const GRAPH_SCOPE = "https://graph.microsoft.com";
  * upload boundary so text-only messages never wait on Graph. Group chats still require
  * sharePointSiteId.
  */
+export type MSTeamsUploadSite = {
+  siteId: string;
+  /** Private/shared channel site: access is limited to channel members. */
+  memberScoped: boolean;
+};
+
 export async function resolveUploadSiteId(
   params: {
     configuredSiteId?: string;
@@ -35,7 +41,7 @@ export async function resolveUploadSiteId(
     tokenProvider: MSTeamsAccessTokenProvider;
     getTeamDetails?: (teamId: string) => Promise<{ aadGroupId?: string }>;
   } & MSTeamsSendHandoff,
-): Promise<string> {
+): Promise<MSTeamsUploadSite> {
   if (params.configuredSiteId !== undefined) {
     const explicit = params.configuredSiteId.trim();
     if (!explicit) {
@@ -43,7 +49,7 @@ export async function resolveUploadSiteId(
         "channels.msteams.sharePointSiteId is blank. Omit it to discover a standard channel's team site, or set a site ID.",
       );
     }
-    return explicit;
+    return { siteId: explicit, memberScoped: false };
   }
   if (!params.teamId) {
     throw new Error(
@@ -72,19 +78,21 @@ export async function resolveUploadSiteId(
       ...handoff,
     });
     if (membershipType !== "standard") {
-      return await resolveChannelSiteId({
+      const siteId = await resolveChannelSiteId({
         groupId,
         channelId: params.channelId,
         tokenProvider: params.tokenProvider,
         ...handoff,
       });
+      return { siteId, memberScoped: true };
     }
   }
-  return await resolveTeamSiteId({
+  const siteId = await resolveTeamSiteId({
     groupId,
     tokenProvider: params.tokenProvider,
     ...handoff,
   });
+  return { siteId, memberScoped: false };
 }
 
 const DEFAULT_SHAREPOINT_FOLDER = "OpenClawShared";
@@ -424,16 +432,21 @@ export async function uploadAndShareSharePoint(
     siteId: string;
     chatId?: string;
     usePerUserSharing?: boolean;
+    memberScoped?: boolean;
     folderName?: string;
     fetchFn?: typeof fetch;
   } & MSTeamsSendHandoff,
 ): Promise<{
   itemId: string;
   webUrl: string;
-  shareUrl: string;
+  shareUrl?: string;
   name: string;
 }> {
   const uploaded = await uploadToSharePoint(params);
+  // Member-scoped sites (private/shared channels): channel membership already grants access.
+  if (params.memberScoped) {
+    return { itemId: uploaded.id, webUrl: uploaded.webUrl, name: uploaded.name };
+  }
 
   let scope: "organization" | "users" = "organization";
   let recipientObjectIds: string[] | undefined;

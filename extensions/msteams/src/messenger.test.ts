@@ -21,7 +21,7 @@ vi.mock("./graph-upload.js", async (importOriginal) => {
   graphUploadMockState.resolveUploadSiteId.mockImplementation(async (params) => {
     const explicit = params.configuredSiteId?.trim();
     if (explicit) {
-      return explicit;
+      return { siteId: explicit, memberScoped: false };
     }
     throw new Error("No SharePoint site ID available for file upload.");
   });
@@ -148,7 +148,7 @@ describe("msteams messenger", () => {
     graphUploadMockState.resolveUploadSiteId.mockImplementation(async (params) => {
       const explicit = params.configuredSiteId?.trim();
       if (explicit) {
-        return explicit;
+        return { siteId: explicit, memberScoped: false };
       }
       throw new Error("No SharePoint site ID available for file upload.");
     });

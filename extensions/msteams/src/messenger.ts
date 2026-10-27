@@ -277,7 +277,7 @@ async function buildActivity(
           throw new Error("MS Teams Graph token provider unavailable for SharePoint file send");
         }
         const chatId = conversationRef.conversation?.id;
-        const siteId = await resolveUploadSiteId({
+        const uploadSite = await resolveUploadSiteId({
           configuredSiteId: sharePointSiteId,
           teamId: conversationRef.teamId,
           channelId: conversationType === "channel" ? chatId : undefined,
@@ -292,7 +292,8 @@ async function buildActivity(
           filename: fileName,
           contentType,
           tokenProvider,
-          siteId,
+          siteId: uploadSite.siteId,
+          memberScoped: uploadSite.memberScoped,
           chatId: chatId ?? undefined,
           usePerUserSharing: conversationType === "groupchat",
           folderName: sharePointFolder,
@@ -300,7 +301,7 @@ async function buildActivity(
 
         const driveItem = await getDriveItemProperties({
           assertDirectAdapterHandoff: options?.assertDirectAdapterHandoff,
-          siteId,
+          siteId: uploadSite.siteId,
           itemId: uploaded.itemId,
           tokenProvider,
         });

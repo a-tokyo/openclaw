@@ -114,7 +114,7 @@ vi.mock("./graph-upload.js", async (importOriginal) => {
   mockState.resolveUploadSiteId.mockImplementation(async (params) => {
     const explicit = params.configuredSiteId?.trim();
     if (explicit) {
-      return explicit;
+      return { siteId: explicit, memberScoped: false };
     }
     throw new Error("No SharePoint site ID available for file upload.");
   });
@@ -303,7 +303,7 @@ describe("sendMessageMSTeams", () => {
     mockState.resolveUploadSiteId.mockImplementation(async (params) => {
       const explicit = params.configuredSiteId?.trim();
       if (explicit) {
-        return explicit;
+        return { siteId: explicit, memberScoped: false };
       }
       throw new Error("No SharePoint site ID available for file upload.");
     });
@@ -679,7 +679,7 @@ describe("sendMessageMSTeams", () => {
         throw new Error("missing teamId");
       }
       await params.getTeamDetails?.(teamId);
-      return "resolved-site";
+      return { siteId: "resolved-site", memberScoped: false };
     });
     mockState.resolveMSTeamsSendContext.mockResolvedValue({
       ...createSharePointSendContext({
@@ -722,7 +722,7 @@ describe("sendMessageMSTeams", () => {
         throw new Error("missing teamId");
       }
       await params.getTeamDetails?.(teamId);
-      return "resolved-site";
+      return { siteId: "resolved-site", memberScoped: false };
     });
     const app = {
       ...createMockApp({ getById: appGetById }),
@@ -776,7 +776,7 @@ describe("sendMessageMSTeams", () => {
       });
     mockState.resolveUploadSiteId.mockImplementation(async (params) => {
       await params.getTeamDetails?.(params.teamId);
-      return "resolved-site";
+      return { siteId: "resolved-site", memberScoped: false };
     });
     mockState.resolveMSTeamsSendContext.mockResolvedValue({
       ...createSharePointSendContext({
@@ -822,7 +822,7 @@ describe("sendMessageMSTeams", () => {
     regionalClientState.created.length = 0;
     mockState.resolveUploadSiteId.mockImplementation(async (params) => {
       await params.getTeamDetails?.(params.teamId);
-      return "resolved-site";
+      return { siteId: "resolved-site", memberScoped: false };
     });
     const app = createMockApp({ getById: appGetById });
     app.api.serviceUrl = "https://smba.trafficmanager.net/amer";

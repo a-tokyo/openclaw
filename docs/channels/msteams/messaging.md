@@ -140,7 +140,7 @@ Bots can send files in DMs using the built-in FileConsentCard flow. **Sending fi
 
 Bots use an application identity, while Microsoft Graph's `/me` resource [requires a signed-in user](https://learn.microsoft.com/en-us/graph/api/user-get?view=graph-rest-1.0). To send files in group chats or channels, the bot uploads to a **SharePoint site** and creates a sharing link.
 
-Channels can omit `sharePointSiteId`. For standard channels the bot resolves the team's backing site with `GET /groups/{groupId}/sites/root`, where team members already have access. Private/shared channels have their own site scoped to channel members; the bot resolves it with `GET /teams/{groupId}/channels/{channelId}/filesFolder` and uploads there, so files never land on the wider team site. Group chats have no team site and still require an explicit `sharePointSiteId`.
+Channels can omit `sharePointSiteId`. For standard channels the bot resolves the team's backing site with `GET /groups/{groupId}/sites/root`, where team members already have access. Private/shared channels have their own site scoped to channel members; the bot resolves it with `GET /teams/{groupId}/channels/{channelId}/filesFolder` and uploads there without an organization-wide sharing link, so files stay readable only by channel members. Group chats have no team site and still require an explicit `sharePointSiteId`.
 
 ### Setup
 

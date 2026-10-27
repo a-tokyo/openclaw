@@ -261,7 +261,7 @@ describe("graph upload helpers", () => {
 
   it("returns an explicit site ID without Graph lookup", async () => {
     const result = await resolveUploadSiteId({ configuredSiteId: " site-123 ", tokenProvider });
-    expect(result).toBe("site-123");
+    expect(result).toEqual({ siteId: "site-123", memberScoped: false });
     expect(tokenProvider.getAccessToken).not.toHaveBeenCalled();
   });
 
@@ -334,6 +334,20 @@ describe("graph upload helpers", () => {
       });
     },
   );
+
+  it("creates no sharing link for member-scoped channel sites", async () => {
+    const fetchFn = createGraphFetch(fixedGraphRoute("/content", DEFAULT_UPLOAD_RESULT));
+
+    const result = await runGraphUpload(fetchFn, { memberScoped: true });
+
+    expect(result).toEqual({
+      itemId: DEFAULT_UPLOAD_RESULT.id,
+      webUrl: DEFAULT_UPLOAD_RESULT.webUrl,
+      name: DEFAULT_UPLOAD_RESULT.name,
+    });
+    expect(fetchFn).toHaveBeenCalledOnce();
+    expect(fetchFn.mock.calls.some(([url]) => String(url).includes("/createLink"))).toBe(false);
+  });
 
   it("uploads to a custom folder when folderName is specified", async () => {
     const fetchFn = createGraphFetch(
