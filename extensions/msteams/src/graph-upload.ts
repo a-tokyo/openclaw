@@ -22,9 +22,10 @@ const GRAPH_SCOPE = "https://graph.microsoft.com";
 
 /**
  * Resolve a SharePoint site ID for a file upload. Uses the explicit config value when set;
- * otherwise resolves a standard channel's team site dynamically. Called lazily at the
- * upload boundary so text-only messages never wait on Graph. Group chats and
- * private/shared channels still require sharePointSiteId.
+ * otherwise resolves the channel's own site dynamically: the team site for standard
+ * channels, the channel's dedicated site for private/shared channels. Called lazily at the
+ * upload boundary so text-only messages never wait on Graph. Group chats still require
+ * sharePointSiteId.
  */
 export async function resolveUploadSiteId(
   params: {
@@ -64,12 +65,20 @@ export async function resolveUploadSiteId(
   }
   const handoff = { assertDirectAdapterHandoff: params.assertDirectAdapterHandoff };
   if (params.channelId) {
-    await assertStandardChannelForAutoUpload({
+    const membershipType = await resolveChannelMembershipType({
       groupId,
       channelId: params.channelId,
       tokenProvider: params.tokenProvider,
       ...handoff,
     });
+    if (membershipType !== "standard") {
+      return await resolveChannelSiteId({
+        groupId,
+        channelId: params.channelId,
+        tokenProvider: params.tokenProvider,
+        ...handoff,
+      });
+    }
   }
   return await resolveTeamSiteId({
     groupId,
@@ -188,25 +197,70 @@ async function resolveTeamSiteId(
   return siteId;
 }
 
-async function assertStandardChannelForAutoUpload(
+function channelGraphPath(groupId: string, channelId: string): string {
+  return `${GRAPH_ROOT}/teams/${encodeURIComponent(groupId)}/channels/${encodeURIComponent(channelId)}`;
+}
+
+async function resolveChannelMembershipType(
   params: {
     groupId: string;
     channelId: string;
     tokenProvider: MSTeamsAccessTokenProvider;
   } & MSTeamsSendHandoff,
-): Promise<void> {
+): Promise<string> {
   const data = await requestSharePointJson<{ membershipType?: string }>(params, {
-    url: `${GRAPH_ROOT}/teams/${encodeURIComponent(params.groupId)}/channels/${encodeURIComponent(params.channelId)}?$select=membershipType`,
+    url: `${channelGraphPath(params.groupId, params.channelId)}?$select=membershipType`,
     label: "msteams.graph-upload.resolveChannelMembershipType",
     error: "Resolve channel membership type failed",
   });
   const membershipType = data.membershipType?.trim().toLowerCase();
-  if (membershipType !== "standard") {
-    throw new Error(
-      "Automatic SharePoint site discovery supports standard channels only. " +
-        "Set channels.msteams.sharePointSiteId to upload to a specific site.",
-    );
+  if (!membershipType) {
+    throw new Error("Graph returned no channel membership type");
   }
+  return membershipType;
+}
+
+const channelSiteIdCache = new Map<string, string>();
+
+// Private/shared channel sites are scoped to channel members; the team site would expose files to the whole team.
+async function resolveChannelSiteId(
+  params: {
+    groupId: string;
+    channelId: string;
+    tokenProvider: MSTeamsAccessTokenProvider;
+  } & MSTeamsSendHandoff,
+): Promise<string> {
+  const cacheKey = `${params.groupId}/${params.channelId}`;
+  const cached = channelSiteIdCache.get(cacheKey);
+  if (cached) {
+    return cached;
+  }
+  const folder = await requestSharePointJson<{ parentReference?: { driveId?: string } }>(params, {
+    url: `${channelGraphPath(params.groupId, params.channelId)}/filesFolder`,
+    label: "msteams.graph-upload.resolveChannelFilesFolder",
+    error: "Resolve channel files folder failed",
+  });
+  const driveId = folder.parentReference?.driveId?.trim();
+  if (!driveId) {
+    throw new Error("Graph returned no drive for the channel files folder");
+  }
+  const drive = await requestSharePointJson<{
+    sharepointIds?: { siteId?: string; siteUrl?: string; webId?: string };
+  }>(params, {
+    url: `${GRAPH_ROOT}/drives/${encodeURIComponent(driveId)}?$select=sharepointIds`,
+    label: "msteams.graph-upload.resolveChannelDriveSite",
+    error: "Resolve channel drive site failed",
+  });
+  const ids = drive.sharepointIds;
+  const hostname = ids?.siteUrl ? URL.parse(ids.siteUrl)?.hostname : undefined;
+  if (!hostname || !ids?.siteId || !ids.webId) {
+    throw new Error("Graph returned incomplete SharePoint IDs for the channel drive");
+  }
+  // Graph site IDs are the composite "{hostname},{site collection id},{web id}".
+  const siteId = `${hostname},${ids.siteId},${ids.webId}`;
+  channelSiteIdCache.set(cacheKey, siteId);
+  pruneMapToMaxSize(channelSiteIdCache, TEAM_SITE_ID_CACHE_MAX_ENTRIES);
+  return siteId;
 }
 
 async function uploadToSharePoint(

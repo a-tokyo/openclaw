@@ -140,20 +140,53 @@ describe("resolveUploadSiteId dynamic resolution", () => {
     expect(getTeamDetails).toHaveBeenCalledWith("19:team-cold@thread.skype");
   });
 
-  it("rejects private channels before discovering the parent team site", async () => {
+  it.each(["private", "shared"])(
+    "resolves a %s channel's own site instead of the parent team site",
+    async (membershipType) => {
+      const fetchFn = createGraphFetch(
+        fixedGraphRoute("membershipType", { membershipType }),
+        fixedGraphRoute("/filesFolder", { parentReference: { driveId: "b!channel-drive" } }),
+        fixedGraphRoute("/drives/", {
+          sharepointIds: {
+            siteId: "site-collection-id",
+            siteUrl: "https://contoso.sharepoint.com/sites/team-private",
+            webId: "web-id",
+          },
+        }),
+      );
+
+      stubGraphFetch(fetchFn);
+      const result = await resolveUploadSiteId({
+        teamId: `19:team-${membershipType}@thread.skype`,
+        channelId: `19:${membershipType}@thread.tacv2`,
+        tokenProvider,
+        getTeamDetails: async () => ({ aadGroupId: `group-${membershipType}` }),
+      });
+
+      expect(result).toBe("contoso.sharepoint.com,site-collection-id,web-id");
+      expect(requireFetchCall(fetchFn, 1)[0]).toBe(
+        `https://graph.microsoft.com/v1.0/teams/group-${membershipType}/channels/19%3A${membershipType}%40thread.tacv2/filesFolder`,
+      );
+      expect(fetchFn.mock.calls.some(([url]) => String(url).includes("/sites/root"))).toBe(false);
+    },
+  );
+
+  it("fails closed when the private channel drive has incomplete SharePoint IDs", async () => {
     const fetchFn = createGraphFetch(
       fixedGraphRoute("membershipType", { membershipType: "private" }),
+      fixedGraphRoute("/filesFolder", { parentReference: { driveId: "b!incomplete" } }),
+      fixedGraphRoute("/drives/", { sharepointIds: { siteId: "site-collection-id" } }),
     );
 
     stubGraphFetch(fetchFn);
     await expect(
       resolveUploadSiteId({
-        teamId: "19:team-private@thread.skype",
-        channelId: "19:private@thread.tacv2",
+        teamId: "19:team-incomplete@thread.skype",
+        channelId: "19:incomplete@thread.tacv2",
         tokenProvider,
-        getTeamDetails: async () => ({ aadGroupId: "group-private" }),
+        getTeamDetails: async () => ({ aadGroupId: "group-incomplete" }),
       }),
-    ).rejects.toThrow("standard channels only");
+    ).rejects.toThrow("incomplete SharePoint IDs");
     expect(fetchFn.mock.calls.some(([url]) => String(url).includes("/sites/root"))).toBe(false);
   });
 
