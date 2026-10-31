@@ -25,7 +25,7 @@ import { formatMSTeamsMarkdown } from "./format.js";
 import { buildTeamsFileInfoCard } from "./graph-chat.js";
 import {
   getDriveItemProperties,
-  requireMSTeamsSharePointSiteId,
+  resolveMSTeamsSharePointSiteId,
   uploadAndShareSharePoint,
 } from "./graph-upload.js";
 import { extractFilename, extractMessageId, MSTEAMS_MAX_MEDIA_BYTES } from "./media-helpers.js";
@@ -261,13 +261,14 @@ export async function sendMessageMSTeams(
 
     // Group chat or channel: upload to configured SharePoint storage.
     try {
-      const siteId = requireMSTeamsSharePointSiteId(sharePointSiteId);
-      log.debug?.("uploading to SharePoint for native file card", {
-        fileName,
-        conversationType,
-        siteId,
+      const siteId = await resolveMSTeamsSharePointSiteId({
+        siteId: sharePointSiteId,
+        app: ctx.app,
+        conversationRef: ctx.ref,
+        tokenProvider,
+        serviceUrlBoundary: ctx.sdkCloudOptions,
+        assertDirectAdapterHandoff: params.assertDirectAdapterHandoff,
       });
-
       const uploaded = await uploadAndShareSharePoint({
         assertDirectAdapterHandoff: params.assertDirectAdapterHandoff,
         buffer: media.buffer,

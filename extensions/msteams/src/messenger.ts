@@ -22,7 +22,7 @@ import { formatMSTeamsMarkdown } from "./format.js";
 import { buildTeamsFileInfoCard } from "./graph-chat.js";
 import {
   getDriveItemProperties,
-  requireMSTeamsSharePointSiteId,
+  resolveMSTeamsSharePointSiteId,
   uploadAndShareSharePoint,
 } from "./graph-upload.js";
 import { normalizeMSTeamsConversationId } from "./inbound.js";
@@ -152,7 +152,11 @@ async function buildActivity(
   tokenProvider?: MSTeamsAccessTokenProvider,
   sharePointSiteId?: string,
   mediaMaxBytes?: number,
-  options?: { feedbackLoopEnabled?: boolean } & MSTeamsSendHandoff,
+  options?: {
+    feedbackLoopEnabled?: boolean;
+    app?: MSTeamsApp;
+    serviceUrlBoundary?: MSTeamsSdkCloudOptions;
+  } & MSTeamsSendHandoff,
 ): Promise<Record<string, unknown>> {
   const activity: Record<string, unknown> = buildMSTeamsMessageActivity(msg.text);
 
@@ -203,10 +207,20 @@ async function buildActivity(
       if (!isPersonal && !isImage) {
         // Non-images in group chats/channels require SharePoint because an
         // application token has no signed-in `/me/drive` to fall back to.
-        const siteId = requireMSTeamsSharePointSiteId(sharePointSiteId);
         if (!tokenProvider) {
           throw new Error("MS Teams Graph token provider unavailable for SharePoint file send");
         }
+        if (!options?.app) {
+          throw new Error("MS Teams app unavailable for SharePoint site resolution");
+        }
+        const siteId = await resolveMSTeamsSharePointSiteId({
+          siteId: sharePointSiteId,
+          app: options.app,
+          conversationRef,
+          tokenProvider,
+          serviceUrlBoundary: options.serviceUrlBoundary,
+          assertDirectAdapterHandoff: options.assertDirectAdapterHandoff,
+        });
         const chatId = conversationRef.conversation?.id;
 
         const uploaded = await uploadAndShareSharePoint({
@@ -300,6 +314,8 @@ export async function sendMSTeamsMessages(
             {
               feedbackLoopEnabled: params.feedbackLoopEnabled,
               assertDirectAdapterHandoff: params.assertDirectAdapterHandoff,
+              app: params.app,
+              serviceUrlBoundary: params.serviceUrlBoundary,
             },
           );
 
