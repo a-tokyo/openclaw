@@ -228,7 +228,10 @@ export async function getMSTeamsTeamDetailsWithReference(
   return withMSTeamsConnectorHandoff(
     { assertDirectAdapterHandoff: options?.assertDirectAdapterHandoff },
     async (handoff) => {
-      const api = getApiClientForReference(app, buildSdkConversationReference(source, options));
+      const api = await getApiClientForReference(
+        app,
+        buildSdkConversationReference(source, options),
+      );
       assertMSTeamsSendHandoff(handoff);
       return api.teams.getById(teamId);
     },

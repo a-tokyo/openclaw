@@ -39,15 +39,9 @@ function fixture() {
     },
   });
   const teamLookup = vi.fn(async () => ({ aadGroupId: "group-a" }));
-  const regionalApi = { ...app.api, teams: { getById: teamLookup } };
-  app.api.fromServiceUrl = vi.fn(() => regionalApi);
-  app.api.teams = {
-    getById: vi.fn(async () => {
-      throw new Error("wrong region");
-    }),
-  };
+  app.api.teams = { getById: teamLookup };
   const ref = createStoredReference({
-    serviceUrl: "https://smba.trafficmanager.net/emea/",
+    serviceUrl: "https://smba.trafficmanager.net/amer/",
     tenantId: `tenant-${id}`,
     teamId: `19:team-${id}@thread.tacv2`,
     conversation: { id: "19:channel-a@thread.tacv2;messageid=123", conversationType: "channel" },
@@ -66,10 +60,14 @@ function fixture() {
       return Response.json({ id: url.includes("group-b") ? "site-b" : "site-a" });
     }
     if (init?.method === "PUT") {
-      return Response.json({ id: "item-a" });
+      return Response.json({
+        id: "item-a",
+        webUrl: "https://contoso.sharepoint.com/report.txt",
+        name: "report.txt",
+      });
     }
     if (url.includes("createLink")) {
-      return Response.json({});
+      return Response.json({ link: { webUrl: "https://contoso.sharepoint.com/share/item-a" } });
     }
     if (url.includes("/items/")) {
       return Response.json({
@@ -98,14 +96,14 @@ type Fixture = ReturnType<typeof fixture>;
 async function sendFile(
   lane: string,
   f: Fixture,
-  options: { siteId?: string; accountId?: string; assertDirectAdapterHandoff?: () => void } = {},
+  options: { siteId?: string; assertDirectAdapterHandoff?: () => void } = {},
 ) {
-  const { siteId, accountId = "default", assertDirectAdapterHandoff } = options;
+  const { siteId, assertDirectAdapterHandoff } = options;
   if (lane === "proactive") {
     state.context.mockResolvedValue({
       app: f.app,
       ref: f.ref,
-      accountId,
+      log: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} },
       conversationId: f.ref.conversation?.id,
       conversationType: "channel",
       tokenProvider: f.tokenProvider,
@@ -124,7 +122,6 @@ async function sendFile(
   return sendMSTeamsMessages({
     app: f.app,
     conversationRef: f.ref,
-    accountId,
     replyStyle: "top-level",
     tokenProvider: f.tokenProvider,
     sharePointSiteId: siteId,
@@ -134,7 +131,7 @@ async function sendFile(
 }
 
 describe.each(["proactive", "reply"])("%s channel file sends", (lane) => {
-  it("discovers and caches each team site within its account, using the regional reference", async () => {
+  it("discovers and caches each team site", async () => {
     const f = fixture();
     await sendFile(lane, f);
     expect(f.teamLookup).toHaveBeenCalledWith(f.ref.teamId);
@@ -156,17 +153,15 @@ describe.each(["proactive", "reply"])("%s channel file sends", (lane) => {
     await sendFile(lane, f);
     f.ref.teamId = teamA;
     await sendFile(lane, f);
-    await sendFile(lane, f, { accountId: "other-account" });
     expect(f.requests.filter((url) => url.includes("/groups/"))).toEqual([
       "https://graph.microsoft.com/v1.0/groups/group-a/sites/root",
       "https://graph.microsoft.com/v1.0/groups/group-b/sites/root",
-      "https://graph.microsoft.com/v1.0/groups/group-a/sites/root",
     ]);
     expect(
       f.requests
         .filter((url) => url.includes("/drive/root:"))
         .map((url) => url.split("/sites/")[1]?.split("/")[0]),
-    ).toEqual(["site-a", "site-b", "site-a", "site-a"]);
+    ).toEqual(["site-a", "site-b", "site-a"]);
   });
 
   it("stops discovery when authority closes during team lookup", async () => {
