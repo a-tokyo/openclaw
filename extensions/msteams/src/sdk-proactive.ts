@@ -49,6 +49,7 @@ type MSTeamsActivitiesClient = {
 type MSTeamsApiClient = {
   serviceUrl?: string;
   http?: unknown;
+  teams: MSTeamsApp["api"]["teams"];
   conversations: {
     activities(conversationId: string): MSTeamsActivitiesClient;
   };

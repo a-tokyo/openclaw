@@ -228,6 +228,18 @@ async function requestSharePointJson<T>(
   });
 }
 
+const DEFAULT_SHAREPOINT_FOLDER = "OpenClawShared";
+
+function resolveMSTeamsSharePointFolder(folder?: string): string {
+  const trimmed = folder?.trim() || DEFAULT_SHAREPOINT_FOLDER;
+  if (trimmed === "." || trimmed === ".." || /[\\/]/.test(trimmed)) {
+    throw new Error(
+      "channels.msteams.sharePointFolder must be a single folder name without path separators",
+    );
+  }
+  return trimmed;
+}
+
 async function uploadToSharePoint(
   params: {
     buffer: Buffer;
@@ -235,9 +247,11 @@ async function uploadToSharePoint(
     contentType?: string;
     tokenProvider: MSTeamsAccessTokenProvider;
     siteId: string;
+    folderName?: string;
   } & MSTeamsSendHandoff,
 ): Promise<DriveUploadResult> {
-  const uploadPath = `/OpenClawShared/${encodeURIComponent(params.filename)}`;
+  const folder = encodeURIComponent(resolveMSTeamsSharePointFolder(params.folderName));
+  const uploadPath = `/${folder}/${encodeURIComponent(params.filename)}`;
   // Graph's default conflictBehavior=replace overwrites a same-named file in place. Bot assets
   // reuse names (image-1.png each generation) and Teams caches file cards by driveItem URL, so
   // replace clobbers history and shows stale images; "rename" mints a unique driveItem instead.
@@ -380,6 +394,7 @@ export async function uploadAndShareSharePoint(
     chatId?: string;
     usePerUserSharing?: boolean;
     memberScoped?: boolean;
+    folderName?: string;
   } & MSTeamsSendHandoff,
 ): Promise<{ itemId: string; webUrl: string; shareUrl?: string; name: string }> {
   const uploaded = await uploadToSharePoint(params);

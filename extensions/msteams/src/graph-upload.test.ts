@@ -291,6 +291,63 @@ describe("graph upload helpers", () => {
     },
   );
 
+  it("uploads to a custom folder when folderName is specified", async () => {
+    const fetchFn = createGraphFetch(
+      fixedGraphRoute("/content", {
+        id: "item-custom",
+        webUrl: "https://example.com/custom",
+        name: "c.txt",
+      }),
+      fixedGraphRoute("/createLink", { link: { webUrl: "https://example.com/share" } }),
+    );
+
+    const result = await runGraphUpload(fetchFn, { folderName: "BotUploads" });
+
+    const [url] = requireFetchCall(fetchFn);
+    expect(url).toContain("/BotUploads/");
+    expect(url).not.toContain("/OpenClawShared/");
+    expect(result.name).toBe("c.txt");
+  });
+
+  it("encodes reserved folder characters in the upload path", async () => {
+    const fetchFn = createGraphFetch(
+      fixedGraphRoute("/content", {
+        id: "item-hash",
+        webUrl: "https://example.com/h",
+        name: "h.txt",
+      }),
+      fixedGraphRoute("/createLink", { link: { webUrl: "https://example.com/share" } }),
+    );
+    await runGraphUpload(fetchFn, { folderName: "Reports#2026" });
+    const [url] = requireFetchCall(fetchFn);
+    expect(url).toContain("/Reports%232026/");
+    expect(url).not.toContain("/Reports#2026/");
+  });
+
+  it.each(["../secrets", "a/b", "a\\b", ".", ".."])(
+    "rejects folder name %s",
+    async (folderName) => {
+      const fetchFn = createGraphFetch();
+      await expect(runGraphUpload(fetchFn, { folderName })).rejects.toThrow(
+        "single folder name without path separators",
+      );
+      expect(fetchFn).not.toHaveBeenCalled();
+    },
+  );
+
+  it("creates no sharing link for member-scoped channel sites", async () => {
+    const fetchFn = createGraphFetch(fixedGraphRoute("/content", DEFAULT_UPLOAD_RESULT));
+
+    const result = await runGraphUpload(fetchFn, { memberScoped: true });
+
+    expect(result).toEqual({
+      itemId: DEFAULT_UPLOAD_RESULT.id,
+      webUrl: DEFAULT_UPLOAD_RESULT.webUrl,
+      name: DEFAULT_UPLOAD_RESULT.name,
+    });
+    expect(fetchFn).toHaveBeenCalledOnce();
+  });
+
   it("uploads with conflictBehavior=rename and surfaces the name SharePoint assigns", async () => {
     // Regression: openclaw-runtime image assets reuse names (image-1.png). Graph's default
     // replace overwrote the prior file and Teams (caching cards by driveItem URL) showed the

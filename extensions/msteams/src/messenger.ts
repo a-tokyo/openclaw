@@ -156,6 +156,7 @@ async function buildActivity(
     feedbackLoopEnabled?: boolean;
     app?: MSTeamsApp;
     serviceUrlBoundary?: MSTeamsSdkCloudOptions;
+    sharePointFolder?: string;
   } & MSTeamsSendHandoff,
 ): Promise<Record<string, unknown>> {
   const activity: Record<string, unknown> = buildMSTeamsMessageActivity(msg.text);
@@ -231,6 +232,7 @@ async function buildActivity(
           tokenProvider,
           siteId: uploadSite.siteId,
           memberScoped: uploadSite.memberScoped,
+          folderName: options.sharePointFolder,
           chatId: chatId ?? undefined,
           usePerUserSharing: conversationType === "groupchat",
         });
@@ -277,6 +279,8 @@ export async function sendMSTeamsMessages(
     tokenProvider?: MSTeamsAccessTokenProvider;
     /** SharePoint site ID for file uploads in group chats/channels */
     sharePointSiteId?: string;
+    /** Single SharePoint folder name for uploads (default: "OpenClawShared") */
+    sharePointFolder?: string;
     /** Max media size in bytes. Default: 100MB. */
     mediaMaxBytes?: number;
     /** Enable the Teams feedback loop (thumbs up/down) on sent messages. */
@@ -317,6 +321,7 @@ export async function sendMSTeamsMessages(
               assertDirectAdapterHandoff: params.assertDirectAdapterHandoff,
               app: params.app,
               serviceUrlBoundary: params.serviceUrlBoundary,
+              sharePointFolder: params.sharePointFolder,
             },
           );
 

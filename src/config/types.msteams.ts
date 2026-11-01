@@ -123,6 +123,8 @@ export type MSTeamsConfig = Omit<
     teams?: Record<string, MSTeamsTeamConfig>;
     /** SharePoint site ID for file uploads in group chats/channels (e.g., "contoso.sharepoint.com,guid1,guid2"). */
     sharePointSiteId?: string;
+    /** Single folder name for bot-uploaded files (default: "OpenClawShared"). Path separators are rejected. */
+    sharePointFolder?: string;
     /** Show a welcome Adaptive Card when the bot is added to a 1:1 chat. Default: true. */
     welcomeCard?: boolean;
     /** Custom prompt starter labels shown on the welcome card. */

@@ -93,6 +93,8 @@ export const MSTeamsConfigSchema = z
     teams: z.record(z.string(), MSTeamsTeamSchema.optional()).optional(),
     /** SharePoint site ID for file uploads in group chats/channels (e.g., "contoso.sharepoint.com,guid1,guid2") */
     sharePointSiteId: z.string().optional(),
+    /** Single folder name for bot-uploaded files (default: "OpenClawShared"). Path separators are rejected. */
+    sharePointFolder: z.string().optional(),
     welcomeCard: z.boolean().optional(),
     promptStarters: z.array(z.string()).optional(),
     groupWelcomeCard: z.boolean().optional(),

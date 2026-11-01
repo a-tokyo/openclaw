@@ -174,7 +174,14 @@ export async function sendMessageMSTeams(
   });
   const messageText = formatMSTeamsMarkdown(text ?? "", tableMode);
   const ctx = await resolveMSTeamsSendContext({ cfg, to });
-  const { conversationId, log, conversationType, tokenProvider, sharePointSiteId } = ctx;
+  const {
+    conversationId,
+    log,
+    conversationType,
+    tokenProvider,
+    sharePointSiteId,
+    sharePointFolder,
+  } = ctx;
 
   log.debug?.("sending proactive message", {
     conversationId,
@@ -277,6 +284,7 @@ export async function sendMessageMSTeams(
         tokenProvider,
         siteId: uploadSite.siteId,
         memberScoped: uploadSite.memberScoped,
+        folderName: sharePointFolder,
         chatId: conversationId,
         usePerUserSharing: conversationType === "groupChat",
       });
@@ -345,6 +353,7 @@ async function sendTextWithMedia(
     log,
     tokenProvider,
     sharePointSiteId,
+    sharePointFolder,
     mediaMaxBytes,
     replyStyle,
   } = ctx;
@@ -375,6 +384,7 @@ async function sendTextWithMedia(
       },
       tokenProvider,
       sharePointSiteId,
+      sharePointFolder,
       mediaMaxBytes,
       serviceUrlBoundary: ctx.sdkCloudOptions,
     });
