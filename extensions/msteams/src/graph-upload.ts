@@ -26,7 +26,14 @@ const GRAPH_SCOPE = "https://graph.microsoft.com";
 
 // Sites are stable team metadata. Bound retained entries and refresh on process restart.
 const teamSiteIds = new Map<string, string>();
+const channelSiteIds = new Map<string, string>();
 const TEAM_SITE_CACHE_MAX_ENTRIES = 500;
+
+export type MSTeamsSharePointUploadSite = {
+  siteId: string;
+  /** Private/shared channel site: access is limited to channel members. */
+  memberScoped: boolean;
+};
 
 export async function resolveMSTeamsSharePointSiteId(
   params: {
@@ -37,13 +44,13 @@ export async function resolveMSTeamsSharePointSiteId(
     tokenProvider: MSTeamsAccessTokenProvider;
     serviceUrlBoundary?: MSTeamsSdkCloudOptions;
   } & MSTeamsSendHandoff,
-): Promise<string> {
+): Promise<MSTeamsSharePointUploadSite> {
   if (params.siteId !== undefined) {
     const siteId = params.siteId.trim();
     if (!siteId) {
       throw new Error("channels.msteams.sharePointSiteId must not be blank");
     }
-    return siteId;
+    return { siteId, memberScoped: false };
   }
   const ref = params.conversationRef;
   const conversation = ref.conversation;
@@ -77,21 +84,25 @@ export async function resolveMSTeamsSharePointSiteId(
     error: "Get Teams channel failed; verify the existing ChannelSettings.Read.Group RSC grant",
     label: "msteams.graph-upload.channel",
   });
-  // Private/shared channels have a separate audience and must never use the parent team's site.
-  if (channel.membershipType !== "standard") {
-    throw new Error(
-      "Automatic SharePoint site discovery supports standard channels only; set channels.msteams.sharePointSiteId",
-    );
-  }
-  const cacheKey = JSON.stringify([
+  const scope = [
     params.accountId ?? "default",
     ref.tenantId ?? conversation.tenantId,
     (ref.agent ?? ref.bot)?.id,
     teamId,
-  ]);
+  ];
+  // Private/shared channels have a separate audience and must never use the parent team's site.
+  if (channel.membershipType !== "standard") {
+    const siteId = await resolveChannelSiteId({
+      ...params,
+      cacheKey: JSON.stringify([...scope, channelId]),
+      channelUrl: `${GRAPH_ROOT}/teams/${encodeURIComponent(teamId)}/channels/${encodeURIComponent(channelId)}`,
+    });
+    return { siteId, memberScoped: true };
+  }
+  const cacheKey = JSON.stringify(scope);
   const cached = teamSiteIds.get(cacheKey);
   if (cached) {
-    return cached;
+    return { siteId: cached, memberScoped: false };
   }
   const site = await requestSharePointJson<{ id?: string }>(params, {
     url: `${GRAPH_ROOT}/groups/${encodeURIComponent(teamId)}/sites/root`,
@@ -105,7 +116,47 @@ export async function resolveMSTeamsSharePointSiteId(
   }
   teamSiteIds.set(cacheKey, site.id);
   pruneMapToMaxSize(teamSiteIds, TEAM_SITE_CACHE_MAX_ENTRIES);
-  return site.id;
+  return { siteId: site.id, memberScoped: false };
+}
+
+async function resolveChannelSiteId(
+  params: {
+    cacheKey: string;
+    channelUrl: string;
+    tokenProvider: MSTeamsAccessTokenProvider;
+  } & MSTeamsSendHandoff,
+): Promise<string> {
+  const cached = channelSiteIds.get(params.cacheKey);
+  if (cached) {
+    return cached;
+  }
+  const folder = await requestSharePointJson<{ parentReference?: { driveId?: string } }>(params, {
+    url: `${params.channelUrl}/filesFolder`,
+    error: "Resolve Teams channel files folder failed",
+    label: "msteams.graph-upload.channelFilesFolder",
+  });
+  const driveId = folder.parentReference?.driveId?.trim();
+  if (!driveId) {
+    throw new Error("Graph returned no drive for the channel files folder");
+  }
+  // Drive resources spell it sharePointIds; driveItems use sharepointIds.
+  const drive = await requestSharePointJson<{
+    sharePointIds?: { siteId?: string; siteUrl?: string; webId?: string };
+  }>(params, {
+    url: `${GRAPH_ROOT}/drives/${encodeURIComponent(driveId)}?$select=sharePointIds`,
+    error: "Resolve Teams channel drive site failed",
+    label: "msteams.graph-upload.channelDriveSite",
+  });
+  const ids = drive.sharePointIds;
+  const hostname = ids?.siteUrl ? URL.parse(ids.siteUrl)?.hostname : undefined;
+  if (!hostname || !ids?.siteId || !ids.webId) {
+    throw new Error("Graph returned incomplete SharePoint IDs for the channel drive");
+  }
+  // Graph site IDs are the composite "{hostname},{site collection id},{web id}".
+  const siteId = `${hostname},${ids.siteId},${ids.webId}`;
+  channelSiteIds.set(params.cacheKey, siteId);
+  pruneMapToMaxSize(channelSiteIds, TEAM_SITE_CACHE_MAX_ENTRIES);
+  return siteId;
 }
 
 interface DriveUploadResult {
@@ -316,7 +367,8 @@ async function createSharePointSharingLink(
  * Upload a file to SharePoint and create a sharing link.
  *
  * For group chats, this creates a per-user sharing link scoped to chat members.
- * For channels, this creates an organization-wide sharing link.
+ * For standard channels, this creates an organization-wide sharing link. Member-scoped sites
+ * (private/shared channels) get no link: channel membership already grants access.
  */
 export async function uploadAndShareSharePoint(
   params: {
@@ -327,9 +379,13 @@ export async function uploadAndShareSharePoint(
     siteId: string;
     chatId?: string;
     usePerUserSharing?: boolean;
+    memberScoped?: boolean;
   } & MSTeamsSendHandoff,
-) {
+): Promise<{ itemId: string; webUrl: string; shareUrl?: string; name: string }> {
   const uploaded = await uploadToSharePoint(params);
+  if (params.memberScoped) {
+    return { itemId: uploaded.id, webUrl: uploaded.webUrl, name: uploaded.name };
+  }
 
   let recipientObjectIds: string[] | undefined;
 

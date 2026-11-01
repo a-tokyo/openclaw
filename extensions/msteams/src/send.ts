@@ -261,7 +261,7 @@ export async function sendMessageMSTeams(
 
     // Group chat or channel: upload to configured SharePoint storage.
     try {
-      const siteId = await resolveMSTeamsSharePointSiteId({
+      const uploadSite = await resolveMSTeamsSharePointSiteId({
         siteId: sharePointSiteId,
         app: ctx.app,
         conversationRef: ctx.ref,
@@ -275,7 +275,8 @@ export async function sendMessageMSTeams(
         filename: fileName,
         contentType: media.contentType,
         tokenProvider,
-        siteId,
+        siteId: uploadSite.siteId,
+        memberScoped: uploadSite.memberScoped,
         chatId: conversationId,
         usePerUserSharing: conversationType === "groupChat",
       });
@@ -287,7 +288,7 @@ export async function sendMessageMSTeams(
 
       const driveItem = await getDriveItemProperties({
         assertDirectAdapterHandoff: params.assertDirectAdapterHandoff,
-        siteId,
+        siteId: uploadSite.siteId,
         itemId: uploaded.itemId,
         tokenProvider,
       });

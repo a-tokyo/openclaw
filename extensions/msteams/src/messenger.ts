@@ -213,7 +213,7 @@ async function buildActivity(
         if (!options?.app) {
           throw new Error("MS Teams app unavailable for SharePoint site resolution");
         }
-        const siteId = await resolveMSTeamsSharePointSiteId({
+        const uploadSite = await resolveMSTeamsSharePointSiteId({
           siteId: sharePointSiteId,
           app: options.app,
           conversationRef,
@@ -229,14 +229,15 @@ async function buildActivity(
           filename: fileName,
           contentType,
           tokenProvider,
-          siteId,
+          siteId: uploadSite.siteId,
+          memberScoped: uploadSite.memberScoped,
           chatId: chatId ?? undefined,
           usePerUserSharing: conversationType === "groupchat",
         });
 
         const driveItem = await getDriveItemProperties({
           assertDirectAdapterHandoff: options?.assertDirectAdapterHandoff,
-          siteId,
+          siteId: uploadSite.siteId,
           itemId: uploaded.itemId,
           tokenProvider,
         });
